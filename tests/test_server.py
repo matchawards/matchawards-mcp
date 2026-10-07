@@ -125,6 +125,14 @@ async def test_failed_follow_up_keeps_the_rows_already_collected(api):
     out = await server.search_contracts(limit=5)
     assert [r["id"] for r in out["results"]] == ["1"]
     assert (out["has_more"], out["next_cursor"]) == (True, "c1")
+    assert out["warning"].startswith("Stopped after 1 rows: MatchAwards rate limit reached")
+    assert "Wait 5 seconds" in out["warning"] and out["warning"].endswith("call again with next_cursor.")
+
+
+@pytest.mark.anyio
+async def test_complete_search_has_no_warning(api):
+    api.replies = [ok(page([1, 2], has_more=True, cursor="c1"))]
+    assert "warning" not in await server.search_contracts(limit=2)
 
 
 @pytest.mark.anyio

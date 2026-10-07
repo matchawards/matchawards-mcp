@@ -163,15 +163,17 @@ async def _search(type_: str, limit: int = 20, keyword: str | None = None, **fil
     params = {"type": type_, "q": keyword, **filters}
     rows: dict[Any, dict[str, Any]] = {}
     page: dict[str, Any] = {}
-    as_of = None
+    as_of = warning = None
     for _ in range(MAX_PAGES):
         try:
             # Ask only for what is still missing, so no row is read past the cursor and then dropped.
             next_page = await _get(SEARCH_PATH, {**params, "limit": limit - len(rows)})
-        except ToolError:
+        except ToolError as e:
             if not page:
-                raise
-            break  # keep what we have; the last good page's next_cursor still points at the rest
+                raise  # first page: nothing to return, so the call fails
+            # Follow-up page: keep what we have; the last good page's next_cursor still points at the rest.
+            warning = f"Stopped after {len(rows)} rows: {e} More results may exist; call again with next_cursor."
+            break
         page = next_page
         as_of = as_of or page.get("as_of")
         for row in page.get("results") or []:
@@ -179,13 +181,14 @@ async def _search(type_: str, limit: int = 20, keyword: str | None = None, **fil
         if len(rows) >= limit or not (page.get("has_more") and page.get("next_cursor")):
             break
         params["cursor"] = page["next_cursor"]
-    return {
+    out = {
         "as_of": as_of,
         "results": list(rows.values()),
         "has_more": bool(page.get("has_more")),
         "next_cursor": page.get("next_cursor"),
         "note": LINK_RULE,
     }
+    return {**out, "warning": warning} if warning else out
 
 
 @_tool
