@@ -128,7 +128,7 @@ def _error_message(r: httpx.Response) -> str:
 
 async def _get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     """GET one API path; turn every failure into a ToolError the model can act on."""
-    query = {k: v for k, v in (params or {}).items() if v is not None}
+    query = {k: v for k, v in (params or {}).items() if v is not None and v != ""}  # "" = unset, e.g. cursor=""
     try:
         r = await client.get(path, params=query)
     except httpx.TimeoutException:
