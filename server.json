@@ -1,0 +1,31 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.matchawards/matchawards-mcp",
+  "title": "MatchAwards",
+  "description": "Search US government contracts, grants and jobs from matchawards.com. Read-only, no key.",
+  "version": "0.1.0",
+  "websiteUrl": "https://matchawards.com",
+  "repository": {
+    "url": "https://github.com/matchawards/matchawards-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "matchawards-mcp",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        {
+          "name": "MATCHAWARDS_API_BASE",
+          "description": "Base URL of the MatchAwards API. Leave unset to use https://matchawards.com; set only for development.",
+          "isRequired": false,
+          "isSecret": false,
+          "default": "https://matchawards.com"
+        }
+      ]
+    }
+  ]
+}
