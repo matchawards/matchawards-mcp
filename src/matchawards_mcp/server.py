@@ -96,9 +96,10 @@ Cursor = Annotated[
 OppId = Annotated[
     str, Field(pattern=r"^[A-Za-z0-9_-]{1,128}$", description="The id field of a search result.")
 ]
-OppType = Annotated[
-    Literal["contract", "federal", "state", "grant", "job"],
-    Field(description="contract = federal and state contracts; federal or state = one level only; grant; job."),
+NaicsType = Annotated[
+    Literal["contract", "federal", "state", "job"],
+    Field(description="contract = federal and state contracts; federal or state = one level only; job. "
+          "Grants have no NAICS code: use search_grants."),
 ]
 
 
@@ -228,25 +229,22 @@ async def search_contracts(
 
 @_tool
 async def search_grants(
-    naics: OptNaics = None,
-    state: State = None,
     keyword: Keyword = None,
     posted_within_days: PostedWithin = None,
     open: Open = None,
     limit: Limit = 20,
     cursor: Cursor = None,
 ) -> dict[str, Any]:
-    """Search US government grant and funding opportunities.
+    """Search US federal grant and funding opportunities.
 
     Use this when the user wants grants or funding, not contracts. Returns {as_of, results, has_more,
-    next_cursor}; each result has id, title, agency, naics, state, posted_at, response_deadline and a
-    matchawards.com url. Filters: naics, state, keyword, posted_within_days, open (default true: open
-    grants of any age), limit, cursor. If has_more is true, call again with cursor=next_cursor and the
-    same filters. Example: keyword="broadband", state="NC".
+    next_cursor}; each result has id, title, agency, posted_at, response_deadline and a matchawards.com url.
+    Filters: keyword, posted_within_days, open (default true: open grants of any age), limit, cursor.
+    Grant notices carry no state or NAICS code, so filter by keyword instead. If has_more is true, call
+    again with cursor=next_cursor and the same filters. Example: keyword="broadband".
     """
     return await _search(
-        "grant", naics=naics, state=state, keyword=keyword,
-        posted_within_days=posted_within_days, open=open, limit=limit, cursor=cursor,
+        "grant", keyword=keyword, posted_within_days=posted_within_days, open=open, limit=limit, cursor=cursor,
     )
 
 
@@ -274,12 +272,12 @@ async def search_jobs(
 
 
 @_tool
-async def search_by_naics(naics: Naics, type: OppType = "contract", cursor: Cursor = None) -> dict[str, Any]:
+async def search_by_naics(naics: Naics, type: NaicsType = "contract", cursor: Cursor = None) -> dict[str, Any]:
     """List the newest opportunities for one or more NAICS industry codes.
 
     Use this when the user gives NAICS codes and nothing else. Returns up to 20 results, {as_of, results,
     has_more, next_cursor}, each with a matchawards.com url. Filters: naics (required), type (contract,
-    federal, state, grant or job), cursor (next_cursor of the previous call, same naics and type). For
+    federal, state or job), cursor (next_cursor of the previous call, same naics and type). For
     keyword, state or other filters use search_contracts, search_grants or search_jobs.
     Example: naics="541511,541512", type="federal".
     """
