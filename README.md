@@ -93,7 +93,7 @@ The data is US federal and state contract opportunities, grants and jobs from [m
 - Job search covers the last 30 days.
 - Results come newest first. When `has_more` is true, the model can ask for the next page with `cursor`.
 - If the first request of a search fails, the tool returns an error. If a later page fails, the tool returns the rows it already has, with a `warning` that says why it stopped.
-- The API is rate-limited per IP: 60 requests per minute. One search call can use up to three requests when the filters are narrow and results are sparse. When the limit is reached, the tool returns an error that tells the model how many seconds to wait.
+- The API is rate-limited per IP: 60 requests per minute, plus a burst limit of 20 requests per 5 seconds. One search call can use up to three requests when the filters are narrow and results are sparse. When the limit is reached, the tool returns an error that tells the model how many seconds to wait.
 
 ## Development
 

@@ -112,7 +112,10 @@ def _error_message(r: httpx.Response) -> str:
     error = body.get("error") or r.text.strip()[:200] or r.reason_phrase
     if r.status_code == 429:
         wait = r.headers.get("Retry-After") or body.get("retry_after") or 60
-        return f"MatchAwards rate limit reached (60 requests per minute per IP). Wait {wait} seconds, then retry."
+        return (
+            f"MatchAwards rate limit reached (per IP: 60 requests per minute, 20 per 5 seconds). "
+            f"Wait {wait} seconds, then retry."
+        )
     if error == "grants_unavailable":
         return "Grant search is temporarily unavailable on MatchAwards. Try again later; contracts and jobs still work."
     if r.status_code >= 500:
