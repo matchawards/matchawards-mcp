@@ -20,3 +20,39 @@ jobs:
       - run: pip install -e ".[test]"
 
       - run: pytest -q
+
+  wheel-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build and check
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          python -m twine check dist/*
+
+      - name: Install the wheel in a fresh venv and run the stdio discover handshake
+        run: |
+          python -m venv "$RUNNER_TEMP/smoke"
+          "$RUNNER_TEMP/smoke/bin/pip" install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/smoke/bin/python" - <<'EOF'
+          import os
+          import anyio
+          from mcp import Client, StdioServerParameters
+
+          async def main():
+              server = StdioServerParameters(command=os.path.join(os.environ["RUNNER_TEMP"], "smoke/bin/matchawards-mcp"))
+              async with Client(server) as client:
+                  names = [t.name for t in (await client.list_tools()).tools]
+                  assert client.protocol_version == "2026-07-28", client.protocol_version
+                  assert len(names) == 6, names
+                  print("smoke ok:", client.server_info.version, names)
+
+          anyio.run(main)
+          EOF
