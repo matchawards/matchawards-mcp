@@ -1,3 +1,4 @@
+# The server speaks MCP over stdio, so run it with -i: docker run -i --rm matchawards-mcp
 FROM python:3.12-slim
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
