@@ -278,7 +278,7 @@ async def search_by_naics(naics: Naics, type: NaicsType = "contract", cursor: Cu
     Use this when the user gives NAICS codes and nothing else. Returns up to 20 results, {as_of, results,
     has_more, next_cursor}, each with a matchawards.com url. Filters: naics (required), type (contract,
     federal, state or job), cursor (next_cursor of the previous call, same naics and type). For
-    keyword, state or other filters use search_contracts, search_grants or search_jobs.
+    keyword, state or other filters use search_contracts or search_jobs.
     Example: naics="541511,541512", type="federal".
     """
     return await _search(type, naics=naics, cursor=cursor)
