@@ -11,9 +11,9 @@ This is the [Model Context Protocol](https://modelcontextprotocol.io) server for
 | Tool | What it returns | Example prompt |
 |---|---|---|
 | `search_contracts` | Federal and state contract opportunities. Filters: NAICS, state, keyword, set-aside, federal or state only, posted within N days, open only, paging. | "Find open roofing contracts in Virginia posted in the last week." |
-| `search_grants` | Federal grant and funding opportunities. Filters: keyword, posted within N days, open only, paging (grant notices carry no state or NAICS). | "Are there open broadband grants?" |
+| `search_grants` | Federal grant and funding opportunities. Filters: NAICS, keyword, posted within N days, open only, paging (grant notices carry no state). | "Are there open broadband grants?" |
 | `search_jobs` | Job postings from the last 30 days. Filters: NAICS, state, keyword, posted within N days, paging. | "Show electrician jobs in Texas from the last 7 days." |
-| `search_by_naics` | The newest opportunities for up to 10 NAICS codes, of one type: contract, federal, state or job. | "What is new for NAICS 541511 and 541512 at the federal level?" |
+| `search_by_naics` | The newest opportunities for up to 10 NAICS codes, of one type: contract, federal, state, grant or job. | "What is new for NAICS 541511 and 541512 at the federal level?" |
 | `get_opportunity` | The full record of one opportunity: description, deadline, agency and contacts (name and title). | "Tell me more about the second result." |
 | `find_contacts` | Only the published points of contact for one opportunity. | "Who do I contact about that solicitation?" |
 

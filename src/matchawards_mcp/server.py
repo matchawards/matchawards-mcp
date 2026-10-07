@@ -97,9 +97,8 @@ OppId = Annotated[
     str, Field(pattern=r"^[A-Za-z0-9_-]{1,128}$", description="The id field of a search result.")
 ]
 NaicsType = Annotated[
-    Literal["contract", "federal", "state", "job"],
-    Field(description="contract = federal and state contracts; federal or state = one level only; job. "
-          "Grants have no NAICS code: use search_grants."),
+    Literal["contract", "federal", "state", "grant", "job"],
+    Field(description="contract = federal and state contracts; federal or state = one level only; grant; job."),
 ]
 
 
@@ -229,6 +228,7 @@ async def search_contracts(
 
 @_tool
 async def search_grants(
+    naics: OptNaics = None,
     keyword: Keyword = None,
     posted_within_days: PostedWithin = None,
     open: Open = None,
@@ -238,13 +238,14 @@ async def search_grants(
     """Search US federal grant and funding opportunities.
 
     Use this when the user wants grants or funding, not contracts. Returns {as_of, results, has_more,
-    next_cursor}; each result has id, title, agency, posted_at, response_deadline and a matchawards.com url.
-    Filters: keyword, posted_within_days, open (default true: open grants of any age), limit, cursor.
-    Grant notices carry no state or NAICS code, so filter by keyword instead. If has_more is true, call
-    again with cursor=next_cursor and the same filters. Example: keyword="broadband".
+    next_cursor}; each result has id, title, agency, naics, posted_at, response_deadline and a matchawards.com
+    url. Filters: naics, keyword, posted_within_days, open (default true: open grants of any age), limit,
+    cursor. Grant notices carry no state, so there is no state filter. If has_more is true, call again with
+    cursor=next_cursor and the same filters. Example: keyword="broadband" or naics="541715".
     """
     return await _search(
-        "grant", keyword=keyword, posted_within_days=posted_within_days, open=open, limit=limit, cursor=cursor,
+        "grant", naics=naics, keyword=keyword, posted_within_days=posted_within_days, open=open, limit=limit,
+        cursor=cursor,
     )
 
 
@@ -277,8 +278,8 @@ async def search_by_naics(naics: Naics, type: NaicsType = "contract", cursor: Cu
 
     Use this when the user gives NAICS codes and nothing else. Returns up to 20 results, {as_of, results,
     has_more, next_cursor}, each with a matchawards.com url. Filters: naics (required), type (contract,
-    federal, state or job), cursor (next_cursor of the previous call, same naics and type). For
-    keyword, state or other filters use search_contracts or search_jobs.
+    federal, state, grant or job), cursor (next_cursor of the previous call, same naics and type). For
+    keyword, state or other filters use search_contracts, search_grants or search_jobs.
     Example: naics="541511,541512", type="federal".
     """
     return await _search(type, naics=naics, cursor=cursor)
