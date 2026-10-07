@@ -109,14 +109,14 @@ def _error_message(r: httpx.Response) -> str:
     except ValueError:
         body = None
     body = body if isinstance(body, dict) else {}
-    error = body.get("error") or r.text.strip()[:200] or r.reason_phrase
+    error = body.get("message") or body.get("error") or r.text.strip()[:200] or r.reason_phrase
     if r.status_code == 429:
         wait = r.headers.get("Retry-After") or body.get("retry_after") or 60
         return (
             f"MatchAwards rate limit reached (per IP: 60 requests per minute, 20 per 5 seconds). "
             f"Wait {wait} seconds, then retry."
         )
-    if error == "grants_unavailable":
+    if body.get("error") == "grants_unavailable":
         return "Grant search is temporarily unavailable on MatchAwards. Try again later; contracts and jobs still work."
     if r.status_code >= 500:
         return f"MatchAwards server error (HTTP {r.status_code}). It is temporary; retry in a minute."
@@ -152,6 +152,15 @@ async def _get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any
             f"MatchAwards returned an unexpected response (HTTP {r.status_code}, not a JSON object). Retry later."
         )
     return data
+
+
+async def _get_one(id: str) -> dict[str, Any]:
+    """One opportunity: the API answers {as_of, result: {row..., description, contacts}}; return the row with as_of."""
+    data = await _get(f"{SEARCH_PATH}/{id}")
+    result = data.get("result")
+    if not isinstance(result, dict):
+        raise ToolError("MatchAwards returned an unexpected API response (no result object).")
+    return {**result, "as_of": data.get("as_of")}
 
 
 async def _search(type_: str, limit: int = 20, keyword: str | None = None, **filters: Any) -> dict[str, Any]:
@@ -292,7 +301,7 @@ async def get_opportunity(id: OppId) -> dict[str, Any]:
     Use this when the user wants details on one result. Returns the search row plus description
     (up to 2000 characters) and contacts [{name, title}], with the matchawards.com url. Example: id="abc123".
     """
-    return {**await _get(f"{SEARCH_PATH}/{id}"), "note": LINK_RULE}
+    return {**await _get_one(id), "note": LINK_RULE}
 
 
 @_tool
@@ -303,7 +312,7 @@ async def find_contacts(id: OppId) -> dict[str, Any]:
     contacts is [{name, title}] as the public matchawards.com page shows them; an empty list means none
     are published. Example: id="abc123".
     """
-    data = await _get(f"{SEARCH_PATH}/{id}")
+    data = await _get_one(id)
     return {
         "id": data.get("id", id),
         "title": data.get("title"),

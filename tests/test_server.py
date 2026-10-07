@@ -37,7 +37,8 @@ def anyio_backend():
 @pytest.fixture
 def api(monkeypatch):
     """Point the server's HTTP client at a mock. api.replies is a queue; the last reply repeats."""
-    api = SimpleNamespace(requests=[], replies=[lambda req: httpx.Response(200, json=page([1]))])
+    # The default reply suits both shapes: a search page and a single opportunity ({result: ...}).
+    api = SimpleNamespace(requests=[], replies=[lambda req: httpx.Response(200, json={**page([1]), "result": row(1)})])
 
     def handler(req):
         api.requests.append(req)
@@ -161,18 +162,21 @@ async def test_complete_search_has_no_warning(api):
 
 @pytest.mark.anyio
 async def test_get_opportunity_passes_json_through_with_link_note(api):
-    api.replies = [ok(DETAIL)]
-    assert await server.get_opportunity("7") == {**DETAIL, "note": NOTE}
+    api.replies = [ok({"as_of": "2026-10-07T12:00:00Z", "result": DETAIL})]
+    assert await server.get_opportunity("7") == {**DETAIL, "as_of": "2026-10-07T12:00:00Z", "note": NOTE}
 
 
 @pytest.mark.anyio
 async def test_find_contacts_returns_only_id_title_url_and_contacts(api):
-    api.replies = [ok(DETAIL)]
+    api.replies = [ok({"as_of": "x", "result": DETAIL})]
     assert await server.find_contacts("7") == {
         "id": "7", "title": "Notice 7", "url": "https://matchawards.com/a/posts/7", "contacts": DETAIL["contacts"],
     }
-    api.replies = [ok(row(8))]
+    api.replies = [ok({"as_of": "x", "result": row(8)})]
     assert (await server.find_contacts("8"))["contacts"] == []
+    api.replies = [ok(row(9))]  # old top-level shape: not accepted
+    with pytest.raises(ToolError, match="no result object"):
+        await server.find_contacts("9")
 
 
 def _raise(exc_type):
@@ -187,10 +191,14 @@ def _raise(exc_type):
      "Wait 30 seconds"),
     (lambda req: httpx.Response(429, json={"error": "rate_limited", "retry_after": 12}), "Wait 12 seconds"),
     (lambda req: httpx.Response(429), "Wait 60 seconds"),
-    (lambda req: httpx.Response(400, json={"error": "only for contract or federal", "parameter": "set_aside"}),
-     "parameter 'set_aside': only for contract or federal"),
+    (lambda req: httpx.Response(400, json={"error": "unsupported_filter", "parameter": "set_aside",
+                                           "message": "set_aside is only for contract or federal"}),
+     "parameter 'set_aside': set_aside is only for contract or federal"),
+    (lambda req: httpx.Response(400, json={"error": "invalid_parameter", "parameter": "state"}),
+     "parameter 'state': invalid_parameter"),
     (lambda req: httpx.Response(404, json={"error": "not_found"}), "Not found on MatchAwards"),
-    (lambda req: httpx.Response(503, json={"error": "grants_unavailable"}), "Grant search is temporarily unavailable"),
+    (lambda req: httpx.Response(503, json={"error": "grants_unavailable", "message": "open grant list is stale"}),
+     "Grant search is temporarily unavailable"),
     (lambda req: httpx.Response(500, json={"error": "internal_error"}), "server error \\(HTTP 500\\)"),
     (lambda req: httpx.Response(502, text="<html>bad gateway</html>"), "server error \\(HTTP 502\\)"),
     (_raise(httpx.ReadTimeout), "did not answer within 20 seconds"),
