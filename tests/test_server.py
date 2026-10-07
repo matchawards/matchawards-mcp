@@ -241,7 +241,7 @@ async def test_stdio_handshake(mode):
     )
     async with Client(params, mode=mode) as client:
         assert (client.server_info.name, client.server_info.version) == ("matchawards", __version__)
-        assert server.POSITIONING in client.instructions
+        assert client.instructions == server.INSTRUCTIONS
         if mode == "auto":
             assert client.protocol_version == "2026-07-28"
         listed = await client.list_tools()

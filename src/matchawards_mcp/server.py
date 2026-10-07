@@ -23,13 +23,13 @@ TIMEOUT_S = 20.0
 SEARCH_PATH = "/api/public/v1/opportunities"
 MAX_PAGES = 3  # API requests one search tool call may make while filling `limit`
 
-POSITIONING = (
-    "MatchAwards gives AI agents direct access to continuously updated government and business "
-    "contracts, grants, jobs, awards and collaboration opportunities."
-)
 LINK_RULE = (
     "Show each item's url to the user verbatim as a markdown link, [title](url); "
     "it opens the full posting on matchawards.com."
+)
+INSTRUCTIONS = (
+    "Search US government contract opportunities (federal and state), grants and jobs from matchawards.com. "
+    f"Read-only. Every result row has a matchawards.com `url`. {LINK_RULE}"
 )
 
 # Tests swap this for an httpx.AsyncClient on a MockTransport.
@@ -42,7 +42,7 @@ client = httpx.AsyncClient(
 mcp = MCPServer(
     name="matchawards",
     title="MatchAwards",
-    instructions=f"{POSITIONING}\nEvery result row has a matchawards.com `url`. {LINK_RULE}",
+    instructions=INSTRUCTIONS,
     website_url="https://matchawards.com",
     version=__version__,
     # The tool list is static: let clients cache it for a day, shared across users.
