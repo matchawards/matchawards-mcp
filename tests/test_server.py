@@ -130,6 +130,26 @@ async def test_failed_follow_up_keeps_the_rows_already_collected(api):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("body", [
+    {"results": ["1", "2"], "has_more": False},
+    {"results": {"id": "1"}, "has_more": False},
+    {"has_more": False},
+])
+async def test_malformed_results_are_a_tool_error(api, body):
+    api.replies = [ok(body)]
+    with pytest.raises(ToolError, match="unexpected API response"):
+        await server.search_contracts()
+
+
+@pytest.mark.anyio
+async def test_malformed_follow_up_page_keeps_rows_with_warning(api):
+    api.replies = [ok(page([1], has_more=True, cursor="c1")), ok({"results": [None], "has_more": False})]
+    out = await server.search_contracts(limit=5)
+    assert [r["id"] for r in out["results"]] == ["1"]
+    assert "unexpected API response" in out["warning"]
+
+
+@pytest.mark.anyio
 async def test_complete_search_has_no_warning(api):
     api.replies = [ok(page([1, 2], has_more=True, cursor="c1"))]
     assert "warning" not in await server.search_contracts(limit=2)

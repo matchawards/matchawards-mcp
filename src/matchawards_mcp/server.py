@@ -168,6 +168,9 @@ async def _search(type_: str, limit: int = 20, keyword: str | None = None, **fil
         try:
             # Ask only for what is still missing, so no row is read past the cursor and then dropped.
             next_page = await _get(SEARCH_PATH, {**params, "limit": limit - len(rows)})
+            results = next_page.get("results")
+            if not isinstance(results, list) or not all(isinstance(r, dict) for r in results):
+                raise ToolError("MatchAwards returned an unexpected API response (results is not a list of objects).")
         except ToolError as e:
             if not page:
                 raise  # first page: nothing to return, so the call fails
@@ -176,7 +179,7 @@ async def _search(type_: str, limit: int = 20, keyword: str | None = None, **fil
             break
         page = next_page
         as_of = as_of or page.get("as_of")
-        for row in page.get("results") or []:
+        for row in results:
             rows.setdefault(row.get("id"), row)
         if len(rows) >= limit or not (page.get("has_more") and page.get("next_cursor")):
             break
