@@ -1,0 +1,47 @@
+[project]
+name = "matchawards-mcp"
+dynamic = ["version"]
+description = "MCP server for MatchAwards: search US government contracts, grants and jobs from matchawards.com."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "MatchAwards" }]
+keywords = [
+  "mcp", "model-context-protocol", "ai-agent", "claude", "cursor",
+  "matchawards", "government-contracts", "federal-contracts", "grants",
+  "jobs", "sam-gov", "naics",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+  "mcp[cli]==2.3.0",
+  "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://matchawards.com"
+Repository = "https://github.com/matchawards/matchawards-mcp"
+Issues = "https://github.com/matchawards/matchawards-mcp/issues"
+
+[project.scripts]
+matchawards-mcp = "matchawards_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/matchawards_mcp/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/matchawards_mcp"]
