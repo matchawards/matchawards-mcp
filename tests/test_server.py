@@ -65,6 +65,7 @@ def ok(body):
               "posted_within_days": "7", "open": "false", "limit": "5", "cursor": "abc="}),
     (lambda: server.search_grants(keyword="broadband", state="NC", open=True),
      PATH, {"type": "grant", "q": "broadband", "state": "NC", "open": "true", "limit": "20"}),
+    (lambda: server.search_jobs(), PATH, {"type": "job", "posted_within_days": "30", "limit": "20"}),
     (lambda: server.search_jobs(keyword="electrician", posted_within_days=7),
      PATH, {"type": "job", "q": "electrician", "posted_within_days": "7", "limit": "20"}),
     (lambda: server.search_contracts(cursor="", set_aside=""), PATH, {"type": "contract", "limit": "20"}),

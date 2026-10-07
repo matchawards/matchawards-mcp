@@ -82,9 +82,7 @@ SetAside = Annotated[str | None, Field(description="Set-aside code, e.g. 'SBA' o
 PostedWithin = Annotated[
     int | None, Field(ge=1, le=180, description="Only items posted in the last N days, 1 to 180 (default 180).")
 ]
-JobsPostedWithin = Annotated[
-    int | None, Field(ge=1, le=30, description="Only jobs posted in the last N days, 1 to 30 (default 30).")
-]
+JobsPostedWithin = Annotated[int, Field(ge=1, le=30, description="Only jobs posted in the last N days, 1 to 30.")]
 Open = Annotated[
     bool | None,
     Field(description="true (the default): only items with a response deadline of today or later, US Eastern; "
@@ -254,7 +252,7 @@ async def search_jobs(
     naics: OptNaics = None,
     state: State = None,
     keyword: Keyword = None,
-    posted_within_days: JobsPostedWithin = None,
+    posted_within_days: JobsPostedWithin = 30,
     limit: Limit = 20,
     cursor: Cursor = None,
 ) -> dict[str, Any]:
