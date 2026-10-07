@@ -17,6 +17,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Tag must equal the package version and both server.json versions
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(python3 -c "import re; print(re.search(r'__version__ = \"([^\"]+)\"', open('src/matchawards_mcp/__init__.py').read())[1])")
+          listing=$(python3 -c "import json; d = json.load(open('server.json')); print(d['version'], d['packages'][0]['version'])")
+          echo "tag=$GITHUB_REF_NAME package=$pkg server.json=$listing"
+          [ "$GITHUB_REF_NAME" = "v$tag" ] && [ "$pkg" = "$tag" ] && [ "$listing" = "$tag $tag" ]
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -41,9 +49,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install mcp-publisher
+      - name: Install mcp-publisher (pinned, sha256 from the release's checksums file)
+        env:
+          MCP_PUBLISHER_VERSION: v1.8.1
+          MCP_PUBLISHER_SHA256: a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc
         run: |
-          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/').tar.gz" -o mcp-publisher.tar.gz
+          curl -fsSL -o mcp-publisher.tar.gz "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          echo "${MCP_PUBLISHER_SHA256}  mcp-publisher.tar.gz" | sha256sum -c -
           tar -xzf mcp-publisher.tar.gz mcp-publisher
           chmod +x mcp-publisher
 
