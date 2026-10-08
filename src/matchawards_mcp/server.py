@@ -6,7 +6,12 @@ Serves stdio by default; `--http` serves the same tools over stateless Streamabl
 """
 
 import argparse
+import asyncio
+import contextlib
+import contextvars
+import functools
 import hashlib
+import hmac
 import inspect
 import ipaddress
 import logging
@@ -28,8 +33,9 @@ from pydantic import Field
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
+from starlette.routing import Route
 
-from . import __version__
+from . import __version__, usage
 
 API_BASE = os.environ.get("MATCHAWARDS_API_BASE", "https://matchawards.com").rstrip("/")
 USER_AGENT = f"matchawards-mcp/{__version__} (+https://github.com/matchawards/matchawards-mcp)"
@@ -49,6 +55,10 @@ INSTRUCTIONS = (
 # HTTP mode only: API calls per minute for the whole server (the API does not rate-limit this server's address,
 # and one search can make up to MAX_PAGES calls). None in stdio mode, where the API's own per-IP limit applies.
 api_budget = None
+
+# HTTP mode only: the usage ledger (None when disabled, and always in stdio mode) and the request being served.
+ledger: usage.Ledger | None = None
+_request: contextvars.ContextVar[dict | None] = contextvars.ContextVar("matchawards_request", default=None)
 
 # Tests swap this for an httpx.AsyncClient on a MockTransport.
 client = httpx.AsyncClient(
@@ -75,8 +85,38 @@ READ_ONLY = ToolAnnotations(
 
 
 def _tool(fn):
-    """Register a read-only tool; its cleaned docstring is the description the model reads."""
-    return mcp.tool(annotations=READ_ONLY, description=inspect.cleandoc(fn.__doc__))(fn)
+    """Register a read-only tool; its cleaned docstring is the description the model reads.
+
+    In --http mode each call that reaches the tool is counted and written to the usage ledger: tool name, outcome,
+    latency and who called (see HttpGuard). Never the arguments. Outside an HTTP request (stdio) it records nothing."""
+
+    @functools.wraps(fn)
+    async def recorded(*args, **kwargs):
+        req = _request.get()
+        if req is None:
+            return await fn(*args, **kwargs)
+        start, outcome = time.monotonic(), "internal_error"
+        try:
+            result = await fn(*args, **kwargs)
+            outcome = "ok"
+            return result
+        except ToolError as e:
+            outcome = getattr(e, "outcome", "upstream_error")
+            raise
+        finally:
+            usage.metrics.inc("mcp_tool_calls_total", tool=fn.__name__, outcome=outcome)
+            if ledger is not None:
+                ledger.submit(usage.Ledger.write_call, fn.__name__, outcome, req["client"], req["ua"],
+                              req["family"], req["fp"], round((time.monotonic() - start) * 1000))
+
+    return mcp.tool(annotations=READ_ONLY, description=inspect.cleandoc(fn.__doc__))(recorded)
+
+
+def _fail(outcome: str, message: str) -> ToolError:
+    """A ToolError tagged with its usage-ledger outcome. An untagged ToolError is recorded as upstream_error."""
+    e = ToolError(message)
+    e.outcome = outcome
+    return e
 
 
 # Optional filters are Annotated[X | None, Field(...)] so the description sits at the top level of
@@ -149,7 +189,7 @@ async def _get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any
     """GET one API path; turn every failure into a ToolError the model can act on."""
     query = {k: v for k, v in (params or {}).items() if v is not None and v != ""}  # "" = unset, e.g. cursor=""
     if api_budget is not None and (wait := api_budget.check("api")):
-        raise ToolError(f"MatchAwards is busy right now. Retry in {wait} seconds.")
+        raise _fail("busy", f"MatchAwards is busy right now. Retry in {wait} seconds.")
     try:
         r = await client.get(path, params=query)
     except httpx.TimeoutException:
@@ -161,8 +201,10 @@ async def _get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any
         raise ToolError(
             f"Could not reach MatchAwards at {API_BASE} ({type(e).__name__}). Check the network and retry later."
         ) from None
-    if r.status_code >= 400:
-        raise ToolError(_error_message(r))
+    if r.status_code == 429:
+        raise _fail("rate_limited_upstream", _error_message(r))
+    if r.status_code >= 400:  # 4xx: the API rejected the parameters or the id (grants_unavailable is a 503)
+        raise _fail("upstream_error" if r.status_code >= 500 else "invalid_input", _error_message(r))
     try:
         data = r.json()
     except ValueError:
@@ -435,49 +477,81 @@ def _host_name(host: str) -> str:
 
 class HttpGuard:
     """Runs before the MCP layer, in this order: path (404), Host (421), method (405), body size (411/413),
-    per-client then global rate limit (429). Writes one access line per request."""
+    per-client then global rate limit (429). Writes one access line per request.
+
+    A rejection is counted in mcp_rejected_total{reason}. A request passed on to /mcp is counted by JSON-RPC method
+    and User-Agent family, added to the daily transport aggregate, and made visible to the tool wrapper (_tool)."""
 
     def __init__(self, app, limiter: RateLimiter, prefix_limiter: RateLimiter, global_limiter: RateLimiter,
-                 trusted_proxies, allowed_hosts):
+                 trusted_proxies, allowed_hosts, usage_salt: bytes | None = None):
         self.app, self.limiter, self.prefix_limiter, self.global_limiter = app, limiter, prefix_limiter, global_limiter
-        self.trusted_proxies, self.allowed_hosts = trusted_proxies, allowed_hosts
+        self.trusted_proxies, self.allowed_hosts, self.usage_salt = trusted_proxies, allowed_hosts, usage_salt
 
-    def reject(self, scope, path: str, key: str) -> Response | None:
-        """The response that ends this request here, or None to pass it on."""
+    def reject(self, scope, path: str, key: str) -> tuple[str, Response] | None:
+        """(reason, response) that ends this request here, or None to pass it on."""
         if path == "/healthz":
             return None  # unlimited; the route itself answers 405 to anything but GET/HEAD
         if path != "/mcp":
-            return PlainTextResponse("Not Found", status_code=404)
+            return "path", PlainTextResponse("Not Found", status_code=404)
         headers = {k: v.decode("latin-1") for k, v in scope["headers"] if k in (b"host", b"content-length")}
         if _host_name(headers.get(b"host", "")) not in self.allowed_hosts:
-            return PlainTextResponse("Invalid Host header", status_code=421)
+            return "host", PlainTextResponse("Invalid Host header", status_code=421)
         if scope["method"] != "POST":
             # Stateless server: no SSE stream to GET, no session to DELETE, no CORS preflight (OPTIONS).
-            return Response(status_code=405, headers={"Allow": "POST"})
+            return "method", Response(status_code=405, headers={"Allow": "POST"})
         length = headers.get(b"content-length")
         if length is None:
-            return PlainTextResponse("Content-Length required", status_code=411)
+            return "size", PlainTextResponse("Content-Length required", status_code=411)
         if not length.isdigit():
-            return PlainTextResponse("Invalid Content-Length", status_code=400)
+            return "size", PlainTextResponse("Invalid Content-Length", status_code=400)
         if int(length) > MAX_BODY_BYTES:
-            return PlainTextResponse("Request body too large", status_code=413)
+            return "size", PlainTextResponse("Request body too large", status_code=413)
         # A request counts in the limits only when all of them allow it: a source adds at most its own budget to
         # the global count (IPv4 address 30/min, IPv6 /48 120/min, so 600 needs 5+ /48s or 20+ IPv4 addresses),
         # and a lockout at one level does not use up the budgets of the others. A distributed flood from that many
         # sources can still trip the global cap for everyone; Cloudflare in front of nginx is the outer layer.
         prefix = prefix_key(key)
-        checks = [(self.limiter, key), (self.global_limiter, "all")]
-        checks += [(self.prefix_limiter, prefix)] if prefix else []
-        if wait := next((w for limiter, k in checks if (w := limiter.wait(k))), 0):
-            return JSONResponse(
-                {"jsonrpc": "2.0", "id": None, "error": {
-                    "code": -32000, "message": f"Rate limit reached. Wait {wait} seconds, then retry.",
-                }},
-                status_code=429, headers={"Retry-After": str(wait)},
-            )
-        for limiter, k in checks:
+        checks = [(self.limiter, key, "client"), (self.global_limiter, "all", "global")]
+        checks += [(self.prefix_limiter, prefix, "prefix")] if prefix else []
+        for limiter, k, name in checks:
+            if wait := limiter.wait(k):
+                return f"rate_limit_{name}", JSONResponse(
+                    {"jsonrpc": "2.0", "id": None, "error": {
+                        "code": -32000, "message": f"Rate limit reached. Wait {wait} seconds, then retry.",
+                    }},
+                    status_code=429, headers={"Retry-After": str(wait)},
+                )
+        for limiter, k, _ in checks:
             limiter.record(k)
         return None
+
+    async def serve_mcp(self, scope, receive, send, key: str) -> None:
+        """Pass a request on to /mcp, observing it for the usage stats on the way.
+
+        The first usage.OBSERVE_BYTES of the body are copied as they stream past (never buffered or replayed), and
+        only the JSON-RPC method and clientInfo are read from them, after the response is sent."""
+        headers = dict(scope["headers"])
+        ua = usage.clean(headers.get(b"user-agent", b"").decode("latin-1"), 200)
+        req = {"client": usage.truncate_key(key), "ua": ua, "family": usage.classify_ua(ua),
+               "fp": usage.fingerprint(headers, self.usage_salt)}
+        seen = bytearray()
+
+        async def observing_receive():
+            message = await receive()
+            if message["type"] == "http.request" and len(seen) < usage.OBSERVE_BYTES:
+                seen.extend(message.get("body", b"")[: usage.OBSERVE_BYTES - len(seen)])
+            return message
+
+        token = _request.set(req)
+        try:
+            await self.app(scope, observing_receive, send)
+        finally:
+            _request.reset(token)
+            method, name, version = usage.parse_body(bytes(seen))
+            usage.metrics.inc("mcp_requests_total", method=method)
+            usage.metrics.inc("mcp_agent_requests_total", family=req["family"])
+            if ledger is not None:
+                ledger.submit(usage.Ledger.write_transport, req["client"], method, name, version, ua)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -492,8 +566,11 @@ class HttpGuard:
             await send(message)
 
         try:
-            if response := self.reject(scope, path, key):
-                await response(scope, receive, send_status)
+            if rejected := self.reject(scope, path, key):
+                usage.metrics.inc("mcp_rejected_total", reason=rejected[0])
+                await rejected[1](scope, receive, send_status)
+            elif path == "/mcp":
+                await self.serve_mcp({**scope, "path": path, "raw_path": path.encode()}, receive, send_status, key)
             else:
                 await self.app({**scope, "path": path, "raw_path": path.encode()}, receive, send_status)
         finally:
@@ -527,8 +604,9 @@ def http_app() -> Starlette:
     hosts = [h.strip() for h in os.environ.get(
         "MATCHAWARDS_ALLOWED_HOSTS", "matchawards.com,staging.matchawards.com").split(",") if h.strip()]
     hosts += ["127.0.0.1", "localhost", "[::1]"]
-    global api_budget
+    global api_budget, ledger
     api_budget = RateLimiter(_env_int("MATCHAWARDS_GLOBAL_API_PER_MIN", 900), 0)
+    ledger = usage.Ledger.open(os.environ.get("MATCHAWARDS_USAGE_DB", usage.DEFAULT_DB))
     # Peers whose X-Real-IP is believed. Loopback only by default; in Docker the deployment names the exact
     # address nginx connects from (the compose network's gateway), never a broad private range.
     try:
@@ -558,12 +636,32 @@ def http_app() -> Starlette:
         global_limiter=RateLimiter(_env_int("MATCHAWARDS_GLOBAL_PER_MIN", 600), 0),
         allowed_hosts={h.lower() for h in hosts},
         trusted_proxies=trusted,
+        usage_salt=os.environ.get("MATCHAWARDS_USAGE_SALT", "").encode() or None,
     )
     return app
 
 
+def metrics_app(token: str) -> Starlette:
+    """GET /metrics in the Prometheus text format, for its own listener (MATCHAWARDS_METRICS_HOST/PORT) only.
+
+    Not on the /mcp app: that port trusts X-Real-IP from the proxy, so it is never the one published to the
+    internal network. Bearer `token` required; anything else on this listener is 404."""
+    expected = f"Bearer {token}".encode()
+
+    async def serve_metrics(request: Request) -> Response:
+        if not hmac.compare_digest(request.headers.get("authorization", "").encode("latin-1"), expected):
+            return PlainTextResponse("Unauthorized", status_code=401, headers={"WWW-Authenticate": "Bearer"})
+        return PlainTextResponse(usage.metrics.render(), media_type="text/plain; version=0.0.4")
+
+    return Starlette(routes=[Route("/metrics", serve_metrics, methods=["GET"])])
+
+
 def main(argv: list[str] | None = None) -> None:
-    """Console entry point: stdio by default, `--http` for the hosted mode."""
+    """Console entry point: stdio by default, `--http` for the hosted mode, `stats` to read the usage ledger."""
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["stats"]:
+        usage.stats_main(argv[1:])
+        return
     parser = argparse.ArgumentParser(prog="matchawards-mcp", description="MatchAwards MCP server.")
     parser.add_argument(
         "--http", action="store_true",
@@ -581,8 +679,7 @@ def main(argv: list[str] | None = None) -> None:
     access_log.addHandler(handler)
     access_log.setLevel(logging.INFO)
     access_log.propagate = False
-    uvicorn.run(
-        http_app(),
+    options = dict(
         host=os.environ.get("MATCHAWARDS_HTTP_HOST", "127.0.0.1"),
         port=_env_int("MATCHAWARDS_HTTP_PORT", 8765),
         access_log=False,  # HttpGuard writes the one access line, without the raw client address
@@ -591,3 +688,30 @@ def main(argv: list[str] | None = None) -> None:
         limit_concurrency=100,  # past this many open connections uvicorn answers 503
         timeout_keep_alive=5,
     )
+    token = os.environ.get("MATCHAWARDS_METRICS_TOKEN", "")
+    if not token:
+        uvicorn.run(http_app(), **options)
+        return
+    metrics_options = dict(
+        host=os.environ.get("MATCHAWARDS_METRICS_HOST", "127.0.0.1"), port=_env_int("MATCHAWARDS_METRICS_PORT", 9765),
+        access_log=False, proxy_headers=False, server_header=False, limit_concurrency=10, timeout_keep_alive=5,
+    )
+    asyncio.run(_serve_both(uvicorn, uvicorn.Config(http_app(), **options),
+                            uvicorn.Config(metrics_app(token), **metrics_options)))
+
+
+async def _serve_both(uvicorn, main_config, metrics_config) -> None:
+    """The /mcp server and the metrics listener in one process. The /mcp server owns the signals (Ctrl+C, SIGTERM);
+    when it stops, the metrics listener stops too."""
+
+    class MetricsServer(uvicorn.Server):
+        def capture_signals(self):
+            return contextlib.nullcontext()
+
+    metrics_server = MetricsServer(metrics_config)
+    metrics_task = asyncio.create_task(metrics_server.serve())
+    try:
+        await uvicorn.Server(main_config).serve()
+    finally:
+        metrics_server.should_exit = True
+        await metrics_task

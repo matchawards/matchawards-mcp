@@ -21,9 +21,12 @@ LEGACY = {"MCP-Protocol-Version": "2025-06-18", "Accept": "application/json, tex
 
 
 @pytest.fixture(autouse=True)
-def no_api_budget_leak(monkeypatch):
-    """http_app() installs a server-wide API budget; put the stdio default (None) back after each test."""
+def no_api_budget_leak(monkeypatch, tmp_path):
+    """http_app() installs a server-wide API budget and a usage ledger; put the stdio defaults (None) back after
+    each test, and keep the ledger in a temporary directory."""
     monkeypatch.setattr(server, "api_budget", None)
+    monkeypatch.setattr(server, "ledger", None)
+    monkeypatch.setenv("MATCHAWARDS_USAGE_DB", str(tmp_path / "usage.db"))
 
 
 @contextlib.asynccontextmanager
