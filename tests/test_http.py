@@ -165,7 +165,9 @@ def test_main_parses_http_flag(monkeypatch):
     server.main(["--http"])
     assert calls[0] == ("stdio", {"transport": "stdio"})
     assert calls[1][0] == "http"
-    assert (calls[1][1]["host"], calls[1][1]["port"], calls[1][1]["access_log"]) == ("127.0.0.1", 9999, False)
+    kw = calls[1][1]
+    assert (kw["host"], kw["port"], kw["access_log"], kw["proxy_headers"]) == ("127.0.0.1", 9999, False, False)
+    assert (kw["limit_concurrency"], kw["timeout_keep_alive"]) == (100, 5)
 
 
 @pytest.mark.anyio
@@ -287,3 +289,23 @@ async def test_a_lying_content_length_is_still_capped_by_the_sdk():
     async with app.router.lifespan_context(app):
         await app(scope, receive, send)
     assert sent[0]["status"] == 413
+
+
+@pytest.mark.anyio
+async def test_one_client_hammering_leaves_the_global_budget_open(monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_GLOBAL_PER_MIN", "11")  # default burst 10: the abuser gets 10 through
+    async with http() as hc:
+        codes = [(await ping(hc, "198.51.100.66")).status_code for _ in range(1000)]
+        assert codes.count(200) == 10 and codes.count(429) == 990
+        assert (await ping(hc, "198.51.100.67")).status_code == 200  # 990 rejections never touched the global count
+        assert (await ping(hc, "198.51.100.68")).status_code == 429  # and the 11-per-minute global cap holds
+
+
+@pytest.mark.parametrize("name, value", [
+    ("MATCHAWARDS_RATE_PER_MIN", "0"), ("MATCHAWARDS_RATE_BURST", "ten"), ("MATCHAWARDS_GLOBAL_PER_MIN", "-5"),
+    ("MATCHAWARDS_RATE_PER_MIN", ""), ("MATCHAWARDS_TRUSTED_PROXIES", "10.0.0.0/33"),
+])
+def test_bad_env_stops_startup_with_a_clear_message(monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+    with pytest.raises(SystemExit, match=name):
+        server.http_app()

@@ -435,7 +435,9 @@ class HttpGuard:
             return PlainTextResponse("Invalid Content-Length", status_code=400)
         if int(length) > MAX_BODY_BYTES:
             return PlainTextResponse("Request body too large", status_code=413)
-        # Per client first: a request it rejects never uses up the shared budget.
+        # Per client first, and the global counter only sees requests that passed it: one client adds at most
+        # its own per-minute budget, so 600 needs 20+ clients. A distributed flood from that many addresses can
+        # still trip the global cap for everyone; Cloudflare in front of nginx is the outer layer for that.
         if wait := self.limiter.check(key) or self.global_limiter.check("all"):
             return JSONResponse(
                 {"jsonrpc": "2.0", "id": None, "error": {
@@ -480,11 +482,24 @@ async def healthz(request: Request) -> Response:
     return PlainTextResponse("ok")
 
 
+def _env_int(name: str, default: int) -> int:
+    """A whole number >= 1 from the environment; a bad value stops the server at startup with a clear message."""
+    raw = os.environ.get(name, str(default))
+    if not raw.strip().isdigit() or int(raw) < 1:
+        raise SystemExit(f"{name} must be a whole number >= 1, got {raw!r}")
+    return int(raw)
+
+
 def http_app() -> Starlette:
     """The ASGI app for --http: stateless Streamable HTTP with JSON replies at /mcp, plus GET /healthz."""
     hosts = [h.strip() for h in os.environ.get(
         "MATCHAWARDS_ALLOWED_HOSTS", "matchawards.com,staging.matchawards.com").split(",") if h.strip()]
     hosts += ["127.0.0.1", "localhost", "[::1]"]
+    try:  # peers whose X-Real-IP is believed: local nginx and Docker bridge gateways
+        trusted = [ipaddress.ip_network(n.strip()) for n in os.environ.get(
+            "MATCHAWARDS_TRUSTED_PROXIES", "127.0.0.1/32,::1/128,172.16.0.0/12").split(",") if n.strip()]
+    except ValueError as e:
+        raise SystemExit(f"MATCHAWARDS_TRUSTED_PROXIES must be comma-separated CIDRs: {e}") from None
     app = mcp.streamable_http_app(
         streamable_http_path="/mcp",
         stateless_http=True,
@@ -500,17 +515,11 @@ def http_app() -> Starlette:
     )
     app.add_middleware(
         HttpGuard,
-        limiter=RateLimiter(
-            int(os.environ.get("MATCHAWARDS_RATE_PER_MIN", "30")), int(os.environ.get("MATCHAWARDS_RATE_BURST", "10"))
-        ),
+        limiter=RateLimiter(_env_int("MATCHAWARDS_RATE_PER_MIN", 30), _env_int("MATCHAWARDS_RATE_BURST", 10)),
         # All clients together: bounds the load on the API, which does not rate-limit this server's address.
-        global_limiter=RateLimiter(int(os.environ.get("MATCHAWARDS_GLOBAL_PER_MIN", "600")), 0),
-        # Peers whose X-Real-IP is believed: local nginx and Docker bridge gateways.
+        global_limiter=RateLimiter(_env_int("MATCHAWARDS_GLOBAL_PER_MIN", 600), 0),
         allowed_hosts={h.lower() for h in hosts},
-        trusted_proxies=[
-            ipaddress.ip_network(n.strip()) for n in os.environ.get(
-                "MATCHAWARDS_TRUSTED_PROXIES", "127.0.0.1/32,::1/128,172.16.0.0/12").split(",") if n.strip()
-        ],
+        trusted_proxies=trusted,
     )
     return app
 
@@ -537,8 +546,10 @@ def main(argv: list[str] | None = None) -> None:
     uvicorn.run(
         http_app(),
         host=os.environ.get("MATCHAWARDS_HTTP_HOST", "127.0.0.1"),
-        port=int(os.environ.get("MATCHAWARDS_HTTP_PORT", "8765")),
+        port=_env_int("MATCHAWARDS_HTTP_PORT", 8765),
         access_log=False,  # HttpGuard writes the one access line, without the raw client address
         proxy_headers=False,  # the client address comes from X-Real-IP only, never X-Forwarded-For
         server_header=False,
+        limit_concurrency=100,  # past this many open connections uvicorn answers 503
+        timeout_keep_alive=5,
     )
