@@ -2,18 +2,31 @@
 
 Six tools, no auth, no state. Each call is a GET to `{MATCHAWARDS_API_BASE}/api/public/v1/opportunities`
 (a search tool may follow the cursor for up to MAX_PAGES requests) or to `.../opportunities/{id}`.
+Serves stdio by default; `--http` serves the same tools over stateless Streamable HTTP at /mcp.
 """
 
+import argparse
+import hashlib
 import inspect
+import ipaddress
+import logging
+import math
 import os
+import sys
+import time
+from collections import deque
 from typing import Annotated, Any, Literal
 
 import httpx
 from mcp.server.caching import CacheHint
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import Field
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 
 from . import __version__
 
@@ -321,10 +334,150 @@ async def find_contacts(id: OppId) -> dict[str, Any]:
     }
 
 
-def main() -> None:
-    """Console entry point. v0.1.0 serves stdio only.
+# --- HTTP mode -------------------------------------------------------------------------------------------
 
-    The tools live on the module-level `mcp`, so a later `--http` flag can serve the same set with
-    `mcp.streamable_http_app(stateless_http=True, json_response=True)` from here.
-    """
-    mcp.run(transport="stdio")
+access_log = logging.getLogger("matchawards_mcp.access")
+_LOG_SALT = os.urandom(16)  # client keys in the log are hashed with a per-process salt, never written raw
+
+
+class RateLimiter:
+    """Sliding window per client key: at most `per_min` requests in 60 s and `burst` in 5 s."""
+
+    # ponytail: per-process memory. One container runs one process, so this is the whole limit. If the service
+    # is ever scaled out (several workers or containers), each keeps its own counts and the real limit multiplies:
+    # then move the counters to a shared store (Redis) or to nginx limit_req keyed on the same client address.
+
+    def __init__(self, per_min: int, burst: int, clock=time.monotonic):
+        self.per_min, self.burst, self.clock = per_min, burst, clock
+        self.hits: dict[str, deque[float]] = {}  # one deque per key, never longer than per_min
+        self.next_sweep = 0.0
+
+    def check(self, key: str) -> int:
+        """Count one request. Return 0 if it is allowed, else the seconds to wait (it is then not counted)."""
+        now = self.clock()
+        if now >= self.next_sweep:  # once a minute, forget idle clients so memory tracks active ones only
+            self.hits = {k: q for k, q in self.hits.items() if q and q[-1] > now - 60}
+            self.next_sweep = now + 60
+        q = self.hits.setdefault(key, deque())
+        while q and q[0] <= now - 60:
+            q.popleft()
+        if len(q) >= self.per_min:
+            return max(1, math.ceil(q[0] + 60 - now))
+        if self.burst and len(q) >= self.burst and q[-self.burst] > now - 5:
+            return max(1, math.ceil(q[-self.burst] + 5 - now))
+        q.append(now)
+        return 0
+
+
+def client_key(scope) -> str:
+    """X-Real-IP (set by nginx to the real client), else the socket peer. IPv6 is keyed per /64."""
+    real_ip = next((v.decode("latin-1") for k, v in scope["headers"] if k == b"x-real-ip"), "")
+    for raw in (real_ip, (scope.get("client") or ("",))[0]):
+        try:
+            ip = ipaddress.ip_address(raw.strip())
+        except ValueError:
+            continue
+        if ip.version == 6 and not ip.ipv4_mapped:
+            return str(ipaddress.ip_network((ip, 64), strict=False))
+        return str(getattr(ip, "ipv4_mapped", None) or ip)
+    return "unknown"
+
+
+class HttpGuard:
+    """Runs before the MCP layer: 405 for anything but POST /mcp, the per-client rate limit, one access line."""
+
+    def __init__(self, app, limiter: RateLimiter):
+        self.app, self.limiter = app, limiter
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        start, status, key = time.monotonic(), 0, client_key(scope)
+
+        async def send_status(message):
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+            await send(message)
+
+        try:
+            if scope["path"] == "/mcp" and scope["method"] != "POST":
+                # Stateless server: no SSE stream to GET, no session to DELETE.
+                response = Response(status_code=405, headers={"Allow": "POST"})
+            elif scope["path"] == "/mcp" and (wait := self.limiter.check(key)):
+                response = JSONResponse(
+                    {"jsonrpc": "2.0", "id": None, "error": {
+                        "code": -32000,
+                        "message": f"Rate limit reached for your address. Wait {wait} seconds, then retry.",
+                    }},
+                    status_code=429, headers={"Retry-After": str(wait)},
+                )
+            else:
+                return await self.app(scope, receive, send_status)
+            await response(scope, receive, send_status)
+        finally:
+            # Method, path, status, duration, hashed client key. Never headers (Authorization) or bodies.
+            access_log.info(
+                "%s %s %s %dms client=%s", scope["method"], scope["path"], status,
+                (time.monotonic() - start) * 1000, hashlib.blake2s(key.encode(), key=_LOG_SALT, digest_size=6).hexdigest(),
+            )
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def healthz(request: Request) -> Response:
+    return PlainTextResponse("ok")
+
+
+def http_app() -> Starlette:
+    """The ASGI app for --http: stateless Streamable HTTP with JSON replies at /mcp, plus GET /healthz."""
+    hosts = [h.strip() for h in os.environ.get(
+        "MATCHAWARDS_ALLOWED_HOSTS", "matchawards.com,staging.matchawards.com").split(",") if h.strip()]
+    hosts += ["127.0.0.1", "localhost", "[::1]"]
+    app = mcp.streamable_http_app(
+        streamable_http_path="/mcp",
+        stateless_http=True,
+        json_response=True,
+        # Host check (DNS rebinding): a Host outside the list gets 421, a foreign Origin 403.
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=hosts + [f"{h}:*" for h in hosts],
+            allowed_origins=[f"{s}://{h}" for h in hosts for s in ("https", "http")]
+            + [f"{s}://{h}:*" for h in hosts for s in ("https", "http")],
+        ),
+    )
+    app.add_middleware(
+        HttpGuard,
+        limiter=RateLimiter(
+            int(os.environ.get("MATCHAWARDS_RATE_PER_MIN", "30")), int(os.environ.get("MATCHAWARDS_RATE_BURST", "10"))
+        ),
+    )
+    return app
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Console entry point: stdio by default, `--http` for the hosted mode."""
+    parser = argparse.ArgumentParser(prog="matchawards-mcp", description="MatchAwards MCP server.")
+    parser.add_argument(
+        "--http", action="store_true",
+        help="serve stateless Streamable HTTP at /mcp (MATCHAWARDS_HTTP_HOST, MATCHAWARDS_HTTP_PORT) instead of stdio",
+    )
+    if not parser.parse_args(argv).http:
+        mcp.run(transport="stdio")
+        return
+
+    import uvicorn
+
+    logging.getLogger().setLevel(logging.WARNING)  # the SDK logs INFO lines per request; keep one access line
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    access_log.addHandler(handler)
+    access_log.setLevel(logging.INFO)
+    access_log.propagate = False
+    uvicorn.run(
+        http_app(),
+        host=os.environ.get("MATCHAWARDS_HTTP_HOST", "127.0.0.1"),
+        port=int(os.environ.get("MATCHAWARDS_HTTP_PORT", "8765")),
+        access_log=False,  # HttpGuard writes the one access line, without the raw client address
+        proxy_headers=False,  # the client address comes from X-Real-IP only, never X-Forwarded-For
+        server_header=False,
+    )
