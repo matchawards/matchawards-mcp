@@ -19,7 +19,7 @@ from . import __version__
 
 API_BASE = os.environ.get("MATCHAWARDS_API_BASE", "https://matchawards.com").rstrip("/")
 USER_AGENT = f"matchawards-mcp/{__version__} (+https://github.com/matchawards/matchawards-mcp)"
-TIMEOUT_S = 20.0
+TIMEOUT_S = 10.0  # the API answers within about 2 s by design
 SEARCH_PATH = "/api/public/v1/opportunities"
 MAX_PAGES = 3  # API requests one search tool call may make while filling `limit`
 

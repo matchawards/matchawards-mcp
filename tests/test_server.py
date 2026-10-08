@@ -201,7 +201,7 @@ def _raise(exc_type):
      "Grant search is temporarily unavailable"),
     (lambda req: httpx.Response(500, json={"error": "internal_error"}), "server error \\(HTTP 500\\)"),
     (lambda req: httpx.Response(502, text="<html>bad gateway</html>"), "server error \\(HTTP 502\\)"),
-    (_raise(httpx.ReadTimeout), "did not answer within 20 seconds"),
+    (_raise(httpx.ReadTimeout), "did not answer within 10 seconds"),
     (_raise(httpx.ConnectError), "Could not reach MatchAwards"),
     (lambda req: httpx.Response(200, text="<html>maintenance</html>"), "not a JSON object"),
     (lambda req: httpx.Response(200, json=[1, 2]), "not a JSON object"),
