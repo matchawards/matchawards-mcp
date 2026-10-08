@@ -19,12 +19,9 @@ This is the [Model Context Protocol](https://modelcontextprotocol.io) server for
 
 Every result carries a `url` on matchawards.com, and the server asks the model to show it to you as a link.
 
-## Hosted (coming soon)
+## Hosted
 
-<!-- Release note: 0.2.0 ships without a server.json "remotes" entry. Add it in 0.2.1, once https://matchawards.com/mcp
-     is live: "remotes": [{"type": "streamable-http", "url": "https://matchawards.com/mcp"}] -->
-
-A hosted endpoint is planned at `https://matchawards.com/mcp`. It is **not live yet**. Once it is, you add it as a remote MCP server (connector) by URL, with nothing to install and no key:
+A hosted endpoint runs at `https://matchawards.com/mcp`. Add it as a remote MCP server (connector) by URL, with nothing to install and no key:
 
 - **ChatGPT**: add a custom connector with the URL `https://matchawards.com/mcp`.
 - **Claude** (claude.ai or Claude Desktop): Settings, Connectors, add a custom connector with the same URL. Claude Code: `claude mcp add --transport http matchawards https://matchawards.com/mcp`.
