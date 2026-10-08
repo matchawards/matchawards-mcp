@@ -354,13 +354,24 @@ class RateLimiter:
     # which resets that client's count. Behind nginx keys are real client addresses, so only a flood from more
     # than max_keys addresses in one minute gets there.
 
-    def __init__(self, per_min: int, burst: int, clock=time.monotonic, max_keys: int = 20_000):
-        self.per_min, self.burst, self.clock, self.max_keys = per_min, burst, clock, max_keys
+    def __init__(self, per_min: int, burst: int, clock=None, max_keys: int = 20_000):
+        self.per_min, self.burst, self.max_keys = per_min, burst, max_keys
+        self.clock = clock or time.monotonic
         self.hits: dict[str, deque[float]] = {}  # one deque per key, never longer than per_min
         self.next_sweep = 0.0
 
     def check(self, key: str) -> int:
         """Count one request. Return 0 if it is allowed, else the seconds to wait (it is then not counted)."""
+        wait = self.wait(key)
+        if not wait:
+            self.record(key)
+        return wait
+
+    def record(self, key: str) -> None:
+        self.hits.setdefault(key, deque()).append(self.clock())
+
+    def wait(self, key: str) -> int:
+        """Seconds until one more request from `key` would be allowed (0: now). Counts nothing."""
         now = self.clock()
         if now >= self.next_sweep:  # once a minute, forget idle clients so memory tracks active ones only
             self.hits = {k: q for k, q in self.hits.items() if q and q[-1] > now - 60}
@@ -375,7 +386,6 @@ class RateLimiter:
             return max(1, math.ceil(q[0] + 60 - now))
         if self.burst and len(q) >= self.burst and q[-self.burst] > now - 5:
             return max(1, math.ceil(q[-self.burst] + 5 - now))
-        q.append(now)
         return 0
 
 
@@ -436,16 +446,19 @@ class HttpGuard:
             return PlainTextResponse("Invalid Content-Length", status_code=400)
         if int(length) > MAX_BODY_BYTES:
             return PlainTextResponse("Request body too large", status_code=413)
-        # Per client first, and the global counter only sees requests that passed it: one client adds at most
-        # its own per-minute budget, so 600 needs 20+ IPv4 addresses or IPv6 /48s. A distributed flood from that many can
-        # still trip the global cap for everyone; Cloudflare in front of nginx is the outer layer for that.
-        if wait := self.limiter.check(key) or self.global_limiter.check("all"):
+        # A request counts in both limits only when both allow it: one client adds at most its own per-minute
+        # budget to the global count (so 600 needs 20+ IPv4 addresses or IPv6 /48s), and a global lockout does not
+        # use up honest clients' own budgets. A distributed flood from that many sources can still trip the global
+        # cap for everyone; Cloudflare in front of nginx is the outer layer for that.
+        if wait := self.limiter.wait(key) or self.global_limiter.wait("all"):
             return JSONResponse(
                 {"jsonrpc": "2.0", "id": None, "error": {
                     "code": -32000, "message": f"Rate limit reached. Wait {wait} seconds, then retry.",
                 }},
                 status_code=429, headers={"Retry-After": str(wait)},
             )
+        self.limiter.record(key)
+        self.global_limiter.record("all")
         return None
 
     async def __call__(self, scope, receive, send):

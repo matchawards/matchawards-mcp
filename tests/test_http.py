@@ -1,6 +1,7 @@
 """--http mode: the SDK's ASGI app driven in-process over httpx2.ASGITransport. No network."""
 
 import contextlib
+from types import SimpleNamespace
 import ipaddress
 import logging
 
@@ -317,3 +318,17 @@ async def test_requests_spread_over_a_56_are_one_client():
         codes = [(await ping(hc, f"2001:db8:0:ab{i % 256:02x}::{i:x}")).status_code for i in range(300)]
         assert codes.count(200) == 10  # the default burst of one client, not 256 fresh /64 budgets
         assert (await ping(hc, "198.51.100.1")).status_code == 200  # the global cap is nowhere near used up
+
+
+@pytest.mark.anyio
+async def test_a_global_lockout_does_not_use_up_a_clients_own_budget(monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_GLOBAL_PER_MIN", "3")
+    monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "3")
+    now = [1000.0]
+    monkeypatch.setattr(server, "time", SimpleNamespace(monotonic=lambda: now[0]))  # this module's clock only
+    async with http() as hc:
+        assert [(await ping(hc, f"198.51.100.{i}")).status_code for i in (1, 2, 3)] == [200] * 3
+        assert [(await ping(hc, "198.51.100.9")).status_code for _ in range(5)] == [429] * 5  # global lockout
+        now[0] += 61  # the global minute passes, the per-client 5 s burst window too
+        # .9 was never counted while locked out, so it has its full burst of 3
+        assert [(await ping(hc, "198.51.100.9")).status_code for _ in range(4)] == [200, 200, 200, 429]
