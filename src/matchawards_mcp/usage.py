@@ -102,8 +102,10 @@ def truncate_key(key: str) -> str:
 
 
 def fingerprint(headers: dict[bytes, bytes], salt: bytes | None) -> str | None:
-    """16-hex HMAC of x-openai-subject (else x-openai-session), to count distinct ChatGPT callers. None without salt."""
-    value = headers.get(b"x-openai-subject") or headers.get(b"x-openai-session")
+    """16-hex HMAC of x-openai-subject, to count distinct ChatGPT callers. None without salt.
+
+    Not x-openai-session: it changes per conversation, so it would count conversations, not callers."""
+    value = headers.get(b"x-openai-subject")
     if not salt or not value:
         return None
     return hmac.new(salt, value, hashlib.sha256).hexdigest()[:16]
@@ -165,14 +167,15 @@ def _now() -> datetime:
 class Ledger:
     """Best-effort writes on two dedicated threads: a failing write is counted in mcp_ledger_errors_total, never raised."""
 
-    # ponytail: unbounded executor queue. The rate limits cap input at MATCHAWARDS_GLOBAL_PER_MIN requests a minute,
-    # so the backlog stays small; bound it if those limits are ever lifted.
+    MAX_PENDING = 10_000  # writes queued past this (a stuck disk) are dropped and counted as ledger errors
 
     def __init__(self, path: str):
         self.path = path
         self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="usage-ledger")
         self.pruned_day = ""
         self.warned = False
+        self.pending = 0
+        self.pending_lock = threading.Lock()
 
     @classmethod
     def open(cls, path: str) -> "Ledger | None":
@@ -190,6 +193,11 @@ class Ledger:
         return cls(path)
 
     def submit(self, fn, *args) -> None:
+        with self.pending_lock:
+            if self.pending >= self.MAX_PENDING:
+                metrics.inc("mcp_ledger_errors_total")
+                return
+            self.pending += 1
         self.pool.submit(self._safe, fn, *args)
 
     def flush(self) -> None:
@@ -198,6 +206,8 @@ class Ledger:
         self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="usage-ledger")
 
     def _safe(self, fn, *args) -> None:
+        with self.pending_lock:
+            self.pending -= 1
         try:
             conn = sqlite3.connect(self.path, timeout=5)
             try:
@@ -216,10 +226,10 @@ class Ledger:
         now = _now()
         if self.pruned_day == now.date().isoformat():
             return
-        self.pruned_day = now.date().isoformat()
         cutoff = now - timedelta(days=RETENTION_DAYS)
         conn.execute("DELETE FROM tool_calls WHERE ts < ?", (cutoff.isoformat(timespec="seconds"),))
         conn.execute("DELETE FROM transport_daily WHERE day < ?", (cutoff.date().isoformat(),))
+        self.pruned_day = now.date().isoformat()  # set only after the deletes, so a failed prune is retried
 
     @staticmethod
     def write_call(conn, tool, outcome, client_key, ua, family, caller_fp, latency_ms) -> None:
@@ -271,7 +281,7 @@ def stats(conn, days: int) -> str:
                             f"AND family NOT IN ({not_real})", ts, *NOT_REAL)
     [(probers,)] = q("SELECT COUNT(*) FROM tool_calls WHERE ts >= ? AND family = 'prober'", ts)
     [(own,)] = q("SELECT COUNT(*) FROM tool_calls WHERE ts >= ? AND family = 'matchawards-test'", ts)
-    [(fps,)] = q("SELECT COUNT(DISTINCT caller_fp) FROM tool_calls WHERE ts >= ?", ts)
+    [(fps,)] = q("SELECT COUNT(DISTINCT caller_fp) FROM tool_calls WHERE ts >= ? AND family = 'openai-mcp'", ts)
     transport = q("SELECT method, client_name, client_version, count, last_ua FROM transport_daily WHERE day >= ?",
                   day)
     t_family = Counter()

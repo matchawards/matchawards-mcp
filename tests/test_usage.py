@@ -183,10 +183,21 @@ async def test_chatgpt_fingerprint_is_hmac_and_needs_salt(api, usage_db, monkeyp
     server.ledger.flush()
     raw = b"".join(p.read_bytes() for p in usage_db.parent.glob("usage.db*"))
     assert b"raw-subject-value" not in raw and b"raw-session-value" not in raw
-    if salt:
-        assert all(len(f) == 16 and int(f, 16) >= 0 for f in fps) and fps[0] != fps[1]
+    if salt:  # x-openai-session is never fingerprinted: it changes per conversation
+        assert sorted(fps, key=str) == sorted([usage.fingerprint({b"x-openai-subject": b"raw-subject-value"},
+                                                                 salt.encode()), None], key=str)
+        assert all(len(f) == 16 and int(f, 16) >= 0 for f in fps if f)
     else:
         assert fps == [None, None]
+
+
+def test_ledger_drops_writes_past_the_queue_bound(tmp_path):
+    ledger = usage.Ledger.open(str(tmp_path / "usage.db"))
+    ledger.pending = usage.Ledger.MAX_PENDING
+    before = usage.metrics.counts[("mcp_ledger_errors_total", ())]
+    ledger.submit(usage.Ledger.write_transport, "192.0.2.0/24", "initialize", "", "", "x")
+    assert usage.metrics.counts[("mcp_ledger_errors_total", ())] == before + 1
+    assert ledger.pending == usage.Ledger.MAX_PENDING
 
 
 @pytest.mark.anyio

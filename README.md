@@ -148,7 +148,7 @@ What is recorded:
 
 - **Tool calls**: one row per call that reached a tool: time, tool name, outcome (`ok`, `invalid_input`, `upstream_error`, `rate_limited_upstream`, `busy`, `internal_error`), the client network (IPv4 /24 or IPv6 /48), the User-Agent (first 200 characters), its family (`openai-mcp`, `claude-user`, `claude`, `cursor`, ..., `prober` or `other`) and the latency. Calls stopped by the rate limit are counted in a metric, with no row. Arguments the SDK rejects before the tool runs leave no row either; they still count in the transport table as `tools/call`.
 - **Transport, per day**: one counter per client network, JSON-RPC method (known MCP methods only, anything else is `_other`) and `clientInfo` name and version, with the last User-Agent seen. `clientInfo` is read from the first 8 KiB of an `initialize` body, or from `params._meta` (2026-07-28 clients), as the body streams past; the body is not buffered. At most 50 counters per client network and day; past that they fold into `_other`.
-- **ChatGPT callers**: when `MATCHAWARDS_USAGE_SALT` is set and a request carries `x-openai-subject` (or `x-openai-session`), the tool-call row stores a 16-hex HMAC-SHA256 of it, to count distinct callers.
+- **ChatGPT callers**: when `MATCHAWARDS_USAGE_SALT` is set and a request carries `x-openai-subject` (ChatGPT's anonymous per-user id), the tool-call row stores a 16-hex HMAC-SHA256 of it, to count distinct ChatGPT callers (`openai-mcp` family only in the stats). `x-openai-session` is not used: it changes per conversation.
 
 Never recorded: tool arguments (search terms, ids), request or response bodies, full client addresses, raw header values.
 
@@ -167,7 +167,7 @@ When `MATCHAWARDS_METRICS_TOKEN` is set, a second listener in the same process (
 ### Ops notes
 
 - Mount a volume at `/data` (or set `MATCHAWARDS_USAGE_DB`) so the file survives a container rebuild.
-- For ChatGPT fingerprints, nginx must pass `x-openai-subject` and `x-openai-session` through to the container (it does by default unless headers are cleared), and `MATCHAWARDS_USAGE_SALT` must be set and kept stable: a new salt starts new fingerprints.
+- For ChatGPT fingerprints, nginx must pass `x-openai-subject` through to the container (it does by default unless headers are cleared), and `MATCHAWARDS_USAGE_SALT` must be set and kept stable: a new salt starts new fingerprints.
 - For Docker, set `MATCHAWARDS_METRICS_HOST=0.0.0.0` and publish the metrics port only on the internal network.
 
 ## Data
