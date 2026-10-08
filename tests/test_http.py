@@ -1,6 +1,7 @@
 """--http mode: the SDK's ASGI app driven in-process over httpx2.ASGITransport. No network."""
 
 import contextlib
+import ipaddress
 import logging
 
 import httpx
@@ -13,6 +14,7 @@ from matchawards_mcp import __version__, server
 
 from test_server import TOOLS, api, anyio_backend, page  # noqa: F401  (fixtures)
 
+TRUSTED = [ipaddress.ip_network(n) for n in ("127.0.0.1/32", "::1/128", "172.16.0.0/12")]
 PING = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
 LEGACY = {"MCP-Protocol-Version": "2025-06-18", "Accept": "application/json, text/event-stream"}
 
@@ -116,14 +118,38 @@ def test_rate_limiter_windows_and_cleanup():
 
 @pytest.mark.parametrize("headers, peer, key", [
     ([(b"x-real-ip", b"203.0.113.9")], ("127.0.0.1", 5), "203.0.113.9"),
-    ([(b"x-real-ip", b"2001:db8:aa:bb:1:2:3:4")], None, "2001:db8:aa:bb::/64"),
-    ([(b"x-real-ip", b"::ffff:203.0.113.9")], None, "203.0.113.9"),
+    ([(b"x-real-ip", b"2001:db8:aa:bb:1:2:3:4")], ("127.0.0.1", 5), "2001:db8:aa:bb::/64"),
+    ([(b"x-real-ip", b"::ffff:203.0.113.9")], ("127.0.0.1", 5), "203.0.113.9"),
     ([(b"x-real-ip", b"not-an-ip")], ("10.0.0.5", 5), "10.0.0.5"),
     ([], ("10.0.0.5", 5), "10.0.0.5"),
     ([], None, "unknown"),
+    ([(b"x-real-ip", b"203.0.113.9")], None, "unknown"),  # no peer, so nothing to trust the header from
 ])
 def test_client_key(headers, peer, key):
-    assert server.client_key({"headers": headers, "client": peer}) == key
+    assert server.client_key({"headers": headers, "client": peer}, TRUSTED) == key
+
+
+@pytest.mark.parametrize("peer, key", [
+    (("203.0.113.66", 5), "203.0.113.66"),  # untrusted peer: forged X-Real-IP ignored
+    (("2001:db8::7", 5), "2001:db8::/64"),
+    (("127.0.0.1", 5), "198.51.100.77"),  # trusted proxies: X-Real-IP used
+    (("172.18.0.1", 5), "198.51.100.77"),
+    (("::1", 5), "198.51.100.77"),
+])
+def test_x_real_ip_is_used_only_from_trusted_proxies(peer, key):
+    scope = {"headers": [(b"x-real-ip", b"198.51.100.77")], "client": peer}
+    assert server.client_key(scope, TRUSTED) == key
+
+
+@pytest.mark.anyio
+async def test_forged_x_real_ip_from_untrusted_peer_cannot_dodge_the_limit(monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "3")
+    app = server.http_app()
+    async with app.router.lifespan_context(app):
+        hc = httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app, client=("203.0.113.66", 5)),
+                                base_url="http://matchawards.com")
+        codes = [(await ping(hc, f"198.51.100.{i}")).status_code for i in range(4)]
+    assert codes == [200, 200, 200, 429]  # every request keyed on the peer, whatever X-Real-IP says
 
 
 def test_main_parses_http_flag(monkeypatch):

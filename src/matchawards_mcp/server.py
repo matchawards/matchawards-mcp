@@ -377,33 +377,39 @@ class RateLimiter:
         return 0
 
 
-def client_key(scope) -> str:
-    """X-Real-IP (set by nginx to the real client), else the socket peer. IPv6 is keyed per /64.
+def _ip(raw: str):
+    """A valid IP address (IPv4-mapped IPv6 unwrapped to IPv4), or None."""
+    try:
+        ip = ipaddress.ip_address(raw.strip())
+    except ValueError:
+        return None
+    return getattr(ip, "ipv4_mapped", None) or ip
 
-    A header that is not a valid IP is ignored, so garbage values cannot mint keys. "unknown" is only reached
-    with no TCP peer at all (a unix socket), which the container does not use."""
-    real_ip = next((v.decode("latin-1") for k, v in scope["headers"] if k == b"x-real-ip"), "")
-    for raw in (real_ip, (scope.get("client") or ("",))[0]):
-        try:
-            ip = ipaddress.ip_address(raw.strip())
-        except ValueError:
-            continue
-        if ip.version == 6 and not ip.ipv4_mapped:
-            return str(ipaddress.ip_network((ip, 64), strict=False))
-        return str(getattr(ip, "ipv4_mapped", None) or ip)
-    return "unknown"
+
+def client_key(scope, trusted_proxies) -> str:
+    """The rate-limit key: the socket peer, or X-Real-IP when the peer is a trusted proxy. IPv6 is keyed per /64.
+
+    X-Real-IP from any other peer is ignored, so a client cannot pick its own key. A value that is not a valid IP
+    is ignored too (the peer is used). "unknown" only happens with no TCP peer at all (a unix socket)."""
+    ip = peer = _ip((scope.get("client") or ("",))[0])
+    if peer is not None and any(peer in net for net in trusted_proxies):
+        real_ip = next((v.decode("latin-1") for k, v in scope["headers"] if k == b"x-real-ip"), "")
+        ip = _ip(real_ip) or peer
+    if ip is None:
+        return "unknown"
+    return str(ipaddress.ip_network((ip, 64), strict=False)) if ip.version == 6 else str(ip)
 
 
 class HttpGuard:
     """Runs before the MCP layer: 405 for anything but POST /mcp, the per-client rate limit, one access line."""
 
-    def __init__(self, app, limiter: RateLimiter):
-        self.app, self.limiter = app, limiter
+    def __init__(self, app, limiter: RateLimiter, trusted_proxies):
+        self.app, self.limiter, self.trusted_proxies = app, limiter, trusted_proxies
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
-        start, status, key = time.monotonic(), 0, client_key(scope)
+        start, status, key = time.monotonic(), 0, client_key(scope, self.trusted_proxies)
 
         async def send_status(message):
             nonlocal status
@@ -466,6 +472,11 @@ def http_app() -> Starlette:
         limiter=RateLimiter(
             int(os.environ.get("MATCHAWARDS_RATE_PER_MIN", "30")), int(os.environ.get("MATCHAWARDS_RATE_BURST", "10"))
         ),
+        # Peers whose X-Real-IP is believed: local nginx and Docker bridge gateways.
+        trusted_proxies=[
+            ipaddress.ip_network(n.strip()) for n in os.environ.get(
+                "MATCHAWARDS_TRUSTED_PROXIES", "127.0.0.1/32,::1/128,172.16.0.0/12").split(",") if n.strip()
+        ],
     )
     return app
 
