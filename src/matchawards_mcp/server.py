@@ -12,6 +12,7 @@ import ipaddress
 import logging
 import math
 import os
+import re
 import sys
 import time
 from collections import deque
@@ -340,6 +341,7 @@ access_log = logging.getLogger("matchawards_mcp.access")
 _LOG_SALT = os.urandom(16)  # client keys in the log are hashed with a per-process salt, never written raw
 _LOG_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
 _LOG_PATHS = {"/mcp", "/healthz"}
+MAX_BODY_BYTES = 64 * 1024  # a JSON-RPC request to these tools is well under 2 KB
 
 
 class RateLimiter:
@@ -400,17 +402,54 @@ def client_key(scope, trusted_proxies) -> str:
     return str(ipaddress.ip_network((ip, 64), strict=False)) if ip.version == 6 else str(ip)
 
 
-class HttpGuard:
-    """Runs before the MCP layer: 405 for anything but POST /mcp, the per-client rate limit, one access line."""
+def _host_name(host: str) -> str:
+    """The Host header without its port, lower-cased: 'matchawards.com:443' -> 'matchawards.com'."""
+    name, sep, port = host.rpartition(":")
+    return (name if sep and port.isdigit() else host).lower()
 
-    def __init__(self, app, limiter: RateLimiter, global_limiter: RateLimiter, trusted_proxies):
+
+class HttpGuard:
+    """Runs before the MCP layer, in this order: path (404), Host (421), method (405), body size (411/413),
+    per-client then global rate limit (429). Writes one access line per request."""
+
+    def __init__(self, app, limiter: RateLimiter, global_limiter: RateLimiter, trusted_proxies, allowed_hosts):
         self.app, self.limiter, self.global_limiter = app, limiter, global_limiter
-        self.trusted_proxies = trusted_proxies
+        self.trusted_proxies, self.allowed_hosts = trusted_proxies, allowed_hosts
+
+    def reject(self, scope, path: str, key: str) -> Response | None:
+        """The response that ends this request here, or None to pass it on."""
+        if path == "/healthz":
+            return None  # unlimited; the route itself answers 405 to anything but GET/HEAD
+        if path != "/mcp":
+            return PlainTextResponse("Not Found", status_code=404)
+        headers = {k: v.decode("latin-1") for k, v in scope["headers"] if k in (b"host", b"content-length")}
+        if _host_name(headers.get(b"host", "")) not in self.allowed_hosts:
+            return PlainTextResponse("Invalid Host header", status_code=421)
+        if scope["method"] != "POST":
+            # Stateless server: no SSE stream to GET, no session to DELETE, no CORS preflight (OPTIONS).
+            return Response(status_code=405, headers={"Allow": "POST"})
+        length = headers.get(b"content-length")
+        if length is None:
+            return PlainTextResponse("Content-Length required", status_code=411)
+        if not length.isdigit():
+            return PlainTextResponse("Invalid Content-Length", status_code=400)
+        if int(length) > MAX_BODY_BYTES:
+            return PlainTextResponse("Request body too large", status_code=413)
+        # Per client first: a request it rejects never uses up the shared budget.
+        if wait := self.limiter.check(key) or self.global_limiter.check("all"):
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": None, "error": {
+                    "code": -32000, "message": f"Rate limit reached. Wait {wait} seconds, then retry.",
+                }},
+                status_code=429, headers={"Retry-After": str(wait)},
+            )
+        return None
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         start, status, key = time.monotonic(), 0, client_key(scope, self.trusted_proxies)
+        path = re.sub(r"/+", "/", scope["path"]).rstrip("/") or "/"  # '//mcp' and '/mcp/' are '/mcp'
 
         async def send_status(message):
             nonlocal status
@@ -419,21 +458,10 @@ class HttpGuard:
             await send(message)
 
         try:
-            if scope["path"] == "/mcp" and scope["method"] != "POST":
-                # Stateless server: no SSE stream to GET, no session to DELETE.
-                response = Response(status_code=405, headers={"Allow": "POST"})
-            # Per client first: a request it rejects never uses up the shared budget.
-            elif scope["path"] == "/mcp" and (wait := self.limiter.check(key) or self.global_limiter.check("all")):
-                response = JSONResponse(
-                    {"jsonrpc": "2.0", "id": None, "error": {
-                        "code": -32000,
-                        "message": f"Rate limit reached. Wait {wait} seconds, then retry.",
-                    }},
-                    status_code=429, headers={"Retry-After": str(wait)},
-                )
+            if response := self.reject(scope, path, key):
+                await response(scope, receive, send_status)
             else:
-                return await self.app(scope, receive, send_status)
-            await response(scope, receive, send_status)
+                await self.app({**scope, "path": path, "raw_path": path.encode()}, receive, send_status)
         finally:
             # Method, path, status, duration, hashed client key. Never headers (Authorization) or bodies.
             # Path and method are client-controlled (the path arrives percent-decoded, so it can hold CR/LF):
@@ -441,7 +469,7 @@ class HttpGuard:
             access_log.info(
                 "%s %s %d %dms client=%s",
                 scope["method"] if scope["method"] in _LOG_METHODS else "OTHER",
-                scope["path"] if scope["path"] in _LOG_PATHS else "OTHER",
+                path if path in _LOG_PATHS else "OTHER",
                 status,
                 (time.monotonic() - start) * 1000, hashlib.blake2s(key.encode(), key=_LOG_SALT, digest_size=6).hexdigest(),
             )
@@ -461,6 +489,7 @@ def http_app() -> Starlette:
         streamable_http_path="/mcp",
         stateless_http=True,
         json_response=True,
+        max_request_body_size=MAX_BODY_BYTES,  # enforced on the bytes read, whatever Content-Length said
         # Host check (DNS rebinding): a Host outside the list gets 421, a foreign Origin 403.
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
@@ -477,6 +506,7 @@ def http_app() -> Starlette:
         # All clients together: bounds the load on the API, which does not rate-limit this server's address.
         global_limiter=RateLimiter(int(os.environ.get("MATCHAWARDS_GLOBAL_PER_MIN", "600")), 0),
         # Peers whose X-Real-IP is believed: local nginx and Docker bridge gateways.
+        allowed_hosts={h.lower() for h in hosts},
         trusted_proxies=[
             ipaddress.ip_network(n.strip()) for n in os.environ.get(
                 "MATCHAWARDS_TRUSTED_PROXIES", "127.0.0.1/32,::1/128,172.16.0.0/12").split(",") if n.strip()

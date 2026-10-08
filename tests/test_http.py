@@ -29,8 +29,8 @@ async def http(host="matchawards.com", headers=None):
         )
 
 
-def ping(hc, ip=None):
-    return hc.post("/mcp", json=PING, headers={**LEGACY, **({"X-Real-IP": ip} if ip else {})})
+def ping(hc, ip=None, path="/mcp"):
+    return hc.post(path, json=PING, headers={**LEGACY, **({"X-Real-IP": ip} if ip else {})})
 
 
 @pytest.mark.anyio
@@ -220,3 +220,70 @@ async def test_requests_rejected_per_client_do_not_use_the_global_budget(monkeyp
         codes = [(await ping(hc, "198.51.100.1")).status_code for _ in range(10)]
         assert codes == [200] * 3 + [429] * 7
         assert [(await ping(hc, f"198.51.100.{i}")).status_code for i in (2, 3, 4)] == [200, 200, 429]
+
+
+@pytest.mark.anyio
+async def test_paths_are_normalised_before_the_guard(monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "3")
+    async with http() as hc:
+        assert [(await ping(hc, path=p)).status_code for p in ("/mcp", "/mcp/", "http://matchawards.com//mcp")] == [200] * 3
+        assert (await ping(hc, path="http://matchawards.com//mcp//")).status_code == 429  # one budget for every spelling of /mcp
+        assert (await hc.get("/mcp/")).status_code == 405
+        assert (await hc.get("/other")).status_code == 404
+        assert (await ping(hc, path="/other")).status_code == 404
+        assert (await hc.get("/healthz/")).text == "ok"
+
+
+@pytest.mark.anyio
+async def test_healthz_is_unlimited_and_options_is_405(monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "1")
+    async with http() as hc:
+        assert [(await hc.get("/healthz")).status_code for _ in range(5)] == [200] * 5
+        r = await hc.options("/mcp")
+        assert (r.status_code, r.headers["Allow"]) == (405, "POST")
+
+
+@pytest.mark.anyio
+async def test_wrong_host_is_421_on_any_method(monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_ALLOWED_HOSTS", "matchawards.com")
+    async with http(host="evil.example") as hc:
+        for method in ("GET", "DELETE", "OPTIONS", "POST"):
+            assert (await hc.request(method, "/mcp", json=PING)).status_code == 421
+
+
+@pytest.mark.anyio
+async def test_body_size_limits():
+    async with http() as hc:
+        big = {**PING, "params": {"pad": "x" * (64 * 1024)}}
+        assert (await hc.post("/mcp", json=big, headers=LEGACY)).status_code == 413
+
+        async def chunked():
+            yield b'{"jsonrpc":"2.0","id":1,"method":"ping"}'
+
+        r = await hc.post("/mcp", content=chunked(), headers={**LEGACY, "Content-Type": "application/json"})
+        assert r.status_code == 411
+        assert (await ping(hc)).status_code == 200
+
+
+@pytest.mark.anyio
+async def test_a_lying_content_length_is_still_capped_by_the_sdk():
+    app = server.http_app()
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"x" * (65 * 1024), "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http", "method": "POST", "path": "/mcp", "raw_path": b"/mcp", "query_string": b"",
+        "root_path": "", "scheme": "http", "server": ("matchawards.com", 80), "client": ("127.0.0.1", 5),
+        "http_version": "1.1", "asgi": {"version": "3.0"},
+        "headers": [(b"host", b"matchawards.com"), (b"content-type", b"application/json"),
+                    (b"content-length", b"40"), (b"mcp-protocol-version", b"2025-06-18"),
+                    (b"accept", b"application/json, text/event-stream")],
+    }
+    async with app.router.lifespan_context(app):
+        await app(scope, receive, send)
+    assert sent[0]["status"] == 413
