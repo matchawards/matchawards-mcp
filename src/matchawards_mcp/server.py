@@ -338,6 +338,8 @@ async def find_contacts(id: OppId) -> dict[str, Any]:
 
 access_log = logging.getLogger("matchawards_mcp.access")
 _LOG_SALT = os.urandom(16)  # client keys in the log are hashed with a per-process salt, never written raw
+_LOG_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
+_LOG_PATHS = {"/mcp", "/healthz"}
 
 
 class RateLimiter:
@@ -346,9 +348,12 @@ class RateLimiter:
     # ponytail: per-process memory. One container runs one process, so this is the whole limit. If the service
     # is ever scaled out (several workers or containers), each keeps its own counts and the real limit multiplies:
     # then move the counters to a shared store (Redis) or to nginx limit_req keyed on the same client address.
+    # Memory is capped at max_keys clients (about 1.5 KB each); past that the least recently seen key is dropped,
+    # which resets that client's count. Behind nginx keys are real client addresses, so only a flood from more
+    # than max_keys addresses in one minute gets there.
 
-    def __init__(self, per_min: int, burst: int, clock=time.monotonic):
-        self.per_min, self.burst, self.clock = per_min, burst, clock
+    def __init__(self, per_min: int, burst: int, clock=time.monotonic, max_keys: int = 20_000):
+        self.per_min, self.burst, self.clock, self.max_keys = per_min, burst, clock, max_keys
         self.hits: dict[str, deque[float]] = {}  # one deque per key, never longer than per_min
         self.next_sweep = 0.0
 
@@ -358,7 +363,10 @@ class RateLimiter:
         if now >= self.next_sweep:  # once a minute, forget idle clients so memory tracks active ones only
             self.hits = {k: q for k, q in self.hits.items() if q and q[-1] > now - 60}
             self.next_sweep = now + 60
-        q = self.hits.setdefault(key, deque())
+        q = self.hits.pop(key, None) or deque()
+        self.hits[key] = q  # re-insert: dict order is least recently seen first
+        if len(self.hits) > self.max_keys:
+            del self.hits[next(iter(self.hits))]
         while q and q[0] <= now - 60:
             q.popleft()
         if len(q) >= self.per_min:
@@ -370,7 +378,10 @@ class RateLimiter:
 
 
 def client_key(scope) -> str:
-    """X-Real-IP (set by nginx to the real client), else the socket peer. IPv6 is keyed per /64."""
+    """X-Real-IP (set by nginx to the real client), else the socket peer. IPv6 is keyed per /64.
+
+    A header that is not a valid IP is ignored, so garbage values cannot mint keys. "unknown" is only reached
+    with no TCP peer at all (a unix socket), which the container does not use."""
     real_ip = next((v.decode("latin-1") for k, v in scope["headers"] if k == b"x-real-ip"), "")
     for raw in (real_ip, (scope.get("client") or ("",))[0]):
         try:
@@ -417,8 +428,13 @@ class HttpGuard:
             await response(scope, receive, send_status)
         finally:
             # Method, path, status, duration, hashed client key. Never headers (Authorization) or bodies.
+            # Path and method are client-controlled (the path arrives percent-decoded, so it can hold CR/LF):
+            # log only known values.
             access_log.info(
-                "%s %s %s %dms client=%s", scope["method"], scope["path"], status,
+                "%s %s %s %dms client=%s",
+                scope["method"] if scope["method"] in _LOG_METHODS else "OTHER",
+                scope["path"] if scope["path"] in _LOG_PATHS else "OTHER",
+                status,
                 (time.monotonic() - start) * 1000, hashlib.blake2s(key.encode(), key=_LOG_SALT, digest_size=6).hexdigest(),
             )
 

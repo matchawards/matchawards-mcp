@@ -140,3 +140,38 @@ def test_main_parses_http_flag(monkeypatch):
     assert calls[0] == ("stdio", {"transport": "stdio"})
     assert calls[1][0] == "http"
     assert (calls[1][1]["host"], calls[1][1]["port"], calls[1][1]["access_log"]) == ("127.0.0.1", 9999, False)
+
+
+@pytest.mark.anyio
+async def test_access_log_has_no_raw_client_values(caplog):
+    caplog.set_level(logging.INFO, logger="matchawards_mcp.access")
+    async with http() as hc:
+        await hc.get("/mcp%0d%0aFAKE 200 0ms client=forged", headers={"X-Real-IP": "203.0.113.50"})
+        await ping(hc, "203.0.113.50")
+        await hc.post("/mcp", json=PING, headers={**LEGACY, "Authorization": "Bearer secret"})
+    lines = [r.getMessage() for r in caplog.records if r.name == "matchawards_mcp.access"]
+    assert len(lines) == 3
+    assert lines[0].startswith("GET OTHER 404 ")
+    assert lines[1].startswith("POST /mcp 200 ")
+    text = "\n".join(lines)
+    for raw in ("\r", "FAKE", "forged", "203.0.113.50", "secret", "ping"):
+        assert raw not in text
+
+
+@pytest.mark.anyio
+async def test_garbage_real_ip_falls_back_to_the_peer_not_a_new_key(monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "3")
+    async with http() as hc:
+        # Three different garbage values all count against the socket peer, so they cannot mint fresh budgets.
+        assert [(await ping(hc, junk)).status_code for junk in ("x", "1.2.3.4.5", "evil\tvalue")] == [200] * 3
+        assert (await ping(hc)).status_code == 429
+        assert (await ping(hc, "198.51.100.9")).status_code == 200  # a valid address is still its own client
+
+
+def test_rate_limiter_key_count_is_bounded():
+    rl = server.RateLimiter(per_min=5, burst=3, clock=lambda: 1000.0, max_keys=100)
+    for i in range(10_000):
+        rl.check(f"10.0.{i // 256}.{i % 256}")
+        rl.check("keep")  # seen on every round, so it is never the least recently seen
+    assert len(rl.hits) == 100
+    assert "keep" in rl.hits and "10.0.39.15" in rl.hits and "10.0.0.0" not in rl.hits
