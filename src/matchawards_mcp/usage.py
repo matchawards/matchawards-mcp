@@ -274,10 +274,13 @@ def stats(conn, days: int) -> str:
     [(fps,)] = q("SELECT COUNT(DISTINCT caller_fp) FROM tool_calls WHERE ts >= ?", ts)
     transport = q("SELECT method, client_name, client_version, count, last_ua FROM transport_daily WHERE day >= ?",
                   day)
-    t_prober = sum(r[3] for r in transport if classify_ua(r[4]) == "prober")
+    t_family = Counter()
+    for r in transport:
+        t_family[classify_ua(r[4])] += r[3]
+    t_prober, t_own = t_family["prober"], t_family["matchawards-test"]
     _table(out, "Real vs probers", ("", "real", "probers", "own tests"), [
         ("tool calls", real, probers, own),
-        ("transport requests (by last UA)", sum(r[3] for r in transport) - t_prober, t_prober, "-"),
+        ("transport requests (by last UA)", sum(t_family.values()) - t_prober - t_own, t_prober, t_own),
     ])
     out.append(f"\nDistinct client keys with tool calls (/24 or /48, no probers or own tests): {real_keys}")
     out.append(f"Distinct ChatGPT callers (x-openai-subject fingerprints): {fps}")

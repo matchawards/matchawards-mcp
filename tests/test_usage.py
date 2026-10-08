@@ -292,7 +292,7 @@ def test_stats_command_on_a_seeded_db(usage_db, capsys):
     assert "search_contracts  ok              2" in out
     assert "openai-mcp        2      2" in out
     assert "tool calls                       3     1        1" in out
-    assert "transport requests (by last UA)  3     1        -" in out
+    assert "transport requests (by last UA)  3     1        0" in out
     assert "Distinct client keys with tool calls (/24 or /48, no probers or own tests): 3" in out
     assert "Distinct ChatGPT callers (x-openai-subject fingerprints): 2" in out
     assert "openai-mcp  1.0.0    2" in out
