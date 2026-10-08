@@ -431,7 +431,7 @@ class HttpGuard:
             # Path and method are client-controlled (the path arrives percent-decoded, so it can hold CR/LF):
             # log only known values.
             access_log.info(
-                "%s %s %s %dms client=%s",
+                "%s %s %d %dms client=%s",
                 scope["method"] if scope["method"] in _LOG_METHODS else "OTHER",
                 scope["path"] if scope["path"] in _LOG_PATHS else "OTHER",
                 status,
