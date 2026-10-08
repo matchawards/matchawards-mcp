@@ -3,7 +3,7 @@
   "name": "io.github.matchawards/matchawards-mcp",
   "title": "MatchAwards",
   "description": "Search US government contracts, grants and jobs from matchawards.com. Read-only, no key.",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "websiteUrl": "https://matchawards.com",
   "repository": {
     "url": "https://github.com/matchawards/matchawards-mcp",
@@ -14,7 +14,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "matchawards-mcp",
-      "version": "0.2.1",
+      "version": "0.3.0",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
