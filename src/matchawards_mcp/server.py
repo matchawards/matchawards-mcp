@@ -389,7 +389,7 @@ def _ip(raw: str):
 
 
 def client_key(scope, trusted_proxies) -> str:
-    """The rate-limit key: the socket peer, or X-Real-IP when the peer is a trusted proxy. IPv6 is keyed per /64.
+    """The rate-limit key: the socket peer, or X-Real-IP when the peer is a trusted proxy. IPv6 is keyed per /48.
 
     X-Real-IP from any other peer is ignored, so a client cannot pick its own key. A value that is not a valid IP
     is ignored too (the peer is used). "unknown" only happens with no TCP peer at all (a unix socket)."""
@@ -399,7 +399,8 @@ def client_key(scope, trusted_proxies) -> str:
         ip = _ip(real_ip) or peer
     if ip is None:
         return "unknown"
-    return str(ipaddress.ip_network((ip, 64), strict=False)) if ip.version == 6 else str(ip)
+    # Per /48, not /64: one subscriber usually holds a /56 or a /48, i.e. up to 65,536 /64s to rotate through.
+    return str(ipaddress.ip_network((ip, 48), strict=False)) if ip.version == 6 else str(ip)
 
 
 def _host_name(host: str) -> str:
@@ -436,7 +437,7 @@ class HttpGuard:
         if int(length) > MAX_BODY_BYTES:
             return PlainTextResponse("Request body too large", status_code=413)
         # Per client first, and the global counter only sees requests that passed it: one client adds at most
-        # its own per-minute budget, so 600 needs 20+ clients. A distributed flood from that many addresses can
+        # its own per-minute budget, so 600 needs 20+ IPv4 addresses or IPv6 /48s. A distributed flood from that many can
         # still trip the global cap for everyone; Cloudflare in front of nginx is the outer layer for that.
         if wait := self.limiter.check(key) or self.global_limiter.check("all"):
             return JSONResponse(

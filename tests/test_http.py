@@ -81,7 +81,7 @@ async def test_unknown_host_is_rejected_and_local_hosts_work(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_rate_limit_per_real_ip_and_ipv6_per_64(monkeypatch):
+async def test_rate_limit_per_real_ip_and_ipv6_per_48(monkeypatch):
     monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "3")
     async with http() as hc:
         assert [(await ping(hc, "198.51.100.1")).status_code for _ in range(3)] == [200] * 3
@@ -94,10 +94,10 @@ async def test_rate_limit_per_real_ip_and_ipv6_per_64(monkeypatch):
         assert (await ping(hc, "198.51.100.2")).status_code == 200  # another client has its own budget
         assert (await ping(hc)).status_code == 200  # no X-Real-IP: keyed on the socket peer
 
-        for ip in ("2001:db8:1:2::1", "2001:db8:1:2::2", "2001:db8:1:2:ffff::9"):  # one /64
+        for ip in ("2001:db8:1:2::1", "2001:db8:1:3::2", "2001:db8:1:ffff::9"):  # one /48
             assert (await ping(hc, ip)).status_code == 200
         assert (await ping(hc, "2001:db8:1:2::3")).status_code == 429
-        assert (await ping(hc, "2001:db8:1:3::1")).status_code == 200  # next /64
+        assert (await ping(hc, "2001:db8:2::1")).status_code == 200  # next /48
 
 
 def test_rate_limiter_windows_and_cleanup():
@@ -118,7 +118,7 @@ def test_rate_limiter_windows_and_cleanup():
 
 @pytest.mark.parametrize("headers, peer, key", [
     ([(b"x-real-ip", b"203.0.113.9")], ("127.0.0.1", 5), "203.0.113.9"),
-    ([(b"x-real-ip", b"2001:db8:aa:bb:1:2:3:4")], ("127.0.0.1", 5), "2001:db8:aa:bb::/64"),
+    ([(b"x-real-ip", b"2001:db8:aa:bb:1:2:3:4")], ("127.0.0.1", 5), "2001:db8:aa::/48"),
     ([(b"x-real-ip", b"::ffff:203.0.113.9")], ("127.0.0.1", 5), "203.0.113.9"),
     ([(b"x-real-ip", b"not-an-ip")], ("10.0.0.5", 5), "10.0.0.5"),
     ([], ("10.0.0.5", 5), "10.0.0.5"),
@@ -131,7 +131,7 @@ def test_client_key(headers, peer, key):
 
 @pytest.mark.parametrize("peer, key", [
     (("203.0.113.66", 5), "203.0.113.66"),  # untrusted peer: forged X-Real-IP ignored
-    (("2001:db8::7", 5), "2001:db8::/64"),
+    (("2001:db8::7", 5), "2001:db8::/48"),
     (("127.0.0.1", 5), "198.51.100.77"),  # trusted proxies: X-Real-IP used
     (("172.18.0.1", 5), "198.51.100.77"),
     (("::1", 5), "198.51.100.77"),
@@ -309,3 +309,11 @@ def test_bad_env_stops_startup_with_a_clear_message(monkeypatch, name, value):
     monkeypatch.setenv(name, value)
     with pytest.raises(SystemExit, match=name):
         server.http_app()
+
+
+@pytest.mark.anyio
+async def test_requests_spread_over_a_56_are_one_client():
+    async with http() as hc:
+        codes = [(await ping(hc, f"2001:db8:0:ab{i % 256:02x}::{i:x}")).status_code for i in range(300)]
+        assert codes.count(200) == 10  # the default burst of one client, not 256 fresh /64 budgets
+        assert (await ping(hc, "198.51.100.1")).status_code == 200  # the global cap is nowhere near used up
