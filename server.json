@@ -27,11 +27,5 @@
         }
       ]
     }
-  ],
-  "remotes": [
-    {
-      "type": "streamable-http",
-      "url": "https://matchawards.com/mcp"
-    }
   ]
 }

@@ -21,13 +21,16 @@ Every result carries a `url` on matchawards.com, and the server asks the model t
 
 ## Hosted (coming soon)
 
+<!-- Release note: 0.2.0 ships without a server.json "remotes" entry. Add it in 0.2.1, once https://matchawards.com/mcp
+     is live: "remotes": [{"type": "streamable-http", "url": "https://matchawards.com/mcp"}] -->
+
 A hosted endpoint is planned at `https://matchawards.com/mcp`. It is **not live yet**. Once it is, you add it as a remote MCP server (connector) by URL, with nothing to install and no key:
 
 - **ChatGPT**: add a custom connector with the URL `https://matchawards.com/mcp`.
 - **Claude** (claude.ai or Claude Desktop): Settings, Connectors, add a custom connector with the same URL. Claude Code: `claude mcp add --transport http matchawards https://matchawards.com/mcp`.
 - **Cursor**: in `mcp.json`, `{"mcpServers": {"matchawards": {"url": "https://matchawards.com/mcp"}}}`.
 
-The hosted endpoint serves the same six tools. It is limited per client address to 30 requests per minute and 10 per 5 seconds; over the limit it answers HTTP 429 with `Retry-After`.
+The hosted endpoint serves the same six tools. It is limited per client address to 30 requests per minute and 10 per 5 seconds, plus 600 per minute for all clients together; over a limit it answers HTTP 429 with `Retry-After`.
 
 ## Install
 
@@ -100,7 +103,16 @@ curl -s http://127.0.0.1:8765/mcp -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-Only `POST /mcp` is served; `GET` and `DELETE` on `/mcp` return 405. `GET /healthz` returns `ok`. Requests whose `Host` header is not in `MATCHAWARDS_ALLOWED_HOSTS` (or `127.0.0.1`, `localhost`) get 421. The rate limit is keyed on the `X-Real-IP` header (IPv6 per /64), falling back to the socket address, so run it behind a reverse proxy that sets `X-Real-IP` and do not expose the port directly. The limit is kept in memory per process. The log has one line per request (method, path, status, duration, a hashed client key), never headers or bodies.
+How requests are handled, in order:
+
+- Repeated and trailing slashes are folded, so `/mcp/` and `//mcp` count as `/mcp`. Any path other than `/mcp` and `/healthz` gets 404.
+- `GET /healthz` returns `ok` and is not rate-limited.
+- A `Host` header not in `MATCHAWARDS_ALLOWED_HOSTS` (or `127.0.0.1`, `localhost`) gets 421, whatever the method.
+- Only `POST /mcp` is served. `GET`, `DELETE` and `OPTIONS` get 405 (no SSE stream, no sessions, no CORS).
+- A POST needs `Content-Length` (411 without it), and bodies over 64 KB get 413.
+- Rate limit per client, then the server-wide cap: 429 with `Retry-After`.
+
+The client is the socket address, or the `X-Real-IP` header when the socket address is in `MATCHAWARDS_TRUSTED_PROXIES` (IPv6 is keyed per /64). Run it behind a reverse proxy that sets `X-Real-IP`, and do not expose the port directly. The limits are kept in memory per process. A bad value in any of the variables below stops the server at startup. The log has one line per request (method, path, status, duration, a hashed client key), never headers or bodies.
 
 ## Configuration
 
@@ -111,6 +123,8 @@ Only `POST /mcp` is served; `GET` and `DELETE` on `/mcp` return 405. `GET /healt
 | `MATCHAWARDS_HTTP_PORT` | `8765` | `--http` only: port to listen on. |
 | `MATCHAWARDS_RATE_PER_MIN` | `30` | `--http` only: requests per minute per client. |
 | `MATCHAWARDS_RATE_BURST` | `10` | `--http` only: requests per 5 seconds per client. |
+| `MATCHAWARDS_GLOBAL_PER_MIN` | `600` | `--http` only: requests per minute for all clients together. |
+| `MATCHAWARDS_TRUSTED_PROXIES` | `127.0.0.1/32,::1/128,172.16.0.0/12` | `--http` only: proxies (CIDRs, comma-separated) whose `X-Real-IP` header is trusted. |
 | `MATCHAWARDS_ALLOWED_HOSTS` | `matchawards.com,staging.matchawards.com` | `--http` only: accepted `Host` headers, comma-separated (`127.0.0.1` and `localhost` are always accepted). |
 
 ## Data
