@@ -82,7 +82,7 @@ async def test_unknown_host_is_rejected_and_local_hosts_work(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_rate_limit_per_real_ip_and_ipv6_per_48(monkeypatch):
+async def test_rate_limit_per_real_ip_and_ipv6_per_64(monkeypatch):
     monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "3")
     async with http() as hc:
         assert [(await ping(hc, "198.51.100.1")).status_code for _ in range(3)] == [200] * 3
@@ -95,10 +95,11 @@ async def test_rate_limit_per_real_ip_and_ipv6_per_48(monkeypatch):
         assert (await ping(hc, "198.51.100.2")).status_code == 200  # another client has its own budget
         assert (await ping(hc)).status_code == 200  # no X-Real-IP: keyed on the socket peer
 
-        for ip in ("2001:db8:1:2::1", "2001:db8:1:3::2", "2001:db8:1:ffff::9"):  # one /48
+        for ip in ("2001:db8:1:2::1", "2001:db8:1:2::2", "2001:db8:1:2:ffff::9"):  # one /64
             assert (await ping(hc, ip)).status_code == 200
         assert (await ping(hc, "2001:db8:1:2::3")).status_code == 429
-        assert (await ping(hc, "2001:db8:2::1")).status_code == 200  # next /48
+        assert (await ping(hc, "2001:db8:1:3::1")).status_code == 200  # next /64, same /48: its own limit
+        assert (await ping(hc, "2001:db8:2::1")).status_code == 200  # another /48
 
 
 def test_rate_limiter_windows_and_cleanup():
@@ -119,7 +120,7 @@ def test_rate_limiter_windows_and_cleanup():
 
 @pytest.mark.parametrize("headers, peer, key", [
     ([(b"x-real-ip", b"203.0.113.9")], ("127.0.0.1", 5), "203.0.113.9"),
-    ([(b"x-real-ip", b"2001:db8:aa:bb:1:2:3:4")], ("127.0.0.1", 5), "2001:db8:aa::/48"),
+    ([(b"x-real-ip", b"2001:db8:aa:bb:1:2:3:4")], ("127.0.0.1", 5), "2001:db8:aa:bb::/64"),
     ([(b"x-real-ip", b"::ffff:203.0.113.9")], ("127.0.0.1", 5), "203.0.113.9"),
     ([(b"x-real-ip", b"not-an-ip")], ("10.0.0.5", 5), "10.0.0.5"),
     ([], ("10.0.0.5", 5), "10.0.0.5"),
@@ -132,7 +133,7 @@ def test_client_key(headers, peer, key):
 
 @pytest.mark.parametrize("peer, key", [
     (("203.0.113.66", 5), "203.0.113.66"),  # untrusted peer: forged X-Real-IP ignored
-    (("2001:db8::7", 5), "2001:db8::/48"),
+    (("2001:db8::7", 5), "2001:db8::/64"),
     (("127.0.0.1", 5), "198.51.100.77"),  # trusted proxies: X-Real-IP used
     (("172.18.0.1", 5), "198.51.100.77"),
     (("::1", 5), "198.51.100.77"),
@@ -304,7 +305,7 @@ async def test_one_client_hammering_leaves_the_global_budget_open(monkeypatch):
 
 @pytest.mark.parametrize("name, value", [
     ("MATCHAWARDS_RATE_PER_MIN", "0"), ("MATCHAWARDS_RATE_BURST", "ten"), ("MATCHAWARDS_GLOBAL_PER_MIN", "-5"),
-    ("MATCHAWARDS_RATE_PER_MIN", ""), ("MATCHAWARDS_TRUSTED_PROXIES", "10.0.0.0/33"),
+    ("MATCHAWARDS_RATE_PER_MIN", ""), ("MATCHAWARDS_TRUSTED_PROXIES", "10.0.0.0/33"), ("MATCHAWARDS_RATE_PER_PREFIX_MIN", "0"),
 ])
 def test_bad_env_stops_startup_with_a_clear_message(monkeypatch, name, value):
     monkeypatch.setenv(name, value)
@@ -313,11 +314,31 @@ def test_bad_env_stops_startup_with_a_clear_message(monkeypatch, name, value):
 
 
 @pytest.mark.anyio
-async def test_requests_spread_over_a_56_are_one_client():
+async def test_rotating_64s_inside_a_56_is_capped_by_the_48_limit(monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_GLOBAL_PER_MIN", "150")
     async with http() as hc:
         codes = [(await ping(hc, f"2001:db8:0:ab{i % 256:02x}::{i:x}")).status_code for i in range(300)]
-        assert codes.count(200) == 10  # the default burst of one client, not 256 fresh /64 budgets
-        assert (await ping(hc, "198.51.100.1")).status_code == 200  # the global cap is nowhere near used up
+        assert codes.count(200) == 120  # MATCHAWARDS_RATE_PER_PREFIX_MIN, not 256 fresh /64 budgets
+        assert (await ping(hc, "2001:db8:0:ab00::1")).status_code == 429  # the /48 is used up for this minute
+        # One /48 cannot use up the global cap: other sources still get through.
+        assert (await ping(hc, "198.51.100.1")).status_code == 200
+        assert (await ping(hc, "2001:db8:5::1")).status_code == 200
+
+
+@pytest.mark.anyio
+async def test_64s_in_different_48s_are_independent(monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "3")
+    monkeypatch.setenv("MATCHAWARDS_RATE_PER_PREFIX_MIN", "4")
+    async with http() as hc:
+        assert [(await ping(hc, "2001:db8:1:1::1")).status_code for _ in range(4)] == [200, 200, 200, 429]
+        assert (await ping(hc, "2001:db8:2:1::1")).status_code == 200  # another /48: its own budgets
+        assert (await ping(hc, "2001:db8:1:2::1")).status_code == 200  # same /48, another /64: 4th of 4
+        assert (await ping(hc, "2001:db8:1:3::1")).status_code == 429  # the /48 is full
+
+
+def test_prefix_key():
+    assert server.prefix_key("2001:db8:1:2::/64") == "2001:db8:1::/48"
+    assert server.prefix_key("198.51.100.1") is None and server.prefix_key("unknown") is None
 
 
 @pytest.mark.anyio

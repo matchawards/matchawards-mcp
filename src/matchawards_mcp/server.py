@@ -399,7 +399,7 @@ def _ip(raw: str):
 
 
 def client_key(scope, trusted_proxies) -> str:
-    """The rate-limit key: the socket peer, or X-Real-IP when the peer is a trusted proxy. IPv6 is keyed per /48.
+    """The rate-limit key: the socket peer, or X-Real-IP when the peer is a trusted proxy. IPv6 is keyed per /64.
 
     X-Real-IP from any other peer is ignored, so a client cannot pick its own key. A value that is not a valid IP
     is ignored too (the peer is used). "unknown" only happens with no TCP peer at all (a unix socket)."""
@@ -409,8 +409,16 @@ def client_key(scope, trusted_proxies) -> str:
         ip = _ip(real_ip) or peer
     if ip is None:
         return "unknown"
-    # Per /48, not /64: one subscriber usually holds a /56 or a /48, i.e. up to 65,536 /64s to rotate through.
-    return str(ipaddress.ip_network((ip, 48), strict=False)) if ip.version == 6 else str(ip)
+    return str(ipaddress.ip_network((ip, 64), strict=False)) if ip.version == 6 else str(ip)
+
+
+def prefix_key(key: str) -> str | None:
+    """The /48 around an IPv6 client key ('2001:db8:1:2::/64' -> '2001:db8:1::/48'); None for IPv4 and 'unknown'.
+
+    One subscriber usually holds a /56 or a /48, so up to 65,536 /64s to rotate through. The /48 gets its own
+    shared limit on top of the per-/64 one, so rotating cannot get past it, while separate users behind one /48
+    (a carrier, a company, a cloud egress) still get their own per-/64 limits inside it."""
+    return str(ipaddress.ip_network(key).supernet(new_prefix=48)) if ":" in key else None
 
 
 def _host_name(host: str) -> str:
@@ -423,8 +431,9 @@ class HttpGuard:
     """Runs before the MCP layer, in this order: path (404), Host (421), method (405), body size (411/413),
     per-client then global rate limit (429). Writes one access line per request."""
 
-    def __init__(self, app, limiter: RateLimiter, global_limiter: RateLimiter, trusted_proxies, allowed_hosts):
-        self.app, self.limiter, self.global_limiter = app, limiter, global_limiter
+    def __init__(self, app, limiter: RateLimiter, prefix_limiter: RateLimiter, global_limiter: RateLimiter,
+                 trusted_proxies, allowed_hosts):
+        self.app, self.limiter, self.prefix_limiter, self.global_limiter = app, limiter, prefix_limiter, global_limiter
         self.trusted_proxies, self.allowed_hosts = trusted_proxies, allowed_hosts
 
     def reject(self, scope, path: str, key: str) -> Response | None:
@@ -446,19 +455,22 @@ class HttpGuard:
             return PlainTextResponse("Invalid Content-Length", status_code=400)
         if int(length) > MAX_BODY_BYTES:
             return PlainTextResponse("Request body too large", status_code=413)
-        # A request counts in both limits only when both allow it: one client adds at most its own per-minute
-        # budget to the global count (so 600 needs 20+ IPv4 addresses or IPv6 /48s), and a global lockout does not
-        # use up honest clients' own budgets. A distributed flood from that many sources can still trip the global
-        # cap for everyone; Cloudflare in front of nginx is the outer layer for that.
-        if wait := self.limiter.wait(key) or self.global_limiter.wait("all"):
+        # A request counts in the limits only when all of them allow it: a source adds at most its own budget to
+        # the global count (IPv4 address 30/min, IPv6 /48 120/min, so 600 needs 5+ /48s or 20+ IPv4 addresses),
+        # and a lockout at one level does not use up the budgets of the others. A distributed flood from that many
+        # sources can still trip the global cap for everyone; Cloudflare in front of nginx is the outer layer.
+        prefix = prefix_key(key)
+        checks = [(self.limiter, key), (self.global_limiter, "all")]
+        checks += [(self.prefix_limiter, prefix)] if prefix else []
+        if wait := next((w for limiter, k in checks if (w := limiter.wait(k))), 0):
             return JSONResponse(
                 {"jsonrpc": "2.0", "id": None, "error": {
                     "code": -32000, "message": f"Rate limit reached. Wait {wait} seconds, then retry.",
                 }},
                 status_code=429, headers={"Retry-After": str(wait)},
             )
-        self.limiter.record(key)
-        self.global_limiter.record("all")
+        for limiter, k in checks:
+            limiter.record(k)
         return None
 
     async def __call__(self, scope, receive, send):
@@ -531,6 +543,8 @@ def http_app() -> Starlette:
         HttpGuard,
         limiter=RateLimiter(_env_int("MATCHAWARDS_RATE_PER_MIN", 30), _env_int("MATCHAWARDS_RATE_BURST", 10)),
         # All clients together: bounds the load on the API, which does not rate-limit this server's address.
+        # All /64s of one IPv6 /48 together.
+        prefix_limiter=RateLimiter(_env_int("MATCHAWARDS_RATE_PER_PREFIX_MIN", 120), 0),
         global_limiter=RateLimiter(_env_int("MATCHAWARDS_GLOBAL_PER_MIN", 600), 0),
         allowed_hosts={h.lower() for h in hosts},
         trusted_proxies=trusted,

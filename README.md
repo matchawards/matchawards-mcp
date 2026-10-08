@@ -30,7 +30,7 @@ A hosted endpoint is planned at `https://matchawards.com/mcp`. It is **not live 
 - **Claude** (claude.ai or Claude Desktop): Settings, Connectors, add a custom connector with the same URL. Claude Code: `claude mcp add --transport http matchawards https://matchawards.com/mcp`.
 - **Cursor**: in `mcp.json`, `{"mcpServers": {"matchawards": {"url": "https://matchawards.com/mcp"}}}`.
 
-The hosted endpoint serves the same six tools. It is limited per client address to 30 requests per minute and 10 per 5 seconds, plus 600 per minute for all clients together; over a limit it answers HTTP 429 with `Retry-After`.
+The hosted endpoint serves the same six tools. It is limited per client address (IPv6: per /64) to 30 requests per minute and 10 per 5 seconds, per IPv6 /48 to 120 per minute, and to 600 per minute for all clients together; over a limit it answers HTTP 429 with `Retry-After`.
 
 ## Install
 
@@ -112,7 +112,7 @@ How requests are handled, in order:
 - A POST needs `Content-Length` (411 without it), and bodies over 64 KB get 413.
 - Rate limit per client, then the server-wide cap: 429 with `Retry-After`.
 
-The client is the socket address, or the `X-Real-IP` header when the socket address is in `MATCHAWARDS_TRUSTED_PROXIES` (IPv6 is keyed per /48, the usual size of one subscriber's allocation). Run it behind a reverse proxy that sets `X-Real-IP`, and do not expose the port directly. The limits are kept in memory per process. A bad value in any of the variables below stops the server at startup. The log has one line per request (method, path, status, duration, a hashed client key), never headers or bodies.
+The client is the socket address, or the `X-Real-IP` header when the socket address is in `MATCHAWARDS_TRUSTED_PROXIES` (IPv6 is keyed per /64; all /64s inside one /48 also share `MATCHAWARDS_RATE_PER_PREFIX_MIN`). Run it behind a reverse proxy that sets `X-Real-IP`, and do not expose the port directly. The limits are kept in memory per process. A bad value in any of the variables below stops the server at startup. The log has one line per request (method, path, status, duration, a hashed client key), never headers or bodies.
 
 ## Configuration
 
@@ -123,6 +123,7 @@ The client is the socket address, or the `X-Real-IP` header when the socket addr
 | `MATCHAWARDS_HTTP_PORT` | `8765` | `--http` only: port to listen on. |
 | `MATCHAWARDS_RATE_PER_MIN` | `30` | `--http` only: requests per minute per client. |
 | `MATCHAWARDS_RATE_BURST` | `10` | `--http` only: requests per 5 seconds per client. |
+| `MATCHAWARDS_RATE_PER_PREFIX_MIN` | `120` | `--http` only: requests per minute for all IPv6 /64s inside one /48 together. |
 | `MATCHAWARDS_GLOBAL_PER_MIN` | `600` | `--http` only: requests per minute for all clients together. |
 | `MATCHAWARDS_TRUSTED_PROXIES` | `127.0.0.1/32,::1/128,172.16.0.0/12` | `--http` only: proxies (CIDRs, comma-separated) whose `X-Real-IP` header is trusted. |
 | `MATCHAWARDS_ALLOWED_HOSTS` | `matchawards.com,staging.matchawards.com` | `--http` only: accepted `Host` headers, comma-separated (`127.0.0.1` and `localhost` are always accepted). |
