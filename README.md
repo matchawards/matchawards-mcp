@@ -134,6 +134,41 @@ Do not trust a broad private range such as `172.16.0.0/12`: it may overlap your 
 | `MATCHAWARDS_GLOBAL_API_PER_MIN` | `900` | `--http` only: API calls per minute for the whole server (one search can make up to 3). Over it, a tool answers "MatchAwards is busy, retry in N seconds" without calling the API. |
 | `MATCHAWARDS_TRUSTED_PROXIES` | `127.0.0.1/32,::1/128` | `--http` only: proxies (CIDRs, comma-separated) whose `X-Real-IP` header is trusted. Loopback only by default. |
 | `MATCHAWARDS_ALLOWED_HOSTS` | `matchawards.com,staging.matchawards.com` | `--http` only: accepted `Host` headers, comma-separated (`127.0.0.1` and `localhost` are always accepted). |
+| `MATCHAWARDS_USAGE_DB` | `/data/usage.db` | `--http` only: SQLite file for the usage stats. If its directory is missing or not writable, the server logs one warning and records nothing. |
+| `MATCHAWARDS_USAGE_SALT` | unset | `--http` only: secret for the ChatGPT caller fingerprint. Unset: no fingerprint is stored. |
+| `MATCHAWARDS_METRICS_TOKEN` | unset | `--http` only: Bearer token for `/metrics`. Unset: the metrics listener does not start. |
+| `MATCHAWARDS_METRICS_HOST` | `127.0.0.1` | `--http` only: address of the metrics listener. |
+| `MATCHAWARDS_METRICS_PORT` | `9765` | `--http` only: port of the metrics listener. |
+
+## Usage stats (hosted mode)
+
+With `--http` the server keeps usage stats in a SQLite file (`MATCHAWARDS_USAGE_DB`, WAL mode). stdio mode records nothing. Writes run on two background threads and are best-effort: a failed write is counted in `mcp_ledger_errors_total` and never fails a request. Rows older than 365 days are deleted, at most once a day.
+
+What is recorded:
+
+- **Tool calls**: one row per call that reached a tool: time, tool name, outcome (`ok`, `invalid_input`, `upstream_error`, `rate_limited_upstream`, `busy`, `internal_error`), the client network (IPv4 /24 or IPv6 /48), the User-Agent (first 200 characters), its family (`openai-mcp`, `claude-user`, `claude`, `cursor`, ..., `prober` or `other`) and the latency. Calls stopped by the rate limit are counted in a metric, with no row. Arguments the SDK rejects before the tool runs leave no row either; they still count in the transport table as `tools/call`.
+- **Transport, per day**: one counter per client network, JSON-RPC method (known MCP methods only, anything else is `_other`) and `clientInfo` name and version, with the last User-Agent seen. `clientInfo` is read from the first 8 KiB of an `initialize` body, or from `params._meta` (2026-07-28 clients), as the body streams past; the body is not buffered. At most 50 counters per client network and day; past that they fold into `_other`.
+- **ChatGPT callers**: when `MATCHAWARDS_USAGE_SALT` is set and a request carries `x-openai-subject` (or `x-openai-session`), the tool-call row stores a 16-hex HMAC-SHA256 of it, to count distinct callers.
+
+Never recorded: tool arguments (search terms, ids), request or response bodies, full client addresses, raw header values.
+
+Read the stats with:
+
+```bash
+matchawards-mcp stats --days 7          # --db PATH to read another file
+```
+
+It prints tool calls per tool and outcome, calls per family, real calls vs probers vs our own tests (`matchawards-test/` UA), distinct client networks (probers and own tests left out), distinct ChatGPT fingerprints, transport requests per method and the top `clientInfo` names. In Docker: `docker exec <container> matchawards-mcp stats --days 1`.
+
+### Metrics
+
+When `MATCHAWARDS_METRICS_TOKEN` is set, a second listener in the same process (`MATCHAWARDS_METRICS_HOST:MATCHAWARDS_METRICS_PORT`, default `127.0.0.1:9765`) serves `GET /metrics` in the Prometheus text format, with `Authorization: Bearer <token>` (401 without it). The `/mcp` port never serves `/metrics` (404): it trusts `X-Real-IP` from the proxy, so publish only the metrics port to the network Prometheus scrapes from. Counters (in memory, reset on restart): `mcp_tool_calls_total{tool,outcome}`, `mcp_requests_total{method}`, `mcp_rejected_total{reason}` (`rate_limit_client`, `rate_limit_prefix`, `rate_limit_global`, `size`, `host`, `path`, `method`), `mcp_agent_requests_total{family}`, `mcp_ledger_errors_total`.
+
+### Ops notes
+
+- Mount a volume at `/data` (or set `MATCHAWARDS_USAGE_DB`) so the file survives a container rebuild.
+- For ChatGPT fingerprints, nginx must pass `x-openai-subject` and `x-openai-session` through to the container (it does by default unless headers are cleared), and `MATCHAWARDS_USAGE_SALT` must be set and kept stable: a new salt starts new fingerprints.
+- For Docker, set `MATCHAWARDS_METRICS_HOST=0.0.0.0` and publish the metrics port only on the internal network.
 
 ## Data
 
