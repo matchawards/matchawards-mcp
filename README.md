@@ -114,6 +114,15 @@ How requests are handled, in order:
 
 The client is the socket address, or the `X-Real-IP` header when the socket address is in `MATCHAWARDS_TRUSTED_PROXIES` (IPv6 is keyed per /64; all /64s inside one /48 also share `MATCHAWARDS_RATE_PER_PREFIX_MIN`). Run it behind a reverse proxy that sets `X-Real-IP`, and do not expose the port directly. The limits are kept in memory per process. A bad value in any of the variables below stops the server at startup. The log has one line per request (method, path, status, duration, a hashed client key), never headers or bodies.
 
+In Docker, nginx on the host reaches the container from the compose network's gateway, not from loopback, so name that address exactly. Read it with `docker network inspect <network> --format '{{(index .IPAM.Config 0).Gateway}}'` and set, for example:
+
+```bash
+MATCHAWARDS_HTTP_HOST=0.0.0.0
+MATCHAWARDS_TRUSTED_PROXIES=127.0.0.1/32,::1/128,172.18.0.1/32
+```
+
+Do not trust a broad private range such as `172.16.0.0/12`: it may overlap your internal network, and any host in it could then pick its own rate-limit key.
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -126,7 +135,7 @@ The client is the socket address, or the `X-Real-IP` header when the socket addr
 | `MATCHAWARDS_RATE_PER_PREFIX_MIN` | `120` | `--http` only: requests per minute for all IPv6 /64s inside one /48 together. |
 | `MATCHAWARDS_GLOBAL_PER_MIN` | `600` | `--http` only: requests per minute for all clients together. |
 | `MATCHAWARDS_GLOBAL_API_PER_MIN` | `900` | `--http` only: API calls per minute for the whole server (one search can make up to 3). Over it, a tool answers "MatchAwards is busy, retry in N seconds" without calling the API. |
-| `MATCHAWARDS_TRUSTED_PROXIES` | `127.0.0.1/32,::1/128,172.16.0.0/12` | `--http` only: proxies (CIDRs, comma-separated) whose `X-Real-IP` header is trusted. |
+| `MATCHAWARDS_TRUSTED_PROXIES` | `127.0.0.1/32,::1/128` | `--http` only: proxies (CIDRs, comma-separated) whose `X-Real-IP` header is trusted. Loopback only by default. |
 | `MATCHAWARDS_ALLOWED_HOSTS` | `matchawards.com,staging.matchawards.com` | `--http` only: accepted `Host` headers, comma-separated (`127.0.0.1` and `localhost` are always accepted). |
 
 ## Data

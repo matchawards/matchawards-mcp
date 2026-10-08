@@ -150,14 +150,22 @@ def test_x_real_ip_is_used_only_from_trusted_proxies(peer, key):
 
 
 @pytest.mark.anyio
-async def test_forged_x_real_ip_from_untrusted_peer_cannot_dodge_the_limit(monkeypatch):
+@pytest.mark.parametrize("peer, trusted, used", [
+    ("203.0.113.66", None, False),
+    ("172.18.0.1", None, False),  # private ranges are not trusted by default, only loopback
+    ("172.18.0.1", "127.0.0.1/32,::1/128,172.18.0.1/32", True),  # the deployment names its gateway
+])
+async def test_x_real_ip_is_used_only_from_configured_proxies(monkeypatch, peer, trusted, used):
     monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "3")
+    if trusted:
+        monkeypatch.setenv("MATCHAWARDS_TRUSTED_PROXIES", trusted)
     app = server.http_app()
     async with app.router.lifespan_context(app):
-        hc = httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app, client=("203.0.113.66", 5)),
+        hc = httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app, client=(peer, 5)),
                                 base_url="http://matchawards.com")
         codes = [(await ping(hc, f"198.51.100.{i}")).status_code for i in range(4)]
-    assert codes == [200, 200, 200, 429]  # every request keyed on the peer, whatever X-Real-IP says
+    # Untrusted: every request keyed on the peer, whatever X-Real-IP says. Trusted: four different clients.
+    assert codes == ([200] * 4 if used else [200, 200, 200, 429])
 
 
 def test_main_parses_http_flag(monkeypatch):

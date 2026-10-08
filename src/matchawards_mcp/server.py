@@ -529,9 +529,11 @@ def http_app() -> Starlette:
     hosts += ["127.0.0.1", "localhost", "[::1]"]
     global api_budget
     api_budget = RateLimiter(_env_int("MATCHAWARDS_GLOBAL_API_PER_MIN", 900), 0)
-    try:  # peers whose X-Real-IP is believed: local nginx and Docker bridge gateways
+    # Peers whose X-Real-IP is believed. Loopback only by default; in Docker the deployment names the exact
+    # address nginx connects from (the compose network's gateway), never a broad private range.
+    try:
         trusted = [ipaddress.ip_network(n.strip()) for n in os.environ.get(
-            "MATCHAWARDS_TRUSTED_PROXIES", "127.0.0.1/32,::1/128,172.16.0.0/12").split(",") if n.strip()]
+            "MATCHAWARDS_TRUSTED_PROXIES", "127.0.0.1/32,::1/128").split(",") if n.strip()]
     except ValueError as e:
         raise SystemExit(f"MATCHAWARDS_TRUSTED_PROXIES must be comma-separated CIDRs: {e}") from None
     app = mcp.streamable_http_app(
