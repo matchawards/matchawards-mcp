@@ -201,3 +201,22 @@ def test_rate_limiter_key_count_is_bounded():
         rl.check("keep")  # seen on every round, so it is never the least recently seen
     assert len(rl.hits) == 100
     assert "keep" in rl.hits and "10.0.39.15" in rl.hits and "10.0.0.0" not in rl.hits
+
+
+@pytest.mark.anyio
+async def test_global_cap_applies_to_everyone(monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_GLOBAL_PER_MIN", "5")
+    async with http() as hc:
+        assert [(await ping(hc, f"198.51.100.{i}")).status_code for i in range(5)] == [200] * 5
+        r = await ping(hc, "198.51.100.200")  # a fresh client, but the server-wide minute is used up
+        assert r.status_code == 429 and 1 <= int(r.headers["Retry-After"]) <= 60
+
+
+@pytest.mark.anyio
+async def test_requests_rejected_per_client_do_not_use_the_global_budget(monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_GLOBAL_PER_MIN", "5")
+    monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "3")
+    async with http() as hc:
+        codes = [(await ping(hc, "198.51.100.1")).status_code for _ in range(10)]
+        assert codes == [200] * 3 + [429] * 7
+        assert [(await ping(hc, f"198.51.100.{i}")).status_code for i in (2, 3, 4)] == [200, 200, 429]

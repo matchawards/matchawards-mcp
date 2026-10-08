@@ -403,8 +403,9 @@ def client_key(scope, trusted_proxies) -> str:
 class HttpGuard:
     """Runs before the MCP layer: 405 for anything but POST /mcp, the per-client rate limit, one access line."""
 
-    def __init__(self, app, limiter: RateLimiter, trusted_proxies):
-        self.app, self.limiter, self.trusted_proxies = app, limiter, trusted_proxies
+    def __init__(self, app, limiter: RateLimiter, global_limiter: RateLimiter, trusted_proxies):
+        self.app, self.limiter, self.global_limiter = app, limiter, global_limiter
+        self.trusted_proxies = trusted_proxies
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -421,11 +422,12 @@ class HttpGuard:
             if scope["path"] == "/mcp" and scope["method"] != "POST":
                 # Stateless server: no SSE stream to GET, no session to DELETE.
                 response = Response(status_code=405, headers={"Allow": "POST"})
-            elif scope["path"] == "/mcp" and (wait := self.limiter.check(key)):
+            # Per client first: a request it rejects never uses up the shared budget.
+            elif scope["path"] == "/mcp" and (wait := self.limiter.check(key) or self.global_limiter.check("all")):
                 response = JSONResponse(
                     {"jsonrpc": "2.0", "id": None, "error": {
                         "code": -32000,
-                        "message": f"Rate limit reached for your address. Wait {wait} seconds, then retry.",
+                        "message": f"Rate limit reached. Wait {wait} seconds, then retry.",
                     }},
                     status_code=429, headers={"Retry-After": str(wait)},
                 )
@@ -472,6 +474,8 @@ def http_app() -> Starlette:
         limiter=RateLimiter(
             int(os.environ.get("MATCHAWARDS_RATE_PER_MIN", "30")), int(os.environ.get("MATCHAWARDS_RATE_BURST", "10"))
         ),
+        # All clients together: bounds the load on the API, which does not rate-limit this server's address.
+        global_limiter=RateLimiter(int(os.environ.get("MATCHAWARDS_GLOBAL_PER_MIN", "600")), 0),
         # Peers whose X-Real-IP is believed: local nginx and Docker bridge gateways.
         trusted_proxies=[
             ipaddress.ip_network(n.strip()) for n in os.environ.get(
