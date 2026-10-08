@@ -20,6 +20,12 @@ PING = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
 LEGACY = {"MCP-Protocol-Version": "2025-06-18", "Accept": "application/json, text/event-stream"}
 
 
+@pytest.fixture(autouse=True)
+def no_api_budget_leak(monkeypatch):
+    """http_app() installs a server-wide API budget; put the stdio default (None) back after each test."""
+    monkeypatch.setattr(server, "api_budget", None)
+
+
 @contextlib.asynccontextmanager
 async def http(host="matchawards.com", headers=None):
     """A fresh app (the SDK's session manager runs once per app) with its lifespan running."""
@@ -306,6 +312,7 @@ async def test_one_client_hammering_leaves_the_global_budget_open(monkeypatch):
 @pytest.mark.parametrize("name, value", [
     ("MATCHAWARDS_RATE_PER_MIN", "0"), ("MATCHAWARDS_RATE_BURST", "ten"), ("MATCHAWARDS_GLOBAL_PER_MIN", "-5"),
     ("MATCHAWARDS_RATE_PER_MIN", ""), ("MATCHAWARDS_TRUSTED_PROXIES", "10.0.0.0/33"), ("MATCHAWARDS_RATE_PER_PREFIX_MIN", "0"),
+    ("MATCHAWARDS_GLOBAL_API_PER_MIN", "x"),
 ])
 def test_bad_env_stops_startup_with_a_clear_message(monkeypatch, name, value):
     monkeypatch.setenv(name, value)
@@ -353,3 +360,25 @@ async def test_a_global_lockout_does_not_use_up_a_clients_own_budget(monkeypatch
         now[0] += 61  # the global minute passes, the per-client 5 s burst window too
         # .9 was never counted while locked out, so it has its full burst of 3
         assert [(await ping(hc, "198.51.100.9")).status_code for _ in range(4)] == [200, 200, 200, 429]
+
+
+@pytest.mark.anyio
+async def test_api_budget_in_http_mode(api, monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_GLOBAL_API_PER_MIN", "2")
+    api.replies = [lambda req: httpx.Response(200, json=page([len(api.requests)], has_more=True, cursor="c"))]
+    async with http() as hc:
+        async with Client(streamable_http_client("http://matchawards.com/mcp", http_client=hc)) as client:
+            out = await client.call_tool("search_contracts", {"limit": 5})  # wants 3 pages, gets 2
+            assert "MatchAwards is busy right now. Retry in" in out.structured_content["warning"]
+            assert len(out.structured_content["results"]) == 2
+            busy = await client.call_tool("get_opportunity", {"id": "7"})
+            assert busy.is_error and "MatchAwards is busy right now. Retry in" in busy.content[0].text
+    assert len(api.requests) == 2  # no call past the budget
+
+
+@pytest.mark.anyio
+async def test_stdio_mode_has_no_api_budget(api):
+    assert server.api_budget is None
+    for _ in range(5):
+        await server.get_opportunity("7")
+    assert len(api.requests) == 5

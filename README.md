@@ -125,6 +125,7 @@ The client is the socket address, or the `X-Real-IP` header when the socket addr
 | `MATCHAWARDS_RATE_BURST` | `10` | `--http` only: requests per 5 seconds per client. |
 | `MATCHAWARDS_RATE_PER_PREFIX_MIN` | `120` | `--http` only: requests per minute for all IPv6 /64s inside one /48 together. |
 | `MATCHAWARDS_GLOBAL_PER_MIN` | `600` | `--http` only: requests per minute for all clients together. |
+| `MATCHAWARDS_GLOBAL_API_PER_MIN` | `900` | `--http` only: API calls per minute for the whole server (one search can make up to 3). Over it, a tool answers "MatchAwards is busy, retry in N seconds" without calling the API. |
 | `MATCHAWARDS_TRUSTED_PROXIES` | `127.0.0.1/32,::1/128,172.16.0.0/12` | `--http` only: proxies (CIDRs, comma-separated) whose `X-Real-IP` header is trusted. |
 | `MATCHAWARDS_ALLOWED_HOSTS` | `matchawards.com,staging.matchawards.com` | `--http` only: accepted `Host` headers, comma-separated (`127.0.0.1` and `localhost` are always accepted). |
 

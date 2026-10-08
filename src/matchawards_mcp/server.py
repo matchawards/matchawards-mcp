@@ -46,6 +46,10 @@ INSTRUCTIONS = (
     f"Read-only. Every result row has a matchawards.com `url`. {LINK_RULE}"
 )
 
+# HTTP mode only: API calls per minute for the whole server (the API does not rate-limit this server's address,
+# and one search can make up to MAX_PAGES calls). None in stdio mode, where the API's own per-IP limit applies.
+api_budget = None
+
 # Tests swap this for an httpx.AsyncClient on a MockTransport.
 client = httpx.AsyncClient(
     base_url=API_BASE,
@@ -144,6 +148,8 @@ def _error_message(r: httpx.Response) -> str:
 async def _get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     """GET one API path; turn every failure into a ToolError the model can act on."""
     query = {k: v for k, v in (params or {}).items() if v is not None and v != ""}  # "" = unset, e.g. cursor=""
+    if api_budget is not None and (wait := api_budget.check("api")):
+        raise ToolError(f"MatchAwards is busy right now. Retry in {wait} seconds.")
     try:
         r = await client.get(path, params=query)
     except httpx.TimeoutException:
@@ -521,6 +527,8 @@ def http_app() -> Starlette:
     hosts = [h.strip() for h in os.environ.get(
         "MATCHAWARDS_ALLOWED_HOSTS", "matchawards.com,staging.matchawards.com").split(",") if h.strip()]
     hosts += ["127.0.0.1", "localhost", "[::1]"]
+    global api_budget
+    api_budget = RateLimiter(_env_int("MATCHAWARDS_GLOBAL_API_PER_MIN", 900), 0)
     try:  # peers whose X-Real-IP is believed: local nginx and Docker bridge gateways
         trusted = [ipaddress.ip_network(n.strip()) for n in os.environ.get(
             "MATCHAWARDS_TRUSTED_PROXIES", "127.0.0.1/32,::1/128,172.16.0.0/12").split(",") if n.strip()]
