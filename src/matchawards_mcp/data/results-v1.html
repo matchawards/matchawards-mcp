@@ -228,7 +228,7 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--link); outline-
     var li = el("li"), title = str(r.title) || "Untitled opportunity";
     // The follow-up is sent as the user's own message, so it carries only the validated id, never upstream text
     // (a crafted title would otherwise speak in the user's name). No valid id: no button.
-    var id = /^\d{1,30}$/.test(str(r.id)) ? str(r.id) : "";
+    var id = /^[A-Za-z0-9_-]{1,128}$/.test(str(r.id)) ? str(r.id) : "";  // get_opportunity's id rule
     var main = el(canMessage() && id ? "button" : "div", "main");
     if (main.tagName === "BUTTON") {
       main.type = "button";

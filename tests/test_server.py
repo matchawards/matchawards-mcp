@@ -466,7 +466,7 @@ def test_card_needs_no_network_and_survives_a_strict_csp():
     # Nothing to fetch: no external script, style, image, font or request of any kind.
     assert not re.search(r"\bfetch\(|XMLHttpRequest|WebSocket|EventSource|<link|<img|<iframe|\bsrc=|@import|url\(",
                          html)
-    # The one URL in the file is the prefix a row link must start with (the link itself comes from the data).
+    # The one URL in the file is the origin a row link must have (the link itself comes from the data).
     assert set(re.findall(r"https?://[^\s\"'<>)]*", html)) == {"https://matchawards.com"}
     # No inline event handlers (a host CSP without 'unsafe-hashes' blocks them), no HTML sinks, no eval.
     assert not re.search(r"<[^>]*\son[a-z]+\s*=", html)
