@@ -10,7 +10,7 @@ import re
 import statistics
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
-from typing import Annotated, Literal
+from typing import Annotated, Literal, NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from mcp.server.mcpserver.exceptions import ToolError
@@ -238,7 +238,9 @@ async def lookup_naics(
     query = " ".join(query.split())
     by = "code" if re.fullmatch(r"\d{2,6}", query) else "q"
     data = await api.get(api.NAICS_PATH, {by: query, "limit": limit})
-    return _parse(NaicsLookup, {**data, "note": "Show each opportunities_url that is set as a markdown link."})
+    results = data.get("results")
+    return _parse(NaicsLookup, {**data, "results": results[:limit] if isinstance(results, list) else results,
+                                "note": "Show each opportunities_url that is set as a markdown link."})
 
 
 async def search_awards(
@@ -268,9 +270,10 @@ async def search_awards(
     awardee name or UEI, with amounts and dates.
 
     Filters: type (contract_award, grant_award or any), naics (up to 10 codes), agency (a name; the note says which
-    agency it matched), state, awardee (part of a name), uei, keyword (title only), awarded_within_days (1 to 1095,
-    default 365), limit (1 to 50, default 20). If has_more is true, call again with cursor=next_cursor and the same
-    filters. Example: naics="541512", agency="Department of Veterans Affairs".
+    agency it matched), state, awardee (part of a name), uei, keyword (matched in the title; a grant award's title
+    is its recipient's name), awarded_within_days (1 to 1095, default 365), limit (1 to 50, default 20). If
+    has_more is true, call again with cursor=next_cursor and the same filters. Example: naics="541512",
+    agency="Department of Veterans Affairs".
 
     Award records may be incomplete, so say so. Head a grant award with its awardee name and CFDA number, not its
     title. Pass an awardee's uei to get_company for its full history.
@@ -312,10 +315,11 @@ async def get_company(uei: Uei) -> Company:
 
 # --- Composite tools: one opportunity plus the award records around it ------------------------------------
 
-# Hard caps per call: 1 detail request + COMPOSITE_QUERIES award queries of COMPOSITE_PAGES requests each (1 + 6),
-# all within COMPOSITE_DEADLINE_S. Cut short, a tool answers with what it read, a warning and ledger outcome partial.
+# Hard caps per call: 1 detail request + COMPOSITE_AWARD_PAGES award requests shared by its queries (at most
+# COMPOSITE_PAGES each), all within COMPOSITE_DEADLINE_S. Cut short, a tool answers with what it read, a warning and
+# ledger outcome partial.
 COMPOSITE_DEADLINE_S = 6.0
-COMPOSITE_QUERIES = 2
+COMPOSITE_AWARD_PAGES = 6
 COMPOSITE_PAGES = 3
 COMPOSITE_ROWS = 150  # per award query: 3 pages of 50
 AWARDS_WINDOW_DAYS = 1095  # 3 years at most: COMPOSITE_ROWS usually ends the read sooner
@@ -338,8 +342,8 @@ def _date(value: str | None) -> date | None:
         return None
 
 
-async def _opportunity(id: str, deadline: float) -> tuple[dict, OpportunityRow]:
-    """The detail (raw, for agency_id and ai) and its row; contracts and grants only."""
+async def _opportunity(id: str, deadline: float) -> tuple[dict, OpportunityRow, str | None]:
+    """The detail (raw, for ai), its row and its NAICS code if it is a valid one; contracts and grants only."""
     try:
         data = await asyncio.wait_for(api.get_one(id), deadline - asyncio.get_running_loop().time())
     except asyncio.TimeoutError:
@@ -348,7 +352,8 @@ async def _opportunity(id: str, deadline: float) -> tuple[dict, OpportunityRow]:
     opp = _parse(OpportunityRow, data)
     if opp.type == "job":
         raise api.fail("invalid_input", "This id is a job posting; this tool covers contracts and grants.")
-    return data, opp
+    code = opp.naics.code if opp.naics and re.fullmatch(r"\d{6}", opp.naics.code or "") else None
+    return data, opp, code
 
 
 def _summary(opp: OpportunityRow) -> OpportunitySummary:
@@ -361,22 +366,37 @@ def _summary(opp: OpportunityRow) -> OpportunitySummary:
     )
 
 
-async def _awards(deadline: float, type_: str, **filters) -> tuple[list[AwardRow], str | None, bool]:
-    """One capped award query: (rows, error or None, whether more matching awards were left unread). A failed or
-    timed-out query is not fatal: the tool answers with the other figures."""
+class _Query(NamedTuple):
+    """One award query's outcome: its rows, an error (it failed or ran out of time), and whether more matching
+    awards were left unread."""
+
+    rows: list[AwardRow]
+    error: str | None = None
+    more: bool = False
+
+    @property
+    def complete(self) -> bool:
+        return not (self.error or self.more)
+
+
+async def _awards(budget: dict, type_: str, **filters) -> _Query:
+    """One award query within the call's budget ({pages, deadline}): at most COMPOSITE_PAGES requests and no more
+    than the pages left. A failed or timed-out query is not fatal: the tool answers with the other figures."""
+    pages = min(COMPOSITE_PAGES, budget["pages"])
     try:
-        out = await api.search(type_, path=api.AWARDS_PATH, model=AwardRow, limit=COMPOSITE_ROWS,
-                               pages=COMPOSITE_PAGES, deadline=deadline, awarded_within_days=AWARDS_WINDOW_DAYS,
-                               **filters)
+        out = await api.search(type_, path=api.AWARDS_PATH, model=AwardRow, limit=COMPOSITE_ROWS, pages=pages,
+                               deadline=budget["deadline"], awarded_within_days=AWARDS_WINDOW_DAYS, **filters)
     except ToolError as e:
-        return [], str(e), False
+        budget["pages"] -= 1  # the first page failed (it may have been sent)
+        return _Query([], str(e))
+    budget["pages"] -= out["requests"]
     error = out.get("warning") if out.get("stopped") else None
-    return out["results"], error, bool(out["has_more"] and not error)
+    return _Query(out["results"], error, bool(out["has_more"] and not error))
 
 
-def _budget_cut(rows: list, more: bool) -> bool:
+def _budget_cut(q: _Query) -> bool:
     """The request budget ran out before COMPOSITE_ROWS matching awards were read (a sparse filter)."""
-    return more and len(rows) < COMPOSITE_ROWS
+    return q.more and len(q.rows) < COMPOSITE_ROWS
 
 
 def _day(value: str) -> str:
@@ -419,7 +439,7 @@ def _firms(rows: list[AwardRow]) -> list[dict]:
         dates = [r.award_date for r in f["rows"] if _date(r.award_date)]
         f.update(count=len(f["rows"]), total=round(sum(amounts), 2) if amounts else None, last=max(dates, default=None),
                  first=min(dates, default=None), typical=statistics.median(amounts) if amounts else None,
-                 agencies=[a for a, _ in Counter(r.agency for r in f["rows"] if r.agency).most_common(3)])
+                 agencies=[api.clean(a) for a, _ in Counter(r.agency for r in f["rows"] if r.agency).most_common(3)])
     return list(firms.values())
 
 
@@ -460,28 +480,28 @@ async def assess_opportunity(
     for job postings.
     """
     deadline = asyncio.get_running_loop().time() + COMPOSITE_DEADLINE_S
-    data, opp = await _opportunity(id, deadline)
-    code = opp.naics.code if opp.naics else None
-    agency_id = opp.agency_id
+    data, opp, code = await _opportunity(id, deadline)
+    budget = {"pages": COMPOSITE_AWARD_PAGES, "deadline": deadline}
     type_ = "grant_award" if opp.type == "grant" else "contract_award"
-    rows, errors, more, basis, notes = [], [], False, None, []
+    used, errors, basis, notes = None, [], None, []  # used: the query whose rows the figures are based on
     if not code:
         notes.append("This opportunity has no NAICS code, so no similar awards were looked up.")
     else:
-        if agency_id:
-            rows, error, more = await _awards(deadline, type_, naics=code, agency=agency_id)
-            errors.append(error)
+        if opp.agency_id:
+            used = await _awards(budget, type_, naics=code, agency=opp.agency_id)
+            errors.append(used.error)
             basis = "same NAICS and agency"
-        if not rows:
-            if agency_id and not errors[-1]:
+        if (used is None or not used.rows) and budget["pages"] > 0:
+            if used is not None and not used.error:
                 notes.append(f"No NAICS {code} awards from this agency were found, so similar awards cover all "
                              "agencies.")
-            rows, error, more = await _awards(deadline, type_, naics=code)
-            errors.append(error)
+            used = await _awards(budget, type_, naics=code)
+            errors.append(used.error)
             basis = "same NAICS, all agencies"
     errors = [f"Award lookup cut short: {e}" for e in errors if e]
-    cut = _budget_cut(rows, more)
-    sample, sample_note = _sample(rows, complete=bool(code) and not (more or errors))
+    rows = used.rows if used else []
+    cut = bool(used) and _budget_cut(used)
+    sample, sample_note = _sample(rows, complete=bool(used) and used.complete)
     winners = sorted(_firms(rows), key=lambda f: (f["count"], f["total"] or 0), reverse=True)[:5]
     mine = {c.strip() for c in my_naics.split(",")} if my_naics else None
     ai = _ai(data)
@@ -530,33 +550,34 @@ async def find_teaming_partners(
     postings.
     """
     deadline = asyncio.get_running_loop().time() + COMPOSITE_DEADLINE_S
-    data, opp = await _opportunity(id, deadline)
-    code = opp.naics.code if opp.naics else None
-    agency_id = opp.agency_id
+    data, opp, code = await _opportunity(id, deadline)
+    budget = {"pages": COMPOSITE_AWARD_PAGES, "deadline": deadline}
     type_ = "grant_award" if opp.type == "grant" else "contract_award"
-    agency = opp.agency or "this agency"
-    queries = []  # (where the awards are, filters); at most COMPOSITE_QUERIES run
-    if code and opp.state:
+    queries = []  # (where the awards are, filters), run while award pages are left
+    if code and opp.state and re.fullmatch(r"[A-Za-z]{2}", opp.state):
         queries.append((f"in {opp.state.upper()}", {"state": opp.state}))
-    if code and agency_id:
-        queries.append((f"at {agency}", {"agency": agency_id}))
-    anywhere = (f"in NAICS {code}", {})
-    if code and not queries:
-        queries.append(anywhere)
-    rows, where, errors, cut, more, notes, ran = {}, {}, [], False, False, [], 0
-    while queries and ran < COMPOSITE_QUERIES:
-        place, filters = queries.pop(0)
-        ran += 1
-        found, error, query_more = await _awards(deadline, type_, naics=code, **filters)
-        errors += [f"Award lookup cut short: {error}"] if error else []
-        cut, more = cut or _budget_cut(found, query_more), more or query_more
-        for r in found:
+    if code and opp.agency_id:
+        queries.append((f"at {api.clean(opp.agency or 'this agency')}", {"agency": opp.agency_id}))
+    ran, notes = [], []  # ran: (place, _Query)
+    for place, filters in queries:
+        if budget["pages"] > 0:
+            ran.append((place, await _awards(budget, type_, naics=code, **filters)))
+    if code and not any(q.rows for _, q in ran) and budget["pages"] > 0:
+        if ran:  # nothing nearby (none found, or the lookups failed): the NAICS anywhere
+            notes.append(f"Nothing came back for the opportunity's state or agency, so these firms won NAICS {code} "
+                         "awards anywhere.")
+        fallback = (f"in NAICS {code}", await _awards(budget, type_, naics=code))
+        used = [fallback]  # the NAICS anywhere covers the earlier queries, which returned no rows
+        ran.append(fallback)
+    else:
+        used = [(p, q) for p, q in ran if q.rows] or ran  # a query without rows adds nothing to the sample
+    errors = [f"Award lookup cut short: {q.error}" for _, q in ran if q.error]
+    cut = any(_budget_cut(q) for _, q in used)
+    rows, where = {}, {}
+    for place, q in used:
+        for r in q.rows:
             if r.id not in rows:
                 rows[r.id], where[r.id] = r, place
-        if filters and not (queries or rows or errors) and ran < COMPOSITE_QUERIES:  # none nearby: NAICS anywhere
-            queries.append(anywhere)
-            notes.append(f"No similar awards in the opportunity's state or at its agency, so these firms won NAICS "
-                         f"{code} awards anywhere.")
     firms = _firms(list(rows.values()))
     # Order: most awards, then the most recent, then the largest total; role reorders ties on the award count.
     firms.sort(key=lambda f: f["total"] or 0, reverse=True)
@@ -573,8 +594,9 @@ async def find_teaming_partners(
                             for i, (place, n) in enumerate(counts.items()))
         since = f" since {_day(f['first'])}" if f["first"] else ""
         partners.append({"name": f["name"], "uei": f["uei"], "awards_count": f["count"], "total_amount": f["total"],
-                         "last_award_date": f["last"], "agencies": f["agencies"], "why": f"Won {text}{since}."})
-    sample, sample_note = _sample(list(rows.values()), complete=bool(code) and not (more or errors))
+                         "last_award_date": f["last"], "agencies": f["agencies"],
+                         "why": api.clean(f"Won {text}{since}.", 200)})
+    sample, sample_note = _sample(list(rows.values()), complete=bool(used) and all(q.complete for _, q in used))
     ai_sub = (_ai(data) or {}).get("subcontracting")
     if not code:
         notes.append("This opportunity has no NAICS code, so no partners were looked up.")
@@ -594,7 +616,7 @@ async def find_teaming_partners(
                       "with a uei.", any(not p["uei"] for p in partners) and NO_UEI_NOTE,
                       isinstance(ai_sub, str) and "ai_subcontracting is AI-generated: label it as such whenever you "
                       "show or quote it.", LINK_RULE),
-        "warning": _note(*errors, cut and _cut_note(partners, code)) or None,
+        "warning": _note(*errors, cut and _cut_note(list(rows), code)) or None,
     })
     out._partial = bool(errors or cut)
     return out

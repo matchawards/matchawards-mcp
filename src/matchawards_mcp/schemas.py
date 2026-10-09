@@ -119,9 +119,17 @@ AI_FIELD = Field(None, description="AI-generated notes on this opportunity, or n
                  "when you show or quote them.")
 
 
+def _cut_words(value, cap: int = 2000):
+    """Text longer than `cap` cut at the last word boundary before it, with an ellipsis."""
+    if not isinstance(value, str) or len(value) <= cap:
+        return value
+    head = value[:cap - 1]
+    return (head.rsplit(None, 1)[0] if " " in head else head) + "…"
+
+
 class OpportunityDetail(OpportunityRow):
     as_of: Text = None
-    description: Text = Field(None, description="Up to 2000 characters.")
+    description: Annotated[Text, BeforeValidator(_cut_words)] = Field(None, description="Up to 2000 characters.")
     contacts: list[Contact] = Field(default_factory=list, description="Published points of contact; [] if none.")
     ai: AiNotes | None = AI_FIELD
     note: Text = None

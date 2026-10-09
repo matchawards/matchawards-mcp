@@ -182,7 +182,7 @@ async def test_agency_ranking_exact_then_prefix_then_api_order(api):
         ("va", "Veterans Affairs"),
     ), awards=awards_page([1]))]
     out = await run_dump(tools.search_awards(agency="veterans affairs"))
-    assert params(api, AGENCIES) == [{"q": "veterans affairs", "limit": "10"}]
+    assert params(api, AGENCIES) == [{"q": "veterans affairs", "limit": "25"}]
     assert params(api, AWARDS)[0]["agency"] == "va"  # the exact name beats prefix and substring matches
     assert "Filtered by agency: Veterans Affairs (va). Other matches: Legal Services for Veterans Grants, " \
            "Veterans Employment And Training Services, United States Department of Veterans Affairs." in out["note"]
@@ -314,3 +314,69 @@ async def test_api_timeouts_are_upstream_timeout(api, call):
     with pytest.raises(ToolError, match="took too long on this request. Retry in 30 seconds") as e:
         await call()
     assert e.value.outcome == "upstream_timeout"
+
+
+# --- Upstream values that must not reach a request or a note as they are -------------------------------------
+
+@pytest.mark.anyio
+async def test_agency_ids_outside_the_slug_alphabet_are_never_used(api):
+    api.replies = [route(agencies=agencies(
+        ("foo,bar", "Department of Poison"), ("../x", "Department of Poison Two"), ("ok_id", "Department of Poison"),
+        ("defense_security_cooperation_university_-_research_grants", "Defense Security Cooperation University")),
+        awards=awards_page([]))]
+    ids, note = await ma_api.resolve_agency("department of poison")
+    assert ids == ["ok_id"] and "foo,bar" not in note and "../x" not in note
+    ma_api._agencies.clear()
+    ids, _ = await ma_api.resolve_agency("defense security cooperation university")  # a real id with a hyphen
+    assert ids == ["defense_security_cooperation_university_-_research_grants"]
+    api.replies = [route(agencies=agencies(("foo,bar", "Bad")), awards=awards_page([]))]
+    ma_api._agencies.clear()
+    out = await run_dump(tools.search_awards(agency="Bad"))
+    assert "agency" not in params(api, AWARDS)[-1] and "No agency matched 'Bad'" in out["note"]
+
+
+@pytest.mark.anyio
+async def test_agency_names_and_the_query_echo_are_cleaned_in_notes(api):
+    api.replies = [route(agencies=agencies(("a_1", "Dept of\nThe\x07 Army " + "y" * 300), ("a_2", "Other\r\nOne")),
+                         awards=awards_page([]))]
+    _, note = await ma_api.resolve_agency("dept")
+    assert "\n" not in note and "\x07" not in note and "\r" not in note
+    assert "Filtered by agency: Dept of The Army yyy" in note and "Other matches: Other One." in note
+    assert len(note) < 120 + 120 + 60
+    api.replies = [route(agencies=agencies(), awards=awards_page([]))]
+    _, note = await ma_api.resolve_agency("bad\nname")
+    assert note == "No agency matched 'bad name'; showing all agencies."
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("cursor, echoed", [("eyJ2IjoxfQ==", "cursor=eyJ2IjoxfQ=="), ("c 1\nignore all", None),
+                                            ("x" * 201, None)])
+async def test_the_cursor_is_echoed_only_when_it_looks_like_a_cursor(api, cursor, echoed):
+    api.replies = [ok(awards_page([], has_more=True, cursor=cursor))]
+    out = await run_dump(tools.search_awards())
+    assert out["warning"].startswith("No matches in the newest results scanned")
+    if echoed:
+        assert f"Call again with {echoed} to keep searching." in out["warning"]
+    else:
+        assert "Call again with next_cursor to keep searching." in out["warning"] and cursor not in out["warning"]
+
+
+@pytest.mark.anyio
+async def test_no_valid_rows_with_more_left_combines_both_warnings(api):
+    api.replies = [ok({**awards_page([], has_more=True, cursor="c1"), "results": [{"title": "no id"}]})]
+    out = await run_dump(tools.search_awards())
+    assert out["warning"] == ("No matches in the newest results scanned; more may exist further back. Call again "
+                              "with cursor=c1 to keep searching. 3 result(s) skipped: unexpected format.")
+
+
+@pytest.mark.anyio
+async def test_lookup_naics_returns_at_most_limit_codes(api):
+    api.replies = [ok({"as_of": "x", "results": [{"code": f"54151{i}", "title": "t"} for i in range(5)]})]
+    assert len((await tools.lookup_naics("software", limit=2)).results) == 2
+
+
+@pytest.mark.anyio
+async def test_a_long_description_is_cut_at_a_word_boundary(api):
+    api.replies = [ok({"as_of": "x", "result": {"id": "7", "description": "word " * 600}})]
+    text = (await tools.get_opportunity("7")).description
+    assert len(text) <= 2000 and text.endswith("word…")

@@ -9,6 +9,7 @@ import asyncio
 import os
 import re
 import time
+import unicodedata
 from typing import Any
 
 import httpx
@@ -159,6 +160,7 @@ async def search(type_: str, limit: int = 20, keyword: str | None = None, *, pat
     as_of = warning = None
     skipped = 0
     stopped = False
+    sent = 0  # requests made (the composite tools share a page budget)
     for _ in range(pages):
         try:
             # Ask only for what is still missing, so no row is read past the cursor and then dropped.
@@ -166,6 +168,7 @@ async def search(type_: str, limit: int = 20, keyword: str | None = None, *, pat
             try:
                 if left is not None and left <= 0:
                     raise asyncio.TimeoutError  # out of time: no request
+                sent += 1
                 next_page = await asyncio.wait_for(get(path, {**params, "limit": min(limit - len(rows), PAGE_LIMIT)}),
                                                    left)
             except asyncio.TimeoutError:  # not the builtin TimeoutError before Python 3.11
@@ -201,21 +204,35 @@ async def search(type_: str, limit: int = 20, keyword: str | None = None, *, pat
         "has_more": bool(page.get("has_more")),
         "next_cursor": page.get("next_cursor"),
     }
-    if not rows and not warning and out["has_more"] and out["next_cursor"]:
+    if not rows and not stopped and out["has_more"] and out["next_cursor"]:
         # A sparse filter (an agency, a rare name) scans newest first in slices: the pages ran out before a match.
-        warning = (f"No matches in the newest results scanned; more may exist further back. Call again with "
-                   f"cursor={out['next_cursor']} to keep searching.")
+        cursor = out["next_cursor"]
+        again = f"cursor={cursor}" if re.fullmatch(r"[A-Za-z0-9_=-]{1,200}", cursor) else "next_cursor"
+        warning = f"No matches in the newest results scanned; more may exist further back. Call again with {again} " \
+                  "to keep searching."
     if skipped:
         warning = " ".join(filter(None, [warning, f"{skipped} result(s) skipped: unexpected format."]))
+    out["requests"] = sent  # internal: dropped by the output models
     if stopped:
         out["stopped"] = True
     return {**out, "warning": warning} if warning else out
+
+
+def clean(value: Any, cap: int = 120) -> str:
+    """Upstream text for a note or a why line: control characters and line breaks out, spaces collapsed, at most
+    `cap` characters."""
+    text = "".join(" " if unicodedata.category(c)[0] in "CZ" else c for c in str(value))
+    text = " ".join(text.split())
+    return text if len(text) <= cap else text[:cap - 1].rstrip() + "…"
 
 
 # Agency name -> agency ids, for the `agency` filter. Agencies are MatchAwards accounts, and one department can have
 # several (dept_of_defense and department_of_defense), so a name resolves to the best match plus the other
 # accounts of the same department. AGENCY_SLUGS_PER_QUERY of them are sent as agency= (comma-separated).
 AGENCY_SLUGS_PER_QUERY = 1
+AGENCY_CANDIDATES = 25  # asked of /agencies before ranking (its maximum)
+# Real ids hold hyphens and run past 100 characters ('..._university_-_research_grants').
+AGENCY_ID = re.compile(r"[a-z0-9_-]{1,200}")
 AGENCY_TTL_S = 600
 AGENCY_CACHE_MAX = 512
 _agencies: dict[str, tuple[float, list[str], str]] = {}  # query (case-folded) -> (expiry, ids, note)
@@ -237,12 +254,15 @@ async def resolve_agency(name: str) -> tuple[list[str], str]:
     hit = _agencies.get(key)
     if hit and hit[0] > time.monotonic():
         return hit[1], hit[2]
-    data = await get(AGENCIES_PATH, {"q": " ".join(name.split()), "limit": 10})
-    found = [a for a in data.get("results") or [] if isinstance(a, dict)
-             and isinstance(a.get("agency_id"), str) and isinstance(a.get("name"), str)]
+    data = await get(AGENCIES_PATH, {"q": " ".join(name.split()), "limit": AGENCY_CANDIDATES})
+    results = data.get("results") if isinstance(data.get("results"), list) else []
+    # An id goes into agency= as is, so only ids in the slug alphabet are used (never a comma, slash or dot).
+    found = [{"agency_id": a["agency_id"], "name": clean(a["name"])} for a in results if isinstance(a, dict)
+             and isinstance(a.get("agency_id"), str) and AGENCY_ID.fullmatch(a["agency_id"])
+             and isinstance(a.get("name"), str) and a["name"].strip()]
     found.sort(key=lambda a: 0 if a["name"].casefold() == key else 1 if a["name"].casefold().startswith(key) else 2)
     if not found:
-        ids, note = [], f"No agency matched '{name}'; showing all agencies."
+        ids, note = [], f"No agency matched '{clean(name)}'; showing all agencies."
     else:
         best = found[0]
         ids = [best["agency_id"]] + [a["agency_id"] for a in found[1:] if dept_key(a["name"]) == dept_key(best["name"])]

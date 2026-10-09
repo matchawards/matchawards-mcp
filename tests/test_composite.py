@@ -328,18 +328,54 @@ async def test_composite_descriptions_say_never_incumbent_only_as_a_rule():
 
 
 @pytest.mark.anyio
-async def test_partners_with_none_nearby_fall_back_to_the_naics_anywhere_within_the_cap(api):
+async def test_partners_with_none_nearby_fall_back_to_the_naics_anywhere_within_the_page_budget(api):
     api.replies = [router(detail(state=None), {("dept_of_the_air_force", None): [results([])],
                                                (None, None): [results(ROWS[:1])]})]
     out = await tools.find_teaming_partners(OPP["id"])
     assert [p.get("agency") for p in params(api, AWARDS)] == ["dept_of_the_air_force", None]
     assert out.partners[0].why == "Won 1 similar award in NAICS 336413 since Sep 1, 2026."
-    assert "No similar awards in the opportunity's state or at its agency" in out.note
-    api.requests.clear()  # state and agency both empty: two queries already used, no third
+    assert "Nothing came back for the opportunity's state or agency" in out.note
+    api.requests.clear()  # state and agency both empty after one page each: 4 pages left for the fallback
     api.replies = [router(detail(), {(None, "OK"): [results([])], ("dept_of_the_air_force", None): [results([])],
                                      (None, None): [results(ROWS[:1])]})]
     out = await tools.find_teaming_partners(OPP["id"])
-    assert len(params(api, AWARDS)) == 2 and out.partners == [] and out._partial is False
+    assert len(params(api, AWARDS)) == 3 and len(out.partners) == 1 and out.sample.complete is True
+    api.requests.clear()  # the state lookup fails: the fallback still runs, and only its rows make the sample
+
+    def failing_state(req):
+        if req.url.params.get("state"):
+            return httpx.Response(500, json={"error": "internal_error"})
+        return router(detail(), {("dept_of_the_air_force", None): [results([])],
+                                 (None, None): [results(ROWS[:2])]})(req)
+
+    api.replies = [failing_state]
+    out = await tools.find_teaming_partners(OPP["id"])
+    assert len(params(api, AWARDS)) == 3 and len(out.partners) == 2
+    assert out.sample.complete is True and "Based on all 2 award records found" in out.note
+    assert out.warning.startswith("Award lookup cut short: MatchAwards server error") and out._partial is True
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("first", [
+    [results([], has_more=True, cursor="c")],  # sparse: 3 empty pages, more left
+    "fail",
+])
+async def test_a_superseded_query_does_not_mark_the_sample_incomplete(api, first):
+    def reply(req):
+        if first == "fail" and req.url.params.get("agency"):
+            return httpx.Response(503, json={"error": "timeout"}, headers={"Retry-After": "30"})
+        return router(detail(), {("dept_of_the_air_force", None): first if first != "fail" else [],
+                                 (None, None): [results(ROWS[:3])]})(req)
+
+    api.replies = [reply]
+    out = await tools.assess_opportunity(OPP["id"])
+    assert out.basis == "same NAICS, all agencies" and out.sample.complete is True
+    assert "Based on all 3 award records found" in out.note and "older awards were not read" not in out.note
+    assert len(params(api, AWARDS)) == (4 if first != "fail" else 2)
+    if first == "fail":
+        assert out._partial is True and "took too long" in out.warning
+    else:
+        assert out._partial is False and out.warning is None
 
 
 @pytest.mark.anyio
@@ -364,3 +400,31 @@ async def test_a_capped_sample_says_older_awards_were_not_read(api):
     assert all(p.uei is None for p in out.partners)
     assert tools.NO_UEI_NOTE in out.note and "get_company" not in out.note  # no hint when no firm has a UEI
     assert all(p.why.endswith(", 2026.") and "since Oct " in p.why for p in out.partners)
+
+
+@pytest.mark.anyio
+async def test_a_sparse_state_query_beside_a_full_agency_one_keeps_the_sample_complete(api):
+    api.replies = [router(detail(), {(None, "OK"): [results([], has_more=True, cursor="c")],
+                                     ("dept_of_the_air_force", None): [results(ROWS[:2])]})]
+    out = await tools.find_teaming_partners(OPP["id"])
+    assert len(params(api, AWARDS)) == 4 and out.sample.complete is True and out._partial is False
+
+
+@pytest.mark.anyio
+async def test_upstream_text_in_why_lines_and_agencies_is_cleaned(api):
+    agency = "Dept\nof\x00 Things " + "x" * 300
+    rows = [win(1, "ALPHA", "A" * 12, 1.0, "2026-01-01", agency=agency)]
+    api.replies = [router(detail(state=None, agency=agency), {("dept_of_the_air_force", None): [results(rows)]})]
+    out = await tools.find_teaming_partners(OPP["id"])
+    [p] = out.partners
+    assert len(p.why) <= 200 and len(p.agencies[0]) <= 120
+    for text in (p.why, p.agencies[0], out.note):
+        assert "\n" not in text and "\x00" not in text
+    assert p.why.startswith("Won 1 similar award at Dept of Things xxx")
+
+
+@pytest.mark.anyio
+async def test_an_invalid_upstream_naics_code_is_not_sent(api):
+    api.replies = [router(detail(naics={"code": "33641,3", "title": "x"}), {})]
+    out = await tools.assess_opportunity(OPP["id"])
+    assert params(api, AWARDS) == [] and out.basis is None
