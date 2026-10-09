@@ -108,6 +108,14 @@ async def test_a_reply_the_tools_cannot_read_is_bad_response(api, usage_db):
 
 
 @pytest.mark.anyio
+async def test_an_api_timeout_is_upstream_timeout(api, usage_db):
+    api.replies = [lambda req: httpx.Response(503, json={"error": "timeout"}, headers={"Retry-After": "60"})]
+    async with http() as hc:
+        assert (await post(hc, call("search_contracts", {}))).json()["result"]["isError"] is True
+    assert [(r["tool"], r["outcome"]) for r in rows(usage_db)] == [("search_contracts", "upstream_timeout")]
+
+
+@pytest.mark.anyio
 async def test_rate_limited_calls_leave_no_row(api, usage_db, monkeypatch):
     monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "2")
     async with http() as hc:

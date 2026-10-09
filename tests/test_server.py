@@ -208,12 +208,13 @@ async def test_get_opportunity_returns_the_detail_with_link_note(api):
 async def test_get_opportunity_contacts_and_reserved_fields(api):
     api.replies = [ok({"as_of": "x", "result": {**row(8), "contacts": None}})]
     out = await run(tools.get_opportunity, "8")
-    assert (out["contacts"], out["ai"], out["teaming"]) == ([], None, None)  # ai and teaming: declared, not yet filled
+    assert (out["contacts"], out["ai"]) == ([], None)  # ai: declared, not yet filled
+    assert "teaming" not in out
     # Sent by the API, but untyped until their models exist: never passed through.
     api.replies = [ok({"as_of": "x", "result": {**row(8), "ai": {"fit": "Good fit.", "generated": True},
                                                 "teaming": {"angle": "x"}}})]
     out = await run(tools.get_opportunity, "8")
-    assert (out["ai"], out["teaming"]) == (None, None)
+    assert out["ai"] is None and "teaming" not in out
     api.replies = [ok(row(9))]  # old top-level shape: not accepted
     with pytest.raises(ToolError, match="no result object"):
         await tools.get_opportunity("9")
@@ -242,6 +243,9 @@ def _raise(exc_type):
     (lambda req: httpx.Response(404, json={"error": "not_found"}), "Not found on MatchAwards"),
     (lambda req: httpx.Response(503, json={"error": "grants_unavailable", "message": "open grant list is stale"}),
      "Grant search is temporarily unavailable"),
+    (lambda req: httpx.Response(503, json={"error": "timeout"}, headers={"Retry-After": "60"}),
+     "took too long on this request. Retry in 60 seconds"),
+    (lambda req: httpx.Response(503, json={"error": "timeout"}), "Retry in 60 seconds"),
     (lambda req: httpx.Response(500, json={"error": "internal_error"}), "server error \\(HTTP 500\\)"),
     (lambda req: httpx.Response(502, text="<html>bad gateway</html>"), "server error \\(HTTP 502\\)"),
     (_raise(httpx.ReadTimeout), "did not answer within 10 seconds"),

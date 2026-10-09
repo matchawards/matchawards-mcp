@@ -21,7 +21,7 @@ Every tool is read-only and needs no account: each declares `readOnlyHint`, `ide
 
 - `search_by_naics` is removed: `search_contracts`, `search_grants` and `search_jobs` take the same `naics` filter on its own.
 - `find_contacts` is removed: `get_opportunity` returns the published contacts with the rest of the record.
-- Results are structured output (`outputSchema` plus `structuredContent`). Fields the API adds later appear in results only once the schema declares them. `get_opportunity` reserves `ai` (AI-generated notes, labelled as such) and `teaming`; both are null for now.
+- Results are structured output (`outputSchema` plus `structuredContent`). Fields the API adds later appear in results only once the schema declares them. `get_opportunity` reserves `ai` (AI-generated notes, labelled as such); it is null for now.
 - Tool annotations are closed-world (`openWorldHint: false`): the tools read the MatchAwards catalog only.
 
 ## Hosted
@@ -156,7 +156,7 @@ With `--http` the server keeps usage stats in a SQLite file (`MATCHAWARDS_USAGE_
 
 What is recorded:
 
-- **Tool calls**: one row per call that reached a tool: time, tool name, outcome (`ok`, `invalid_input`, `upstream_error`, `bad_response` (a reply the tools cannot read), `rate_limited_upstream`, `busy`, `internal_error`), the client network (IPv4 /24 or IPv6 /48), the User-Agent (first 200 characters), its family (`openai-mcp`, `claude-user`, `claude`, `cursor`, ..., `prober` or `other`) and the latency. Calls stopped by the rate limit are counted in a metric, with no row. Arguments the SDK rejects before the tool runs leave no row either; they still count in the transport table as `tools/call`.
+- **Tool calls**: one row per call that reached a tool: time, tool name, outcome (`ok`, `invalid_input`, `upstream_error`, `bad_response` (a reply the tools cannot read), `upstream_timeout` (the API ran out of time; retry), `rate_limited_upstream`, `busy`, `internal_error`), the client network (IPv4 /24 or IPv6 /48), the User-Agent (first 200 characters), its family (`openai-mcp`, `claude-user`, `claude`, `cursor`, ..., `prober` or `other`) and the latency. Calls stopped by the rate limit are counted in a metric, with no row. Arguments the SDK rejects before the tool runs leave no row either; they still count in the transport table as `tools/call`.
 - **Transport, per day**: one counter per client network, JSON-RPC method (known MCP methods only, anything else is `_other`) and `clientInfo` name and version, with the last User-Agent seen. `clientInfo` is read from the first 8 KiB of an `initialize` body, or from `params._meta` (2026-07-28 clients), as the body streams past; the body is not buffered. At most 50 counters per client network and day; past that they fold into `_other`.
 - **ChatGPT callers**: when `MATCHAWARDS_USAGE_SALT` is set and a request carries `x-openai-subject` (ChatGPT's anonymous per-user id), the tool-call row stores a 16-hex HMAC-SHA256 of it, to count distinct ChatGPT callers (`openai-mcp` family only in the stats). `x-openai-session` is not used: it changes per conversation.
 

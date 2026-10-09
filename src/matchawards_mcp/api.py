@@ -43,6 +43,15 @@ def fail(outcome: str, message: str) -> ToolError:
     return e
 
 
+def _error_code(r: httpx.Response) -> str | None:
+    """The `error` field of a JSON error body, or None."""
+    try:
+        body = r.json()
+    except ValueError:
+        return None
+    return body.get("error") if isinstance(body, dict) else None
+
+
 def error_message(r: httpx.Response) -> str:
     """Turn an API error response ({error, parameter?} JSON) into advice the model can act on."""
     try:
@@ -56,6 +65,12 @@ def error_message(r: httpx.Response) -> str:
         return (
             f"MatchAwards rate limit reached (per IP: 60 requests per minute, 20 per 5 seconds). "
             f"Wait {wait} seconds, then retry."
+        )
+    if body.get("error") == "timeout":  # the API's own time budget (503 with Retry-After)
+        wait = r.headers.get("Retry-After") or 60
+        return (
+            f"MatchAwards took too long on this request. Retry in {wait} seconds; if it happens again, narrow the "
+            "search (fewer NAICS codes, a shorter time window)."
         )
     if body.get("error") == "grants_unavailable":
         return "Grant search is temporarily unavailable on MatchAwards. Try again later; contracts and jobs still work."
@@ -86,6 +101,8 @@ async def get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]
         ) from None
     if r.status_code == 429:
         raise fail("rate_limited_upstream", error_message(r))
+    if r.status_code == 503 and _error_code(r) == "timeout":
+        raise fail("upstream_timeout", error_message(r))
     if r.status_code >= 400:  # 4xx: the API rejected the parameters or the id (grants_unavailable is a 503)
         raise fail("upstream_error" if r.status_code >= 500 else "invalid_input", error_message(r))
     try:

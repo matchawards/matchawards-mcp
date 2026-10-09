@@ -57,5 +57,4 @@ class OpportunityDetail(OpportunityRow):
     contacts: list[Contact] = Field(default_factory=list, description="Published points of contact; [] if none.")
     ai: dict[str, Any] | None = Field(None, description="AI-generated notes on this opportunity, or null. "
                                       "Label them as AI-generated when you show them.")
-    teaming: dict[str, Any] | None = Field(None, description="Teaming angles for this opportunity, or null.")
     note: Text = None

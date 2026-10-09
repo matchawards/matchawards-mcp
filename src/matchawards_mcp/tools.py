@@ -168,9 +168,9 @@ async def get_opportunity(id: OppId) -> OpportunityDetail:
     published names and titles.
     """
     data = await api.get_one(id)
-    # ai and teaming stay null until their models are typed: no untyped upstream text passes through.
+    # ai stays null until its model is typed: no untyped upstream text passes through.
     return _parse(OpportunityDetail, {
-        **data, "contacts": data.get("contacts") or [], "ai": None, "teaming": None, "note": LINK_RULE,
+        **data, "contacts": data.get("contacts") or [], "ai": None, "note": LINK_RULE,
     })
 
 
