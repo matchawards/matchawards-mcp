@@ -98,7 +98,11 @@ async def test_assess_reads_the_detail_then_same_naics_and_agency_awards(api):
         "url": OPP["url"], "sam_url": OPP["sam_url"]}
     assert (out["naics_match"], out["set_aside_match"]) == (True, True)
     assert out["ai"]["fit"] == "Suits machine shops." and "generated" not in out["ai"]
-    assert out["basis"] == "same NAICS and agency" and out["awards_read"] == 7
+    assert out["basis"] == "same NAICS and agency"
+    assert out["sample"] == {"awards_read": 7, "oldest_award_date": "2024-06-01", "newest_award_date": "2026-10-05",
+                             "complete": True}
+    assert out["note"].startswith("Based on all 7 award records found (2024-06-01 to 2026-10-05). ")
+    assert tools.NO_UEI_NOTE in out["note"]  # GAMMA CO has no UEI
     assert [r["id"] for r in out["similar_awards"]] == ["4", "1", "2", "3", "5"]  # by award_date, newest first
     assert [(w["name"], w["awards"], w["total_amount"], w["last_award_date"]) for w in out["typical_winners"]] == [
         ("BETA INC", 2, 1000.0, "2026-08-01"),  # 2 awards each: the larger total first
@@ -117,7 +121,8 @@ async def test_assess_falls_back_to_all_agencies_and_says_so(api):
                                      (None, None): [results(ROWS[:2])]})]
     out = await call("assess_opportunity", {"id": OPP["id"]})
     assert [p.get("agency") for p in params(api, AWARDS)] == ["dept_of_the_air_force", None]
-    assert out["basis"] == "same NAICS, all agencies" and out["awards_read"] == 2
+    assert out["basis"] == "same NAICS, all agencies" and out["sample"]["awards_read"] == 2
+    assert tools.NO_UEI_NOTE not in out["note"]  # both firms have a UEI
     assert "No NAICS 336413 awards from this agency were found, so similar awards cover all agencies." in out["note"]
     assert (out["naics_match"], out["set_aside_match"], out["ai"], out["award_value_range"]) == (None, None, None, None)
     assert tools.AI_NOTE not in out["note"]
@@ -180,7 +185,8 @@ async def test_the_deadline_cuts_the_award_lookup_short_and_keeps_what_was_read(
     api.replies = [slow_awards]
     out = await tools.assess_opportunity(OPP["id"])
     # Page 1 lands at 0.2 s and page 2 is cut at 0.3 s; with a row read, there is no fallback query.
-    assert len(params(api, AWARDS)) == 2 and out.awards_read == 1 and out._partial is True
+    assert len(params(api, AWARDS)) == 2 and out.sample.awards_read == 1 and out._partial is True
+    assert out.sample.complete is False and "older awards were not read" in out.note
     assert out.basis == "same NAICS and agency"
     assert out.warning.startswith("Award lookup cut short: Stopped after 1 rows: MatchAwards did not answer within "
                                   "this tool's time limit.")
@@ -209,7 +215,8 @@ async def test_a_failed_award_query_is_partial_not_fatal(api):
 
     api.replies = [reply]
     out = await tools.assess_opportunity(OPP["id"])
-    assert out._partial is True and out.awards_read == 0 and out.similar_awards == []
+    assert out._partial is True and out.sample.awards_read == 0 and out.similar_awards == []
+    assert out.sample.complete is False and "No similar award records were found" not in out.note
     assert out.warning.count("Award lookup cut short: MatchAwards took too long") == 2  # agency, then all agencies
     assert "No NAICS" not in out.note  # an error is not "none found"
 
@@ -258,13 +265,20 @@ async def test_partners_from_state_then_agency_deduped_ranked_with_why(api):
     ]
     alpha, acme, zeta, _ = out["partners"]
     assert alpha["why"] == ("Won 2 similar awards in OK and 1 at United States Department of the Air Force "
-                            "since 2024.")
-    assert acme["why"] == "Won 1 similar award in OK and 1 at United States Department of the Air Force since 2026."
-    assert zeta["why"] == "Won 1 similar award at United States Department of the Air Force since 2026."
+                            "since May 1, 2024.")
+    assert acme["why"] == ("Won 1 similar award in OK and 1 at United States Department of the Air Force since "
+                           "Feb 1, 2026.")
+    assert zeta["why"] == "Won 1 similar award at United States Department of the Air Force since Jun 1, 2026."
+    # The sample: 7 distinct awards (11 was read twice), all of them; the why dates fall inside it.
+    assert out["sample"] == {"awards_read": 7, "oldest_award_date": "2024-05-01", "newest_award_date": "2026-09-01",
+                             "complete": True}
+    assert "Based on all 7 award records found (2024-05-01 to 2026-09-01)." in out["note"]
+    # Acme has no UEI: no get_company for it, said once; the others still get the hint.
+    assert out["note"].count(tools.NO_UEI_NOTE) == 1 and "get_company(uei) shows" in out["note"]
     assert alpha["agencies"] == ["Dept of the Army", "United States Department of the Air Force"]
     assert out["ai_subcontracting"] == "Plating and testing subs."
     assert "ai_subcontracting is AI-generated" in out["note"]
-    assert "get_company(uei)" in out["note"] and out["role"] == "any" and out["warning"] is None
+    assert out["role"] == "any" and out["warning"] is None
 
 
 @pytest.mark.anyio
@@ -294,7 +308,8 @@ async def test_partners_are_capped_at_ten(api):
 async def test_partners_without_state_or_agency_use_naics_only_and_without_naics_none(api):
     api.replies = [router(detail(state=None, agency_id=None), {(None, None): [results(ROWS[:1])]})]
     out = await tools.find_teaming_partners(OPP["id"])
-    assert len(params(api, AWARDS)) == 1 and out.partners[0].why == "Won 1 similar award in NAICS 336413 since 2026."
+    assert len(params(api, AWARDS)) == 1
+    assert out.partners[0].why == "Won 1 similar award in NAICS 336413 since Sep 1, 2026."
     api.requests.clear()
     api.replies = [router(detail(naics=None), {})]
     out = await tools.find_teaming_partners(OPP["id"])
@@ -318,7 +333,7 @@ async def test_partners_with_none_nearby_fall_back_to_the_naics_anywhere_within_
                                                (None, None): [results(ROWS[:1])]})]
     out = await tools.find_teaming_partners(OPP["id"])
     assert [p.get("agency") for p in params(api, AWARDS)] == ["dept_of_the_air_force", None]
-    assert out.partners[0].why == "Won 1 similar award in NAICS 336413 since 2026."
+    assert out.partners[0].why == "Won 1 similar award in NAICS 336413 since Sep 1, 2026."
     assert "No similar awards in the opportunity's state or at its agency" in out.note
     api.requests.clear()  # state and agency both empty: two queries already used, no third
     api.replies = [router(detail(), {(None, "OK"): [results([])], ("dept_of_the_air_force", None): [results([])],
@@ -334,3 +349,18 @@ async def test_totals_are_rounded_to_cents(api):
     out = await tools.assess_opportunity(OPP["id"])
     assert out.typical_winners[0].total_amount == 1082394.85
     assert out.award_value_range.model_dump() == {"p25": 0.15, "median": 0.2, "p75": 541197.38}
+
+
+@pytest.mark.anyio
+async def test_a_capped_sample_says_older_awards_were_not_read(api):
+    rows = [win(i, f"FIRM {i}", None, 1.0, f"2026-10-{1 + i % 9:02d}") for i in range(50)]
+    api.replies = [router(detail(), {(None, "OK"): [results(rows, has_more=True, cursor="c")],
+                                     ("dept_of_the_air_force", None): [results([])]})]
+    out = await tools.find_teaming_partners(OPP["id"])
+    # 3 pages of the same 50 rows (deduplicated) and more left: not complete, though 150 rows were not reached.
+    assert out.sample.model_dump() == {"awards_read": 50, "oldest_award_date": "2026-10-01",
+                                       "newest_award_date": "2026-10-09", "complete": False}
+    assert "Based on the newest 50 award records (2026-10-01 to 2026-10-09); older awards were not read." in out.note
+    assert all(p.uei is None for p in out.partners)
+    assert tools.NO_UEI_NOTE in out.note and "get_company" not in out.note  # no hint when no firm has a UEI
+    assert all(p.why.endswith(", 2026.") and "since Oct " in p.why for p in out.partners)

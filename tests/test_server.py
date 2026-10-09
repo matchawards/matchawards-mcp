@@ -361,7 +361,7 @@ SKIP_CASE = [ok({**page([]), "results": [row(1), {"id": ["bad"]}]})]  # one row 
                                                          "naics": None, "sam_url": None}], "has_more": False})]),
     ("get_opportunity", {"id": "7"}, [ok({"as_of": "x", "result": {
         **DETAIL, "naics": {"code": "238160", "title": "Roofing Contractors"}, "sam_url": "https://sam.gov/opp/1",
-        "no_fixed_deadline": True, "agency_id": "not-declared-yet"}})]),
+        "no_fixed_deadline": True, "agency_id": "dept_of_the_army", "made_up_field": "x"}})]),
     ("get_opportunity", {"id": "8"}, [ok({"as_of": "x", "result": row(8)})]),  # no description, no contacts
     ("search_grants", {}, SKIP_CASE),
 ])
@@ -376,7 +376,9 @@ async def test_structured_content_validates_against_output_schema(api, name, arg
         assert out.structured_content["warning"].startswith("Stopped after 1 rows")
     if name == "search_grants" and replies is SKIP_CASE:
         assert out.structured_content["warning"] == "1 result(s) skipped: unexpected format."
-    assert "agency_id" not in out.structured_content  # undeclared API fields stay out until a model declares them
+    assert "made_up_field" not in out.structured_content  # undeclared API fields stay out until a model declares them
+    if name == "get_opportunity" and args["id"] == "7":
+        assert out.structured_content["agency_id"] == "dept_of_the_army"  # declared: passed through
 
 
 @pytest.mark.anyio

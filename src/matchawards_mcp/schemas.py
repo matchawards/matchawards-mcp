@@ -76,6 +76,7 @@ class OpportunityRow(BaseModel):
     type: Text = Field(None, description="federal, state, grant or job.")
     title: Text = None
     agency: Agency = None
+    agency_id: Text = Field(None, description="The agency's MatchAwards id.")
     office: Text = None
     naics: Naics | None = None
     set_aside: Text = None
@@ -246,6 +247,15 @@ class Winner(BaseModel):
     last_award_date: Text = None
 
 
+class Sample(BaseModel):
+    """What the award figures are based on: the newest matching awards, up to 150 per query."""
+
+    awards_read: int
+    oldest_award_date: Text = None
+    newest_award_date: Text = None
+    complete: bool = Field(description="true: every matching award was read; false: older awards were not read.")
+
+
 class ValueRange(BaseModel):
     p25: float
     median: float
@@ -266,7 +276,7 @@ class Assessment(BaseModel):
                                           "then largest total.")
     award_value_range: ValueRange | None = Field(None, description="Quartiles of the similar awards' amounts (USD); "
                                                  "null with fewer than 3 amounts.")
-    awards_read: int = Field(description="Similar awards the figures are based on.")
+    sample: Sample
     basis: Text = Field(None, description="'same NAICS and agency', 'same NAICS, all agencies', or null (no NAICS).")
     coverage_note: Text = None
     note: Text = None
@@ -290,6 +300,7 @@ class TeamingPartners(BaseModel):
     opportunity: OpportunitySummary
     role: str
     partners: list[Partner] = Field(description="Up to 10 firms that won similar work.")
+    sample: Sample
     ai_subcontracting: AiText = Field(None, description="AI-generated notes on subcontracting angles for this "
                                       "opportunity, or null. Label them as AI-generated when you show them.")
     coverage_note: Text = None
