@@ -42,9 +42,9 @@ async def http(host="matchawards.com", headers=None):
 
 
 def global_cap(monkeypatch, n):
-    """MATCHAWARDS_GLOBAL_PER_MIN=n, with the ChatGPT pool lowered to fit (startup refuses a global cap below it)."""
+    """MATCHAWARDS_GLOBAL_PER_MIN=n, with the ChatGPT pool lowered to fit (startup needs the global cap above it)."""
     monkeypatch.setenv("MATCHAWARDS_GLOBAL_PER_MIN", str(n))
-    monkeypatch.setenv("MATCHAWARDS_EGRESS_PER_MIN", str(n))
+    monkeypatch.setenv("MATCHAWARDS_EGRESS_PER_MIN", str(n - 1))
 
 
 def ping(hc, ip=None, path="/mcp", subject=None):
@@ -621,7 +621,22 @@ def test_an_unusable_bundled_snapshot_stops_startup(monkeypatch, tmp_path, conte
         server.http_app()
 
 
-def test_a_global_cap_below_the_chatgpt_pool_stops_startup(monkeypatch):
-    monkeypatch.setenv("MATCHAWARDS_GLOBAL_PER_MIN", "100")
-    with pytest.raises(SystemExit, match=r"MATCHAWARDS_GLOBAL_PER_MIN \(100\) must not be below MATCHAWARDS_EGRESS"):
+@pytest.mark.parametrize("cap", ["100", "600"])
+def test_a_global_cap_not_above_the_chatgpt_pool_stops_startup(monkeypatch, cap):
+    monkeypatch.setenv("MATCHAWARDS_GLOBAL_PER_MIN", cap)
+    with pytest.raises(SystemExit, match=rf"MATCHAWARDS_GLOBAL_PER_MIN \({cap}\) must be above MATCHAWARDS_EGRESS"):
         server.http_app()
+
+
+def test_overlapping_prefixes_count_once_against_the_address_cap(monkeypatch):
+    monkeypatch.setattr(server, "EGRESS_MAX_IPV4", 65_536)
+    same = [{"ipv4Prefix": "10.1.0.0/16"}, {"ipv4Prefix": "10.1.0.0/17"}, {"ipv4Prefix": "10.1.128.0/17"}]
+    assert server.parse_egress({"prefixes": same}) is not None
+    assert server.parse_egress({"prefixes": same + [{"ipv4Prefix": "10.2.0.0/24"}]}) is None
+
+
+def test_too_many_prefixes_are_rejected_whole(monkeypatch):
+    monkeypatch.setattr(server, "EGRESS_MAX_ENTRIES", 3)
+    v6 = [{"ipv6Prefix": f"2001:db8:{i}::/48"} for i in range(4)]
+    assert server.parse_egress({"prefixes": v6[:3]}) is not None
+    assert server.parse_egress({"prefixes": v6}) is None

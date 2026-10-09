@@ -494,6 +494,8 @@ SUBJECT_MAX_LEN = 256  # a longer x-openai-subject counts as absent
 # this is about 4x that. Every address in the list skips its per-IP limit, so a list grown far past what OpenAI
 # publishes (an error upstream, or a tampered copy) must not take effect. Raise it if OpenAI's list really grows.
 EGRESS_MAX_IPV4 = 150_000
+# ~4x today's 283 prefixes: bounds IPv6 too (it has no address-count cap) and the per-request scan.
+EGRESS_MAX_ENTRIES = 1_200
 egress_log = logging.getLogger("matchawards_mcp.egress")
 
 
@@ -514,7 +516,11 @@ def parse_egress(data) -> list | None:
             egress_log.warning("egress list: skipped a bad entry %.100r", entry)
         else:
             nets.append(net)
-    if (total := sum(n.num_addresses for n in nets if n.version == 4)) > EGRESS_MAX_IPV4:
+    if len(nets) > EGRESS_MAX_ENTRIES:
+        egress_log.warning("egress list rejected: %d prefixes, more than EGRESS_MAX_ENTRIES", len(nets))
+        return None
+    v4 = ipaddress.collapse_addresses(n for n in nets if n.version == 4)  # overlaps counted once
+    if (total := sum(n.num_addresses for n in v4)) > EGRESS_MAX_IPV4:
         egress_log.warning("egress list rejected: %d IPv4 addresses, more than EGRESS_MAX_IPV4", total)
         return None
     return nets or None
@@ -724,8 +730,8 @@ def http_app() -> Starlette:
         raise SystemExit(f"MATCHAWARDS_TRUSTED_PROXIES must be comma-separated CIDRs: {e}") from None
     global_per_min = _env_int("MATCHAWARDS_GLOBAL_PER_MIN", 1200)
     egress_per_min = _env_int("MATCHAWARDS_EGRESS_PER_MIN", 600)
-    if global_per_min < egress_per_min:
-        raise SystemExit(f"MATCHAWARDS_GLOBAL_PER_MIN ({global_per_min}) must not be below "
+    if global_per_min <= egress_per_min:
+        raise SystemExit(f"MATCHAWARDS_GLOBAL_PER_MIN ({global_per_min}) must be above "
                          f"MATCHAWARDS_EGRESS_PER_MIN ({egress_per_min}): ChatGPT alone could use the whole cap")
     try:
         snapshot = parse_egress(json.loads(EGRESS_SNAPSHOT.read_text()))
@@ -752,8 +758,8 @@ def http_app() -> Starlette:
         # All clients together: bounds the load on the API, which does not rate-limit this server's address.
         # All /64s of one IPv6 /48 together.
         prefix_limiter=RateLimiter(_env_int("MATCHAWARDS_RATE_PER_PREFIX_MIN", 120), 0),
-        # Not below MATCHAWARDS_EGRESS_PER_MIN: ChatGPT traffic alone can use its whole pool, and everyone else
-        # still needs room under the global cap.
+        # Above MATCHAWARDS_EGRESS_PER_MIN (checked above): ChatGPT traffic alone can use its whole pool, and
+        # everyone else still needs room under the global cap.
         global_limiter=RateLimiter(global_per_min, 0),
         # ChatGPT traffic (from OpenAI's egress addresses): per x-openai-subject, and all of it together.
         subject_limiter=RateLimiter(_env_int("MATCHAWARDS_RATE_PER_SUBJECT_MIN", 30),

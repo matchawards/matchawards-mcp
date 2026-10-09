@@ -132,7 +132,7 @@ Do not trust a broad private range such as `172.16.0.0/12`: it may overlap your 
 | `MATCHAWARDS_RATE_PER_MIN` | `30` | `--http` only: requests per minute per client. |
 | `MATCHAWARDS_RATE_BURST` | `10` | `--http` only: requests per 5 seconds per client. |
 | `MATCHAWARDS_RATE_PER_PREFIX_MIN` | `120` | `--http` only: requests per minute for all IPv6 /64s inside one /48 together. |
-| `MATCHAWARDS_GLOBAL_PER_MIN` | `1200` | `--http` only: requests per minute for all clients together. Must not be below `MATCHAWARDS_EGRESS_PER_MIN` (the server will not start). |
+| `MATCHAWARDS_GLOBAL_PER_MIN` | `1200` | `--http` only: requests per minute for all clients together. Must be above `MATCHAWARDS_EGRESS_PER_MIN` (otherwise the server will not start). |
 | `MATCHAWARDS_RATE_PER_SUBJECT_MIN` | `30` | `--http` only: requests per minute per ChatGPT user (`x-openai-subject`, from OpenAI's egress addresses only). |
 | `MATCHAWARDS_RATE_SUBJECT_BURST` | `10` | `--http` only: requests per 5 seconds per ChatGPT user. |
 | `MATCHAWARDS_EGRESS_PER_MIN` | `600` | `--http` only: requests per minute for all ChatGPT traffic together. |
