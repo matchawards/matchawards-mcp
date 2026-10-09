@@ -219,11 +219,14 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--link); outline-
 
   function row(r) {
     var li = el("li"), title = str(r.title) || "Untitled opportunity";
-    var main = el(canMessage() ? "button" : "div", "main");
+    // The follow-up is sent as the user's own message, so it carries only the validated id, never upstream text
+    // (a crafted title would otherwise speak in the user's name). No valid id: no button.
+    var id = /^\d{1,30}$/.test(str(r.id)) ? str(r.id) : "";
+    var main = el(canMessage() && id ? "button" : "div", "main");
     if (main.tagName === "BUTTON") {
       main.type = "button";
       main.title = "Ask for the details";
-      main.addEventListener("click", function () { ask("Show details for " + title + " (id " + r.id + ")"); });
+      main.addEventListener("click", function () { ask("Show details for MatchAwards opportunity " + id + "."); });
     }
     main.appendChild(el("span", "title", title));
     var place = [str(r.city), str(r.state)].filter(Boolean).join(", ");

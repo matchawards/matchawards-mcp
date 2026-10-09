@@ -476,6 +476,9 @@ def test_card_needs_no_network_and_survives_a_strict_csp():
 def test_card_renders_from_structured_content_and_never_calls_a_tool():
     assert "structuredContent" in CARD_SCRIPT and "toolOutput" in CARD_SCRIPT
     assert "_meta" not in CARD_SCRIPT and "toolResponseMetadata" not in CARD_SCRIPT  # host bugs: _meta leaks/varies
+    # A follow-up goes out as the user's own message: only the validated id, never upstream text such as the title.
+    assert '"Show details for MatchAwards opportunity " + id' in CARD_SCRIPT
+    assert re.search(r'ask\([^)]*title', CARD_SCRIPT) is None
     assert "tools/call" not in CARD_SCRIPT and "callTool" not in CARD_SCRIPT  # actions go through the model
     # The opportunity layout is picked by the shape of SearchResult.
     from matchawards_mcp.schemas import SearchResult

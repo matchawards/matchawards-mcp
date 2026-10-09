@@ -54,7 +54,7 @@ for (const fixture of Object.keys(ROWS)) {
   const sent = await page.evaluate(() => window.messages.filter((m) => m.method && m.method.startsWith("ui/")));
   const ask = sent.find((m) => m.method === "ui/message");
   assert.deepEqual(ask.params, { role: "user", content: [{ type: "text",
-    text: "Show details for Roof replacement, building 1 (id 117402307943537001)" }] });
+    text: "Show details for MatchAwards opportunity 117402307943537001." }] });
   const link = sent.find((m) => m.method === "ui/open-link");
   assert.deepEqual(link.params, { url: "https://matchawards.com/a/posts/1" });
   assert.ok(!(await page.evaluate(() => window.messages.some((m) => m.method === "tools/call"))));
@@ -74,8 +74,7 @@ for (const fixture of Object.keys(ROWS)) {
   await card.getByRole("link").first().click();
   const calls = await page.evaluate(() => window.messages.filter((m) => m.openai));
   assert.deepEqual(calls, [
-    { openai: "sendFollowUpMessage", args: { prompt: "Show details for Broadband infrastructure deployment grants " +
-      "(id 117402307943537031)" } },
+    { openai: "sendFollowUpMessage", args: { prompt: "Show details for MatchAwards opportunity 117402307943537031." } },
     { openai: "openExternal", args: { href: "https://matchawards.com/a/posts/31" } },
   ]);
   assert.deepEqual(errors, []);
