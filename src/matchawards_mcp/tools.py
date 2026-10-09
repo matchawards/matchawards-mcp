@@ -469,8 +469,9 @@ async def assess_opportunity(
     value.
 
     Pass the id from a search result, and optionally my_naics (up to 10 codes) and my_set_aside to check the fit.
-    Similar awards are the newest (up to 150) of the same NAICS at the same agency, or at all agencies when that
-    agency has none (basis says which); sample gives the dates they cover, so state it rather than a longer span.
+    Similar awards come from MatchAwards' award records for the same NAICS at the same agency, or at all agencies
+    when that agency has none (basis says which); sample gives the dates covered and whether every matching record
+    was read, so state that span rather than a longer one.
     Award records may be incomplete, so say so; ai text is AI-generated, so label it.
     Never call a firm the incumbent: these are firms that won similar work. Example: id="117412688283576625".
 
@@ -537,10 +538,10 @@ async def find_teaming_partners(
     """Use this when the user wants possible teaming partners, subcontractors or primes for one opportunity: firms
     that won similar awards in the same state or at the same agency.
 
-    Pass the id from a search result, and optionally role (sub, prime or any). Returns up to 10 firms from the
-    newest public award records (same NAICS in the opportunity's state, then at its agency, else anywhere; sample
-    gives the dates read), ranked by similar awards won, then the most recent, then the total, each with a why
-    line; get_company(uei) shows the history of a firm with a uei. No contact details. Award records may be
+    Pass the id from a search result, and optionally role (sub, prime or any). Returns up to 10 firms from
+    MatchAwards' award records (same NAICS in the opportunity's state, then at its agency, else anywhere; sample
+    gives the dates covered and whether every matching record was read), ranked by how many similar awards they
+    won, each with a why line; get_company(uei) shows the history of a firm with a uei. No contact details. Award records may be
     incomplete, so say so; ai_subcontracting is AI-generated, so label it. Never call a firm the incumbent.
     Example: id="117412688283576625".
 

@@ -256,7 +256,8 @@ class Winner(BaseModel):
 
 
 class Sample(BaseModel):
-    """What the award figures are based on: the newest matching awards, up to 150 per query."""
+    """What the award figures are based on: the award records read, the dates they cover, and whether every matching
+    record was read (complete)."""
 
     awards_read: int
     oldest_award_date: Text = None
