@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import inspect
 import ipaddress
+import json
 import logging
 import math
 import os
@@ -21,6 +22,7 @@ import re
 import sys
 import time
 from collections import deque
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import httpx
@@ -54,6 +56,8 @@ INSTRUCTIONS = (
 
 # HTTP mode only: API calls per minute for the whole server (the API does not rate-limit this server's address,
 # and one search can make up to MAX_PAGES calls). None in stdio mode, where the API's own per-IP limit applies.
+# Tools that combine several API calls in one call may need it raised, together with the API side's allowlist
+# for this server's address (PUBLIC_API_ALLOW_IPS), which is what lets this server past the API's per-IP limit.
 api_budget = None
 
 # HTTP mode only: the usage ledger (None when disabled, and always in stdio mode) and the request being served.
@@ -387,6 +391,7 @@ async def find_contacts(id: OppId) -> dict[str, Any]:
 
 access_log = logging.getLogger("matchawards_mcp.access")
 _LOG_SALT = os.urandom(16)  # client keys in the log are hashed with a per-process salt, never written raw
+_SUBJECT_SALT = os.urandom(16)  # x-openai-subject is kept only as a keyed hash, as a rate-limit key
 _LOG_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
 _LOG_PATHS = {"/mcp", "/healthz"}
 MAX_BODY_BYTES = 64 * 1024  # a JSON-RPC request to these tools is well under 2 KB
@@ -446,18 +451,29 @@ def _ip(raw: str):
     return getattr(ip, "ipv4_mapped", None) or ip
 
 
-def client_key(scope, trusted_proxies) -> str:
-    """The rate-limit key: the socket peer, or X-Real-IP when the peer is a trusted proxy. IPv6 is keyed per /64.
+def client_ip(scope, trusted_proxies):
+    """The client address: the socket peer, or X-Real-IP when the peer is a trusted proxy. None without a TCP peer.
 
-    X-Real-IP from any other peer is ignored, so a client cannot pick its own key. A value that is not a valid IP
-    is ignored too (the peer is used). "unknown" only happens with no TCP peer at all (a unix socket)."""
+    X-Real-IP from any other peer is ignored, so a client cannot pick its own address. A value that is not a valid
+    IP is ignored too (the peer is used)."""
     ip = peer = _ip((scope.get("client") or ("",))[0])
     if peer is not None and any(peer in net for net in trusted_proxies):
         real_ip = next((v.decode("latin-1") for k, v in scope["headers"] if k == b"x-real-ip"), "")
         ip = _ip(real_ip) or peer
+    return ip
+
+
+def ip_key(ip) -> str:
+    """The rate-limit key of a client address: the address itself, IPv6 per /64. "unknown" for None (a unix
+    socket)."""
     if ip is None:
         return "unknown"
     return str(ipaddress.ip_network((ip, 64), strict=False)) if ip.version == 6 else str(ip)
+
+
+def client_key(scope, trusted_proxies) -> str:
+    """The rate-limit key of a request (client_ip, then ip_key)."""
+    return ip_key(client_ip(scope, trusted_proxies))
 
 
 def prefix_key(key: str) -> str | None:
@@ -469,6 +485,71 @@ def prefix_key(key: str) -> str | None:
     return str(ipaddress.ip_network(key).supernet(new_prefix=48)) if ":" in key else None
 
 
+EGRESS_URL = "https://openai.com/chatgpt-connectors.json"
+EGRESS_SNAPSHOT = Path(__file__).parent / "data" / "chatgpt-connectors.json"  # bundled; used until a fetch works
+EGRESS_REFRESH_S = 86_400  # after a good fetch
+EGRESS_RETRY_S = 3_600  # after a failed one
+egress_log = logging.getLogger("matchawards_mcp.egress")
+
+
+def parse_egress(data) -> list | None:
+    """The networks in an egress list ({creationTime, prefixes: [{ipv4Prefix | ipv6Prefix: CIDR}]}), or None if
+    there are none. An entry that is not a CIDR string, or is wider than an IPv4 /8 or IPv6 /32 (every client would
+    become a ChatGPT one and skip its per-IP limit), is skipped and logged."""
+    prefixes = data.get("prefixes") if isinstance(data, dict) else None
+    nets = []
+    for entry in prefixes if isinstance(prefixes, list) else []:
+        raw = (entry.get("ipv4Prefix") or entry.get("ipv6Prefix")) if isinstance(entry, dict) else None
+        try:
+            net = ipaddress.ip_network(raw if isinstance(raw, str) else "")
+        except ValueError:
+            net = None
+        if net is None or net.prefixlen < (8 if net.version == 4 else 32):
+            egress_log.warning("egress list: skipped a bad entry %.100r", entry)
+        else:
+            nets.append(net)
+    return nets or None
+
+
+async def fetch_egress() -> list | None:
+    """The current egress list from EGRESS_URL, or None (logged) if it cannot be fetched or has no valid entry."""
+    try:
+        r = await client.get(EGRESS_URL, timeout=10.0)
+        r.raise_for_status()
+        nets = parse_egress(r.json())
+    except (httpx.HTTPError, ValueError) as e:
+        egress_log.warning("egress list refresh failed, keeping the last good list: %s", type(e).__name__)
+        return None
+    if nets is None:
+        egress_log.warning("egress list refresh had no valid prefix, keeping the last good list")
+    return nets
+
+
+class EgressRanges:
+    """The addresses ChatGPT calls from: OpenAI's published list, shared by every ChatGPT user.
+
+    Starts from the bundled snapshot and refreshes from EGRESS_URL in the background, started by the request that
+    finds it due (the first request, then every EGRESS_REFRESH_S). A failed or empty fetch keeps the last good list,
+    so the limits never fall open."""
+
+    def __init__(self, nets: list, clock=None):
+        self.nets, self.clock = nets, clock or time.monotonic
+        self.due = 0.0
+        self.task: asyncio.Task | None = None  # held so the running refresh is not garbage-collected
+
+    def __contains__(self, ip) -> bool:
+        return ip is not None and any(ip in net for net in self.nets)
+
+    def refresh_if_due(self) -> None:
+        if self.clock() >= self.due and (self.task is None or self.task.done()):
+            self.due = self.clock() + EGRESS_RETRY_S  # until the fetch succeeds
+            self.task = asyncio.create_task(self.refresh())
+
+    async def refresh(self) -> None:
+        if nets := await fetch_egress():
+            self.nets, self.due = nets, self.clock() + EGRESS_REFRESH_S
+
+
 def _host_name(host: str) -> str:
     """The Host header without its port, lower-cased: 'matchawards.com:443' -> 'matchawards.com'."""
     name, sep, port = host.rpartition(":")
@@ -477,23 +558,26 @@ def _host_name(host: str) -> str:
 
 class HttpGuard:
     """Runs before the MCP layer, in this order: path (404), Host (421), method (405), body size (411/413),
-    per-client then global rate limit (429). Writes one access line per request.
+    rate limits (429). Writes one access line per request.
 
     A rejection is counted in mcp_rejected_total{reason}. A request passed on to /mcp is counted by JSON-RPC method
     and User-Agent family, added to the daily transport aggregate, and made visible to the tool wrapper (_tool)."""
 
     def __init__(self, app, limiter: RateLimiter, prefix_limiter: RateLimiter, global_limiter: RateLimiter,
+                 subject_limiter: RateLimiter, egress_limiter: RateLimiter, egress: EgressRanges,
                  trusted_proxies, allowed_hosts, usage_salt: bytes | None = None):
         self.app, self.limiter, self.prefix_limiter, self.global_limiter = app, limiter, prefix_limiter, global_limiter
+        self.subject_limiter, self.egress_limiter, self.egress = subject_limiter, egress_limiter, egress
         self.trusted_proxies, self.allowed_hosts, self.usage_salt = trusted_proxies, allowed_hosts, usage_salt
 
-    def reject(self, scope, path: str, key: str) -> tuple[str, Response] | None:
+    def reject(self, scope, path: str, ip, key: str) -> tuple[str, Response] | None:
         """(reason, response) that ends this request here, or None to pass it on."""
         if path == "/healthz":
             return None  # unlimited; the route itself answers 405 to anything but GET/HEAD
         if path != "/mcp":
             return "path", PlainTextResponse("Not Found", status_code=404)
-        headers = {k: v.decode("latin-1") for k, v in scope["headers"] if k in (b"host", b"content-length")}
+        headers = {k: v.decode("latin-1") for k, v in scope["headers"]
+                   if k in (b"host", b"content-length", b"x-openai-subject")}
         if _host_name(headers.get(b"host", "")) not in self.allowed_hosts:
             return "host", PlainTextResponse("Invalid Host header", status_code=421)
         if scope["method"] != "POST":
@@ -507,12 +591,25 @@ class HttpGuard:
         if int(length) > MAX_BODY_BYTES:
             return "size", PlainTextResponse("Request body too large", status_code=413)
         # A request counts in the limits only when all of them allow it: a source adds at most its own budget to
-        # the global count (IPv4 address 30/min, IPv6 /48 120/min, so 600 needs 5+ /48s or 20+ IPv4 addresses),
-        # and a lockout at one level does not use up the budgets of the others. A distributed flood from that many
-        # sources can still trip the global cap for everyone; Cloudflare in front of nginx is the outer layer.
-        prefix = prefix_key(key)
-        checks = [(self.limiter, key, "client"), (self.global_limiter, "all", "global")]
-        checks += [(self.prefix_limiter, prefix, "prefix")] if prefix else []
+        # the global count (IPv4 address 30/min, IPv6 /48 120/min, all of ChatGPT 600/min, so 1200 needs 10+ /48s
+        # or 40+ IPv4 addresses, or ChatGPT plus half that), and a lockout at one level does not use up the budgets
+        # of the others. A distributed flood from that many sources can still trip the global cap for everyone;
+        # Cloudflare in front of nginx is the outer layer.
+        self.egress.refresh_if_due()
+        if ip in self.egress:
+            # ChatGPT: many users share each of these addresses, so a per-IP limit would throttle them together.
+            # Its x-openai-subject (one per user) gets the per-client budget instead, inside a pool for all ChatGPT
+            # traffic. Trusted only from these addresses (anyone else could pick a fresh subject per request), and
+            # never the User-Agent, which anyone can send.
+            subject = headers.get(b"x-openai-subject")
+            checks = [(self.egress_limiter, "egress", "egress"), (self.global_limiter, "all", "global")]
+            if subject:
+                digest = hashlib.blake2s(subject.encode("latin-1"), key=_SUBJECT_SALT, digest_size=16).hexdigest()
+                checks.insert(0, (self.subject_limiter, digest, "subject"))
+        else:
+            prefix = prefix_key(key)
+            checks = [(self.limiter, key, "client"), (self.global_limiter, "all", "global")]
+            checks += [(self.prefix_limiter, prefix, "prefix")] if prefix else []
         for limiter, k, name in checks:
             if wait := limiter.wait(k):
                 return f"rate_limit_{name}", JSONResponse(
@@ -556,7 +653,8 @@ class HttpGuard:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
-        start, status, key = time.monotonic(), 0, client_key(scope, self.trusted_proxies)
+        start, status, ip = time.monotonic(), 0, client_ip(scope, self.trusted_proxies)
+        key = ip_key(ip)
         path = re.sub(r"/+", "/", scope["path"]).rstrip("/") or "/"  # '//mcp' and '/mcp/' are '/mcp'
 
         async def send_status(message):
@@ -566,7 +664,7 @@ class HttpGuard:
             await send(message)
 
         try:
-            if rejected := self.reject(scope, path, key):
+            if rejected := self.reject(scope, path, ip, key):
                 usage.metrics.inc("mcp_rejected_total", reason=rejected[0])
                 await rejected[1](scope, receive, send_status)
             elif path == "/mcp":
@@ -633,7 +731,14 @@ def http_app() -> Starlette:
         # All clients together: bounds the load on the API, which does not rate-limit this server's address.
         # All /64s of one IPv6 /48 together.
         prefix_limiter=RateLimiter(_env_int("MATCHAWARDS_RATE_PER_PREFIX_MIN", 120), 0),
-        global_limiter=RateLimiter(_env_int("MATCHAWARDS_GLOBAL_PER_MIN", 600), 0),
+        # Not below MATCHAWARDS_EGRESS_PER_MIN: ChatGPT traffic alone can use its whole pool, and everyone else
+        # still needs room under the global cap.
+        global_limiter=RateLimiter(_env_int("MATCHAWARDS_GLOBAL_PER_MIN", 1200), 0),
+        # ChatGPT traffic (from OpenAI's egress addresses): per x-openai-subject, and all of it together.
+        subject_limiter=RateLimiter(_env_int("MATCHAWARDS_RATE_PER_SUBJECT_MIN", 30),
+                                    _env_int("MATCHAWARDS_RATE_SUBJECT_BURST", 10)),
+        egress_limiter=RateLimiter(_env_int("MATCHAWARDS_EGRESS_PER_MIN", 600), 0),
+        egress=EgressRanges(parse_egress(json.loads(EGRESS_SNAPSHOT.read_text()))),
         allowed_hosts={h.lower() for h in hosts},
         trusted_proxies=trusted,
         usage_salt=os.environ.get("MATCHAWARDS_USAGE_SALT", "").encode() or None,

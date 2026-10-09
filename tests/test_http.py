@@ -3,6 +3,7 @@
 import contextlib
 from types import SimpleNamespace
 import ipaddress
+import json
 import logging
 
 import httpx
@@ -11,13 +12,14 @@ import pytest
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 
-from matchawards_mcp import __version__, server
+from matchawards_mcp import __version__, server, usage
 
 from test_server import TOOLS, api, anyio_backend, page  # noqa: F401  (fixtures)
 
 TRUSTED = [ipaddress.ip_network(n) for n in ("127.0.0.1/32", "::1/128", "172.16.0.0/12")]
 PING = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
 LEGACY = {"MCP-Protocol-Version": "2025-06-18", "Accept": "application/json, text/event-stream"}
+REAL_FETCH_EGRESS = server.fetch_egress  # conftest swaps it for a failing stub in every test
 
 
 @pytest.fixture(autouse=True)
@@ -39,8 +41,9 @@ async def http(host="matchawards.com", headers=None):
         )
 
 
-def ping(hc, ip=None, path="/mcp"):
-    return hc.post(path, json=PING, headers={**LEGACY, **({"X-Real-IP": ip} if ip else {})})
+def ping(hc, ip=None, path="/mcp", subject=None):
+    headers = {**LEGACY, **({"X-Real-IP": ip} if ip else {}), **({"x-openai-subject": subject} if subject else {})}
+    return hc.post(path, json=PING, headers=headers)
 
 
 @pytest.mark.anyio
@@ -393,3 +396,158 @@ async def test_stdio_mode_has_no_api_budget(api):
     for _ in range(5):
         await server.get_opportunity("7")
     assert len(api.requests) == 5
+
+
+# --- ChatGPT egress ---------------------------------------------------------------------------------------
+
+@pytest.fixture
+def egress(monkeypatch, tmp_path):
+    """ChatGPT egress = 192.0.2.0/24 and 2001:db8:ee::/48 (instead of the bundled snapshot), fresh counters."""
+    snapshot = tmp_path / "egress.json"
+    snapshot.write_text(json.dumps({"creationTime": "2026-01-01T00:00:00", "prefixes": [
+        {"ipv4Prefix": "192.0.2.0/24"}, {"ipv6Prefix": "2001:db8:ee::/48"}]}))
+    monkeypatch.setattr(server, "EGRESS_SNAPSHOT", snapshot)
+    monkeypatch.setattr(usage, "metrics", usage.Metrics())
+
+
+def rejected(reason):
+    return usage.metrics.counts[("mcp_rejected_total", (("reason", reason),))]
+
+
+@pytest.mark.anyio
+async def test_chatgpt_subjects_are_limited_separately(egress, monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_RATE_SUBJECT_BURST", "3")
+    keys, record = [], server.RateLimiter.record
+    monkeypatch.setattr(server.RateLimiter, "record", lambda self, key: (keys.append(key), record(self, key)))
+    async with http() as hc:
+        assert [(await ping(hc, "192.0.2.10", subject="user-a")).status_code for _ in range(4)] == [200] * 3 + [429]
+        assert rejected("rate_limit_subject") == 1
+        assert (await ping(hc, "192.0.2.10", subject="user-b")).status_code == 200  # same address, another user
+        assert (await ping(hc, "192.0.2.99", subject="user-a")).status_code == 429  # the user, from any egress address
+    assert keys and not any("user" in k for k in keys)  # limiters hold a keyed hash, never the subject
+    assert "192.0.2.10" not in keys  # and no per-IP key for an egress address
+
+
+@pytest.mark.anyio
+async def test_one_chatgpt_subject_has_the_per_minute_cap(egress, monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_RATE_PER_SUBJECT_MIN", "5")
+    monkeypatch.setenv("MATCHAWARDS_RATE_SUBJECT_BURST", "3")
+    now = [1000.0]
+    monkeypatch.setattr(server, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    async with http() as hc:
+        assert [(await ping(hc, "192.0.2.10", subject="u")).status_code for _ in range(4)] == [200] * 3 + [429]
+        now[0] += 5
+        assert [(await ping(hc, "192.0.2.10", subject="u")).status_code for _ in range(2)] == [200] * 2
+        r = await ping(hc, "192.0.2.10", subject="u")
+        assert r.status_code == 429 and int(r.headers["Retry-After"]) == 55  # 5 per minute
+
+
+@pytest.mark.anyio
+async def test_chatgpt_without_subject_uses_only_the_pooled_budget(egress, monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_EGRESS_PER_MIN", "5")
+    monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "3")  # would stop one address at 4 if the per-IP limit applied
+    async with http() as hc:
+        assert [(await ping(hc, "192.0.2.10")).status_code for _ in range(5)] == [200] * 5
+        assert (await ping(hc, "192.0.2.11")).status_code == 429  # the pool, shared by every egress address
+        assert (await ping(hc, "192.0.2.12", subject="fresh")).status_code == 429  # a subject is inside the pool too
+        assert rejected("rate_limit_egress") == 2
+        assert (await ping(hc, "198.51.100.1")).status_code == 200  # everyone else is not in the pool
+
+
+@pytest.mark.anyio
+async def test_subject_header_from_a_non_egress_address_is_ignored(egress, monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "3")
+    async with http() as hc:
+        codes = [(await ping(hc, "198.51.100.1", subject=f"user-{i}")).status_code for i in range(4)]
+        assert codes == [200] * 3 + [429]  # a fresh subject per request mints no fresh budget
+        assert rejected("rate_limit_client") == 1 and rejected("rate_limit_subject") == 0
+
+
+@pytest.mark.anyio
+async def test_ipv6_and_ipv4_mapped_egress_addresses(egress, monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "3")
+    monkeypatch.setenv("MATCHAWARDS_RATE_PER_PREFIX_MIN", "4")
+    async with http() as hc:
+        # One /64 and one /48, past both the per-/64 burst and the /48 limit: egress skips them.
+        codes = [(await ping(hc, f"2001:db8:ee:{i % 2}::1", subject=f"u{i}")).status_code for i in range(6)]
+        assert codes == [200] * 6
+        assert [(await ping(hc, "::ffff:192.0.2.10", subject="v")).status_code for _ in range(4)] == [200] * 4
+        assert [(await ping(hc, "2001:db8:ef::1")).status_code for _ in range(4)] == [200] * 3 + [429]  # not egress
+
+
+def test_bundled_snapshot_parses():
+    nets = server.parse_egress(json.loads(server.EGRESS_SNAPSHOT.read_text()))
+    assert len(nets) > 50
+    assert ipaddress.ip_address(str(nets[0].network_address)) in server.EgressRanges(nets)
+
+
+def test_parse_egress_skips_bad_entries(caplog):
+    data = {"prefixes": [{"ipv4Prefix": "192.0.2.0/24"}, {"ipv6Prefix": "2001:db8::/48"}, {"ipv4Prefix": "bad"},
+                         {"ipv4Prefix": "192.0.2.1/24"}, {"ipv4Prefix": 5}, {"ipv4Prefix": "0.0.0.0/0"},
+                         {"ipv6Prefix": "::/0"}, "x", None, {}]}
+    assert [str(n) for n in server.parse_egress(data)] == ["192.0.2.0/24", "2001:db8::/48"]
+    assert len([r for r in caplog.records if "skipped a bad entry" in r.getMessage()]) == 8
+    for bad in (None, [], "x", {}, {"prefixes": "x"}, {"prefixes": []}, {"prefixes": [{"ipv4Prefix": "bad"}]}):
+        assert server.parse_egress(bad) is None
+
+
+def egress_reply(monkeypatch, reply):
+    """Route the real fetch_egress through a mock client answering `reply`; return the requests it saw."""
+    seen = []
+
+    def handler(req):
+        seen.append(req)
+        return reply(req)
+
+    monkeypatch.setattr(server, "client", httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(server, "fetch_egress", REAL_FETCH_EGRESS)
+    return seen
+
+
+@pytest.mark.anyio
+async def test_a_refresh_replaces_the_list(monkeypatch):
+    fresh = {"prefixes": [{"ipv4Prefix": "203.0.113.0/24"}]}
+    seen = egress_reply(monkeypatch, lambda req: httpx.Response(200, json=fresh))
+    now = [1000.0]
+    ranges = server.EgressRanges([ipaddress.ip_network("192.0.2.0/24")], clock=lambda: now[0])
+    ranges.refresh_if_due()  # due at start: the first request starts the first fetch
+    ranges.refresh_if_due()  # one fetch at a time
+    await ranges.task
+    assert [str(r.url) for r in seen] == [server.EGRESS_URL]
+    assert ipaddress.ip_address("203.0.113.5") in ranges and ipaddress.ip_address("192.0.2.5") not in ranges
+    now[0] += server.EGRESS_REFRESH_S - 1
+    ranges.refresh_if_due()
+    assert ranges.task.done() and len(seen) == 1  # not due again for a day
+    now[0] += 1
+    ranges.refresh_if_due()
+    await ranges.task
+    assert len(seen) == 2
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("reply", [
+    lambda req: httpx.Response(200, text="not json {"),
+    lambda req: httpx.Response(200, json={"prefixes": [{"ipv4Prefix": "0.0.0.0/0"}]}),
+    lambda req: httpx.Response(200, json=["192.0.2.0/24"]),
+    lambda req: httpx.Response(503, text="down"),
+    lambda req: (_ for _ in ()).throw(httpx.ConnectTimeout("timeout")),
+])
+async def test_a_failed_refresh_keeps_the_last_good_list(monkeypatch, reply):
+    egress_reply(monkeypatch, reply)
+    now = [1000.0]
+    ranges = server.EgressRanges([ipaddress.ip_network("192.0.2.0/24")], clock=lambda: now[0])
+    ranges.refresh_if_due()
+    await ranges.task
+    assert [str(n) for n in ranges.nets] == ["192.0.2.0/24"]
+    assert ipaddress.ip_address("198.51.100.1") not in ranges  # never "everyone is ChatGPT"
+    assert ranges.due == 1000.0 + server.EGRESS_RETRY_S  # retried sooner than a day
+
+
+@pytest.mark.anyio
+async def test_the_bundled_snapshot_is_used_when_the_refresh_fails(monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "3")
+    monkeypatch.setenv("MATCHAWARDS_RATE_SUBJECT_BURST", "3")
+    snapshot_ip = str(server.parse_egress(json.loads(server.EGRESS_SNAPSHOT.read_text()))[0].network_address)
+    async with http() as hc:  # conftest: every fetch fails
+        assert [(await ping(hc, snapshot_ip, subject=f"u{i}")).status_code for i in range(5)] == [200] * 5
+        assert [(await ping(hc, snapshot_ip, subject="u")).status_code for _ in range(4)] == [200] * 3 + [429]

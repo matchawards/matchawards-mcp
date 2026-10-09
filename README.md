@@ -107,9 +107,11 @@ How requests are handled, in order:
 - A `Host` header not in `MATCHAWARDS_ALLOWED_HOSTS` (or `127.0.0.1`, `localhost`) gets 421, whatever the method.
 - Only `POST /mcp` is served. `GET`, `DELETE` and `OPTIONS` get 405 (no SSE stream, no sessions, no CORS).
 - A POST needs `Content-Length` (411 without it), and bodies over 64 KB get 413.
-- Rate limit per client, then the server-wide cap: 429 with `Retry-After`.
+- Rate limit per client (per ChatGPT user from OpenAI's addresses), then the server-wide cap: 429 with `Retry-After`.
 
 The client is the socket address, or the `X-Real-IP` header when the socket address is in `MATCHAWARDS_TRUSTED_PROXIES` (IPv6 is keyed per /64; all /64s inside one /48 also share `MATCHAWARDS_RATE_PER_PREFIX_MIN`). Run it behind a reverse proxy that sets `X-Real-IP`, and do not expose the port directly. The limits are kept in memory per process. A bad value in any of the variables below stops the server at startup. The log has one line per request (method, path, status, duration, a hashed client key), never headers or bodies.
+
+ChatGPT calls come from OpenAI's shared egress addresses ([published list](https://openai.com/chatgpt-connectors.json), bundled with the package and refreshed daily; a failed refresh keeps the last good list), so one address carries many users and a per-IP limit would throttle them together. From those addresses only, a request is limited per `x-openai-subject` (ChatGPT's per-user id, kept only as a keyed hash) and all ChatGPT traffic shares `MATCHAWARDS_EGRESS_PER_MIN`; a request without the header counts in that pool only. The header from any other address is ignored, and the User-Agent is never used.
 
 In Docker, nginx on the host reaches the container from the compose network's gateway, not from loopback, so name that address exactly. Read it with `docker network inspect <network> --format '{{(index .IPAM.Config 0).Gateway}}'` and set, for example:
 
@@ -130,7 +132,10 @@ Do not trust a broad private range such as `172.16.0.0/12`: it may overlap your 
 | `MATCHAWARDS_RATE_PER_MIN` | `30` | `--http` only: requests per minute per client. |
 | `MATCHAWARDS_RATE_BURST` | `10` | `--http` only: requests per 5 seconds per client. |
 | `MATCHAWARDS_RATE_PER_PREFIX_MIN` | `120` | `--http` only: requests per minute for all IPv6 /64s inside one /48 together. |
-| `MATCHAWARDS_GLOBAL_PER_MIN` | `600` | `--http` only: requests per minute for all clients together. |
+| `MATCHAWARDS_GLOBAL_PER_MIN` | `1200` | `--http` only: requests per minute for all clients together. Keep it above `MATCHAWARDS_EGRESS_PER_MIN`. |
+| `MATCHAWARDS_RATE_PER_SUBJECT_MIN` | `30` | `--http` only: requests per minute per ChatGPT user (`x-openai-subject`, from OpenAI's egress addresses only). |
+| `MATCHAWARDS_RATE_SUBJECT_BURST` | `10` | `--http` only: requests per 5 seconds per ChatGPT user. |
+| `MATCHAWARDS_EGRESS_PER_MIN` | `600` | `--http` only: requests per minute for all ChatGPT traffic together. |
 | `MATCHAWARDS_GLOBAL_API_PER_MIN` | `900` | `--http` only: API calls per minute for the whole server (one search can make up to 3). Over it, a tool answers "MatchAwards is busy, retry in N seconds" without calling the API. |
 | `MATCHAWARDS_TRUSTED_PROXIES` | `127.0.0.1/32,::1/128` | `--http` only: proxies (CIDRs, comma-separated) whose `X-Real-IP` header is trusted. Loopback only by default. |
 | `MATCHAWARDS_ALLOWED_HOSTS` | `matchawards.com,staging.matchawards.com` | `--http` only: accepted `Host` headers, comma-separated (`127.0.0.1` and `localhost` are always accepted). |
@@ -162,7 +167,7 @@ It prints tool calls per tool and outcome, calls per family, real calls vs probe
 
 ### Metrics
 
-When `MATCHAWARDS_METRICS_TOKEN` is set, a second listener in the same process (`MATCHAWARDS_METRICS_HOST:MATCHAWARDS_METRICS_PORT`, default `127.0.0.1:9765`) serves `GET /metrics` in the Prometheus text format, with `Authorization: Bearer <token>` (401 without it). The `/mcp` port never serves `/metrics` (404): it trusts `X-Real-IP` from the proxy, so publish only the metrics port to the network Prometheus scrapes from. Counters (in memory, reset on restart): `mcp_tool_calls_total{tool,outcome}`, `mcp_requests_total{method}`, `mcp_rejected_total{reason}` (`rate_limit_client`, `rate_limit_prefix`, `rate_limit_global`, `size`, `host`, `path`, `method`), `mcp_agent_requests_total{family}`, `mcp_ledger_errors_total`.
+When `MATCHAWARDS_METRICS_TOKEN` is set, a second listener in the same process (`MATCHAWARDS_METRICS_HOST:MATCHAWARDS_METRICS_PORT`, default `127.0.0.1:9765`) serves `GET /metrics` in the Prometheus text format, with `Authorization: Bearer <token>` (401 without it). The `/mcp` port never serves `/metrics` (404): it trusts `X-Real-IP` from the proxy, so publish only the metrics port to the network Prometheus scrapes from. Counters (in memory, reset on restart): `mcp_tool_calls_total{tool,outcome}`, `mcp_requests_total{method}`, `mcp_rejected_total{reason}` (`rate_limit_client`, `rate_limit_prefix`, `rate_limit_subject`, `rate_limit_egress`, `rate_limit_global`, `size`, `host`, `path`, `method`), `mcp_agent_requests_total{family}`, `mcp_ledger_errors_total`.
 
 ### Ops notes
 
