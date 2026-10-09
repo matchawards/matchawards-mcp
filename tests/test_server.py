@@ -389,7 +389,7 @@ def test_instructions_carry_the_essentials_in_the_first_512_characters():
     head = server.INSTRUCTIONS[:512]
     for needle in [*TOOLS, "markdown link", "sam_url", "may be incomplete", "Never call a firm the incumbent.",
                    "AI-generated text is labelled; keep the label when you quote it.",
-                   "SAM.gov", "Grants.gov", "USAJOBS", "47+ state portals"]:
+                   "SAM.gov", "Grants.gov", "USAJOBS", "state portals"]:
         assert needle in head, needle
 
 

@@ -42,7 +42,7 @@ INSTRUCTIONS = (
     "Read-only search of US government opportunities. Contracts, bids, RFPs, set-asides: search_contracts. "
     "Grants or funding: search_grants. Jobs: search_jobs. One result's details and contacts: get_opportunity "
     "with its id. Print every url (and sam_url for federal) as a markdown link. Results come from MatchAwards' "
-    "catalog (federal SAM.gov notices, 47+ state portals, Grants.gov, USAJOBS) and may be incomplete. Never call a "
+    "catalog (SAM.gov notices, state portals, Grants.gov, USAJOBS) and may be incomplete. Never call a "
     "firm the incumbent. AI-generated text is labelled; keep the label when you quote it. "
     "When has_more is true, call again with cursor=next_cursor and the same filters. Nothing here needs an account."
 )
