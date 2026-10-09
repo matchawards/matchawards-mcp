@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Card harness</title>
+<link rel="icon" href="data:,">
+<!--
+  A minimal MCP Apps host for the result card, for local checks in a real browser. Serve the repository root
+  over HTTP and open /tests/widget_harness/index.html?fixture=full&theme=dark&mode=bridge.
+  fixture: a key of FIXTURES (fixtures.js). theme: light or dark. mode:
+    bridge  answers ui/initialize, then sends the fixture as ui/notifications/tool-result
+    late    the same, with the result 1.5 s later
+    openai  no bridge; window.openai.toolOutput carries the fixture (the ChatGPT compatibility layer)
+    none    no bridge and no result at all
+  Every message from the card is kept in window.messages.
+-->
+<style>
+  body { margin: 0; padding: 16px; font: 14px system-ui, sans-serif; background: #F7F7F8; }
+  body.dark { background: #171717; }
+  iframe { display: block; width: 100%; height: 200px; border: 1px solid #D4D4D8; border-radius: 12px; }
+</style>
+</head>
+<body>
+<iframe id="card" title="Result card" sandbox="allow-scripts allow-popups"></iframe>
+<script src="fixtures.js"></script>
+<script>
+(async function () {
+  var q = new URLSearchParams(location.search);
+  var fixture = FIXTURES[q.get("fixture") || "full"];
+  var theme = q.get("theme") || "light", mode = q.get("mode") || "bridge";
+  if (theme === "dark") document.body.className = "dark";
+  window.messages = [];
+  var frame = document.getElementById("card");
+  // What a host does: an opaque-origin sandbox with a CSP that allows nothing from the network.
+  var csp = "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; " +
+    "script-src 'unsafe-inline'; style-src 'unsafe-inline'\">";
+  var openai = mode !== "openai" ? "" : "<script>window.openai = { theme: " + JSON.stringify(theme) +
+    ", toolOutput: " + JSON.stringify(fixture) + ", " +
+    "sendFollowUpMessage: function (a) { parent.postMessage({ openai: 'sendFollowUpMessage', args: a }, '*'); }, " +
+    "openExternal: function (a) { parent.postMessage({ openai: 'openExternal', args: a }, '*'); } };<\/script>";
+  var html = await (await fetch("../../src/matchawards_mcp/data/results-v1.html")).text();
+  frame.srcdoc = html.replace("<head>", "<head>" + csp + openai);
+
+  function send(msg) { frame.contentWindow.postMessage(msg, "*"); }
+  window.addEventListener("message", function (event) {
+    if (event.source !== frame.contentWindow) return;
+    var m = event.data;
+    window.messages.push(m);
+    if (!m || m.jsonrpc !== "2.0") return;
+    if (m.method === "ui/initialize") {
+      if (mode === "bridge" || mode === "late") send({ jsonrpc: "2.0", id: m.id, result: {
+        protocolVersion: "2026-01-26", hostInfo: { name: "harness", version: "1" },
+        hostCapabilities: { message: {}, openLinks: {} }, hostContext: { theme: theme }
+      } });
+    } else if (m.method === "ui/notifications/initialized") {
+      var result = { jsonrpc: "2.0", method: "ui/notifications/tool-result",
+        params: { content: [{ type: "text", text: JSON.stringify(fixture) }], structuredContent: fixture } };
+      setTimeout(function () { send(result); }, mode === "late" ? 1500 : 0);
+    } else if (m.method === "ui/notifications/size-changed") {
+      frame.style.height = (m.params.height + 2) + "px";
+    } else if (m.id != null && m.method) {
+      send({ jsonrpc: "2.0", id: m.id, result: {} });
+    }
+  });
+})();
+</script>
+</body>
+</html>

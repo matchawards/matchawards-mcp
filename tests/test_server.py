@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 from importlib.metadata import version
 from pathlib import Path
@@ -415,3 +416,68 @@ async def test_golden_prompts_name_only_listed_tools():
         assert p["prompt"] and set(p["expect"]) <= listed, p
         assert (p["kind"] == "negative") == (p["expect"] == []), p
     assert listed == {t for p in golden["prompts"] for t in p["expect"]}  # every tool has a prompt
+
+
+# --- The result card (MCP Apps), behind MATCHAWARDS_WIDGETS -------------------------------------------------
+
+CARD_SCRIPT = server.CARD_HTML[server.CARD_HTML.index("<script>"):]
+
+
+@pytest.mark.anyio
+async def test_card_is_off_by_default():
+    assert not server.WIDGETS
+    assert await server.mcp.list_resources() == []
+    assert all("ui" not in (t.meta or {}) for t in await server.mcp.list_tools())
+
+
+@pytest.mark.anyio
+async def test_card_on_lists_the_resource_and_only_the_search_tools_point_at_it():
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["-c", "from matchawards_mcp.server import main; main()"],
+        env={"MATCHAWARDS_WIDGETS": "1", "MATCHAWARDS_API_BASE": "http://127.0.0.1:9"},
+    )
+    async with Client(params) as client:
+        listed = {t.name: t for t in (await client.list_tools()).tools}
+        assert list(listed) == TOOLS
+        carded = {n for n, t in listed.items() if "ui" in t.meta}
+        assert carded == {"search_contracts", "search_grants"}
+        for name, t in listed.items():
+            assert t.meta["securitySchemes"] == [{"type": "noauth"}], name  # the card meta merges, never replaces
+            assert "openai/outputTemplate" not in t.meta, name
+        for name in carded:
+            assert listed[name].meta["ui"] == {"resourceUri": "ui://matchawards/results-v1.html"}
+        [res] = (await client.list_resources()).resources
+        assert (str(res.uri), res.mime_type) == ("ui://matchawards/results-v1.html", "text/html;profile=mcp-app")
+        [content] = (await client.read_resource("ui://matchawards/results-v1.html")).contents
+    assert content.mime_type == "text/html;profile=mcp-app"
+    assert content.text == server.CARD_HTML
+    ui = content.meta["ui"]
+    assert ui["csp"] == {"connectDomains": [], "resourceDomains": [], "frameDomains": []}
+    assert (ui["domain"], ui["prefersBorder"]) == ("https://matchawards.com", True)
+    assert content.meta["openai/widgetCSP"] == {
+        "connect_domains": [], "resource_domains": [],
+        "redirect_domains": ["https://matchawards.com", "https://sam.gov", "https://www.usaspending.gov"],
+    }
+
+
+def test_card_needs_no_network_and_survives_a_strict_csp():
+    html = server.CARD_HTML
+    # Nothing to fetch: no external script, style, image, font or request of any kind.
+    assert not re.search(r"\bfetch\(|XMLHttpRequest|WebSocket|EventSource|<link|<img|<iframe|\bsrc=|@import|url\(",
+                         html)
+    # The one URL in the file is the prefix a row link must start with (the link itself comes from the data).
+    assert set(re.findall(r"https?://[^\s\"'<>)]*", html)) == {"https://matchawards.com/"}
+    # No inline event handlers (a host CSP without 'unsafe-hashes' blocks them), no HTML sinks, no eval.
+    assert not re.search(r"<[^>]*\son[a-z]+\s*=", html)
+    assert not re.search(r"innerHTML|outerHTML|insertAdjacentHTML|document\.write|\beval\(|new Function", CARD_SCRIPT)
+
+
+def test_card_renders_from_structured_content_and_never_calls_a_tool():
+    assert "structuredContent" in CARD_SCRIPT and "toolOutput" in CARD_SCRIPT
+    assert "_meta" not in CARD_SCRIPT and "toolResponseMetadata" not in CARD_SCRIPT  # host bugs: _meta leaks/varies
+    assert "tools/call" not in CARD_SCRIPT and "callTool" not in CARD_SCRIPT  # actions go through the model
+    # The opportunity layout is picked by the shape of SearchResult.
+    from matchawards_mcp.schemas import SearchResult
+    assert {"results", "has_more", "warning"} <= SearchResult.model_fields.keys()
+    assert 'Array.isArray(d.results) && typeof d.has_more === "boolean"' in CARD_SCRIPT

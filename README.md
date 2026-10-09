@@ -24,6 +24,12 @@ Every tool is read-only and needs no account: each declares `readOnlyHint`, `ide
 - Results are structured output (`outputSchema` plus `structuredContent`). Fields the API adds later appear in results only once the schema declares them. `get_opportunity` reserves `ai` (AI-generated notes, labelled as such); it is null for now.
 - Tool annotations are closed-world (`openWorldHint: false`): the tools read the MatchAwards catalog only.
 
+## Cards
+
+Hosts that render [MCP Apps](https://modelcontextprotocol.io/extensions/apps) (ChatGPT, Claude) can show `search_contracts` and `search_grants` results as an inline card: up to 8 opportunities with title, agency, place, a federal/state/grant badge, the deadline (days left, closed, or no fixed deadline), set-aside and NAICS code, plus any `warning`. Clicking a row asks the model for that opportunity's details; each row's "Open on MatchAwards" link opens its page. The card is one self-contained HTML resource, `ui://matchawards/results-v1.html` (`text/html;profile=mcp-app`): no scripts or styles from elsewhere and no network requests, so its CSP allows nothing. It renders only the tool's `structuredContent`, and never calls a tool itself.
+
+Cards are off by default. Set `MATCHAWARDS_WIDGETS=1` to list the resource and point the two search tools at it (`_meta.ui.resourceUri`); tool results are the same either way. `tests/widget_harness/` holds a minimal host page with sample results for checking the card in a browser.
+
 ## Hosted
 
 A hosted endpoint runs at `https://matchawards.com/mcp`. Add it as a remote MCP server (connector) by URL, with nothing to install and no key:
@@ -149,6 +155,7 @@ Do not trust a broad private range such as `172.16.0.0/12`: it may overlap your 
 | `MATCHAWARDS_METRICS_TOKEN` | unset | `--http` only: Bearer token for `/metrics`. Unset: the metrics listener does not start. |
 | `MATCHAWARDS_METRICS_HOST` | `127.0.0.1` | `--http` only: address of the metrics listener. |
 | `MATCHAWARDS_METRICS_PORT` | `9765` | `--http` only: port of the metrics listener. |
+| `MATCHAWARDS_WIDGETS` | unset | `1`: serve the result card (see Cards). Unset: no card resource, no `_meta.ui` on the tools. |
 
 ## Usage stats (hosted mode)
 

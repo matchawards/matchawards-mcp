@@ -71,6 +71,34 @@ READ_ONLY = ToolAnnotations(
 # unknown top-level fields, so a top-level securitySchemes never reaches the wire.
 SECURITY_SCHEMES = [{"type": "noauth"}]
 
+# The result card (MCP Apps): one self-contained HTML resource, no network, that hosts with UI support render for
+# the search tools below from their structuredContent. Off unless MATCHAWARDS_WIDGETS=1: then the resource is listed
+# and those tools point at it in _meta. Results are the same either way. Hosts cache a card by URI, so a breaking
+# change to the HTML bumps the version in CARD_URI.
+WIDGETS = os.environ.get("MATCHAWARDS_WIDGETS", "").strip() == "1"
+CARD_URI = "ui://matchawards/results-v1.html"
+CARD_MIME = "text/html;profile=mcp-app"
+CARD_TOOLS = ("search_contracts", "search_grants")
+CARD_HTML = (Path(__file__).parent / "data" / "results-v1.html").read_text(encoding="utf-8")
+CARD_META = {
+    "ui": {
+        "csp": {"connectDomains": [], "resourceDomains": [], "frameDomains": []},
+        "domain": "https://matchawards.com",
+        "prefersBorder": True,
+    },
+    # ChatGPT's own key: links to these origins open without the "Check this link is safe" dialog.
+    "openai/widgetCSP": {
+        "connect_domains": [],
+        "resource_domains": [],
+        "redirect_domains": ["https://matchawards.com", "https://sam.gov", "https://www.usaspending.gov"],
+    },
+    "openai/widgetDescription": (
+        "A MatchAwards results card: the opportunities found, with agency, place, deadline, set-aside and NAICS. "
+        "The card already lists them, so do not repeat the whole list; summarize what matters and link the "
+        "results you mention."
+    ),
+}
+
 
 def _tool(fn, title: str):
     """Register a read-only tool; its docstring is the description the model reads, its return model the
@@ -100,12 +128,18 @@ def _tool(fn, title: str):
 
     # One line per paragraph: the docstring's wrapping never reaches the published description.
     description = "\n\n".join(" ".join(p.split()) for p in inspect.cleandoc(fn.__doc__).split("\n\n"))
-    return mcp.tool(title=title, annotations=READ_ONLY, meta={"securitySchemes": SECURITY_SCHEMES},
-                    description=description)(recorded)
+    meta = {"securitySchemes": SECURITY_SCHEMES}
+    if WIDGETS and fn.__name__ in CARD_TOOLS:
+        meta["ui"] = {"resourceUri": CARD_URI}
+    return mcp.tool(title=title, annotations=READ_ONLY, meta=meta, description=description)(recorded)
 
 
 for _fn, _title in tools.TOOLS:
     _tool(_fn, _title)
+
+if WIDGETS:
+    mcp.resource(CARD_URI, name="matchawards-results", title="MatchAwards results", mime_type=CARD_MIME,
+                 meta=CARD_META)(lambda: CARD_HTML)
 
 
 # --- HTTP mode -------------------------------------------------------------------------------------------

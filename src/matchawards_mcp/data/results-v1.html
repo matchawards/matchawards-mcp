@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MatchAwards results</title>
+<!--
+  The MCP Apps result card for search_contracts and search_grants (served as ui://matchawards/results-v1.html).
+  Self-contained on purpose: no network, no CDN, so the resource CSP lists nothing.
+  It renders the tool's structuredContent only (never _meta), picking a layout by its shape (LAYOUTS below).
+  Every value reaches the DOM through textContent. Two actions at most: a row asks the model for that
+  opportunity's details (a follow-up message, never a tool call), and its link opens the posting.
+-->
+<style>
+:root {
+  --bg: #FFFFFF; --bg-2: #F4F4F5; --line: #E4E4E7; --ink: #18181B; --muted: #52525B;
+  --link: #1D4ED8; --soon: #B45309; --warn-bg: #FFFBEB; --warn-line: #F59E0B;
+  --fed: #1D4ED8; --fed-bg: #EFF6FF; --st: #166534; --st-bg: #F0FDF4; --gr: #6B21A8; --gr-bg: #FAF5FF;
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #212121; --bg-2: #2E2E2E; --line: #3F3F46; --ink: #F4F4F5; --muted: #B4B4BB;
+    --link: #93C5FD; --soon: #FBBF24; --warn-bg: #2E2410; --warn-line: #B45309;
+    --fed: #BFDBFE; --fed-bg: #172554; --st: #BBF7D0; --st-bg: #052E16; --gr: #E9D5FF; --gr-bg: #3B0764;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #212121; --bg-2: #2E2E2E; --line: #3F3F46; --ink: #F4F4F5; --muted: #B4B4BB;
+  --link: #93C5FD; --soon: #FBBF24; --warn-bg: #2E2410; --warn-line: #B45309;
+  --fed: #BFDBFE; --fed-bg: #172554; --st: #BBF7D0; --st-bg: #052E16; --gr: #E9D5FF; --gr-bg: #3B0764;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.4 var(--sans); }
+.card { padding: 12px 16px 14px; }
+.head { margin: 0 0 8px; font-size: 13px; font-weight: 600; color: var(--muted); }
+.warn { margin: 0 0 10px; padding: 8px 10px; border-left: 3px solid var(--warn-line); background: var(--warn-bg);
+  border-radius: 4px; overflow-wrap: anywhere; }
+.rows { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); }
+.rows > li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; padding: 4px 0;
+  border-bottom: 1px solid var(--line); }
+.main { display: block; width: 100%; min-width: 0; margin: 0; padding: 6px 8px; border: 0; border-radius: 6px;
+  background: none; color: inherit; font: inherit; text-align: left; }
+button.main { cursor: pointer; }
+button.main:hover { background: var(--bg-2); }
+.title { display: block; font-weight: 600; overflow-wrap: anywhere; }
+.meta { display: block; margin-top: 2px; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+.chip { font-size: 12px; font-weight: 600; line-height: 1.5; padding: 0 6px; border-radius: 4px;
+  background: var(--bg-2); color: var(--muted); overflow-wrap: anywhere; }
+.t-federal { background: var(--fed-bg); color: var(--fed); }
+.t-state { background: var(--st-bg); color: var(--st); }
+.t-grant { background: var(--gr-bg); color: var(--gr); }
+.side { display: flex; flex-direction: column; align-items: flex-end; justify-content: space-between; gap: 6px;
+  padding: 6px 0; text-align: right; font-size: 13px; }
+.due { font-weight: 600; white-space: nowrap; }
+.due small { display: block; font-size: 12px; font-weight: 400; color: var(--muted); }
+.d-soon { color: var(--soon); }
+.d-closed, .d-none { color: var(--muted); font-weight: 400; }
+.side a { color: var(--link); text-underline-offset: 2px; white-space: nowrap; }
+.foot, .note { margin: 10px 0 0; color: var(--muted); }
+button:focus-visible, a:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+.sk { height: 12px; margin: 6px 8px; border-radius: 4px; background: var(--bg-2); }
+.sk.w1 { width: 70%; margin-top: 12px; } .sk.w2 { width: 45%; margin-bottom: 12px; }
+@media (prefers-reduced-motion: no-preference) {
+  .sk { animation: pulse 1.2s ease-in-out infinite alternate; }
+  @keyframes pulse { to { opacity: .45; } }
+}
+/* Narrow (phones): the deadline and link go under the row instead of beside it, so titles keep the width. */
+@media (max-width: 480px) {
+  .card { padding: 10px 12px 12px; }
+  .rows > li { grid-template-columns: minmax(0, 1fr); }
+  .side { flex-direction: row; align-items: baseline; padding: 0 8px 6px; text-align: left; }
+  .due small { display: inline; margin-left: 6px; }
+}
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main class="card" id="card" aria-live="polite">
+  <div id="body" aria-busy="true">
+    <ul class="rows" aria-label="Loading results">
+      <li><div><div class="sk w1"></div><div class="sk w2"></div></div></li>
+      <li><div><div class="sk w1"></div><div class="sk w2"></div></div></li>
+      <li><div><div class="sk w1"></div><div class="sk w2"></div></div></li>
+    </ul>
+  </div>
+</main>
+<script>
+(function () {
+  "use strict";
+  var MAX_ROWS = 8;
+  var LINK_PREFIX = "https://matchawards.com/";  // the only links a row opens
+  var TYPES = { federal: "Federal", state: "State", grant: "Grant", job: "Job" };
+  var $ = function (id) { return document.getElementById(id); };
+  var current = null;
+
+  // ── MCP Apps bridge (JSON-RPC over postMessage), window.openai as the fallback ──
+  var nextId = 1, pending = {}, bridged = false, caps = {};
+  function post(msg) { try { window.parent.postMessage(msg, "*"); } catch (e) { /* no host */ } }
+  function rpc(method, params) {
+    var id = nextId++;
+    post({ jsonrpc: "2.0", id: id, method: method, params: params });
+    return new Promise(function (resolve, reject) {
+      pending[id] = { resolve: resolve, reject: reject };
+      setTimeout(function () { if (pending[id]) { delete pending[id]; reject(new Error("timeout")); } }, 5000);
+    });
+  }
+  window.addEventListener("message", function (event) {
+    if (event.source !== window.parent) return;
+    var m = event.data;
+    if (!m || m.jsonrpc !== "2.0") return;
+    if (!m.method) {  // a response to one of our requests
+      var p = m.id != null && pending[m.id];
+      if (p) { delete pending[m.id]; if (m.error) p.reject(m.error); else p.resolve(m.result); }
+      return;
+    }
+    if (m.method === "ui/resource-teardown" && m.id != null) { post({ jsonrpc: "2.0", id: m.id, result: {} }); return; }
+    if (m.method === "ui/notifications/tool-cancelled") { unavailable("The search was cancelled."); return; }
+    if (m.method === "ui/notifications/tool-result" && m.params) render(m.params.structuredContent);
+    if (m.method === "ui/notifications/host-context-changed" && m.params && m.params.theme) theme(m.params.theme);
+  });
+  rpc("ui/initialize", {
+    protocolVersion: "2026-01-26",
+    appInfo: { name: "matchawards-results", version: "1" },
+    appCapabilities: {}
+  }).then(function (result) {
+    bridged = true;
+    caps = (result && result.hostCapabilities) || {};
+    if (result && result.hostContext) theme(result.hostContext.theme);
+    post({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} });
+    sync();
+  }, function () { /* not an MCP Apps host; window.openai may still be */ });
+
+  function openai() { return window.openai || null; }
+  function theme(value) {
+    if (value === "dark" || value === "light") document.documentElement.setAttribute("data-theme", value);
+  }
+
+  // ── The two actions ──
+  function canMessage() {
+    var o = openai();
+    return (bridged && !!caps.message) || !!(o && typeof o.sendFollowUpMessage === "function");
+  }
+  function ask(prompt) {
+    var o = openai();
+    if (bridged && caps.message) {
+      rpc("ui/message", { role: "user", content: [{ type: "text", text: prompt }] }).catch(function () {});
+      return;
+    }
+    if (o && typeof o.sendFollowUpMessage === "function") o.sendFollowUpMessage({ prompt: prompt });
+  }
+  // A plain link is the last resort: it is only intercepted when the host can open it for us.
+  function open(event, url) {
+    var o = openai();
+    if (bridged && caps.openLinks) {
+      event.preventDefault();
+      rpc("ui/open-link", { url: url }).catch(function () {});
+      return;
+    }
+    if (o && typeof o.openExternal === "function") { event.preventDefault(); o.openExternal({ href: url }); }
+  }
+
+  // ── Building blocks (text only) ──
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  }
+  function str(v) { return v == null ? "" : String(v).trim(); }
+  function plural(n, one, many) { return n + " " + (n === 1 ? one : many); }
+  function ymd(iso) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(str(iso));
+    return m ? new Date(+m[1], +m[2] - 1, +m[3]) : null;
+  }
+  function deadline(r) {
+    if (r.no_fixed_deadline === true) return ["d-none", "No fixed deadline", ""];
+    var due = ymd(r.response_deadline);
+    if (!due) return ["d-none", "No deadline listed", ""];
+    var now = new Date(), today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    var days = Math.round((due - today) / 86400000);
+    var opts = { month: "short", day: "numeric" };
+    if (due.getFullYear() !== today.getFullYear()) opts.year = "numeric";
+    var date = due.toLocaleDateString("en-US", opts);
+    if (days < 0) return ["d-closed", "Closed", date];
+    if (days === 0) return ["d-soon", "Due today", date];
+    return [days <= 7 ? "d-soon" : "", plural(days, "day", "days") + " left", date];
+  }
+
+  // ── Layouts: the first whose `match` takes the structuredContent renders it ──
+  // Add the award list, assessment brief and partner list here, each matched on its own result shape
+  // (keys the SearchResult does not carry), before `opportunities` if they could also match its keys.
+  var LAYOUTS = [
+    {
+      name: "opportunities", render: opportunities,
+      match: function (d) { return Array.isArray(d.results) && typeof d.has_more === "boolean"; }
+    }
+  ];
+
+  function opportunities(d, b) {
+    var rows = d.results.filter(function (r) { return r && typeof r === "object" && typeof r.id === "string"; });
+    var grants = rows.length > 0 && rows.every(function (r) { return r.type === "grant"; });
+    var noun = grants ? ["grant", "grants"] : ["opportunity", "opportunities"];
+    b.appendChild(el("p", rows.length ? "head" : "note",
+      rows.length ? plural(rows.length, noun[0], noun[1]) : "No matching opportunities."));
+    if (str(d.warning)) b.appendChild(el("p", "warn", str(d.warning)));
+    if (rows.length) {
+      var list = el("ul", "rows");
+      rows.slice(0, MAX_ROWS).forEach(function (r) { list.appendChild(row(r)); });
+      b.appendChild(list);
+    }
+    var hidden = Math.max(0, rows.length - MAX_ROWS), foot = "";
+    if (hidden && d.has_more) foot = hidden + " more not shown here, and more on MatchAwards.";
+    else if (hidden) foot = hidden + " more not shown here.";
+    else if (d.has_more) foot = "More on MatchAwards: ask for the next page.";
+    if (foot) b.appendChild(el("p", "foot", foot));
+  }
+
+  function row(r) {
+    var li = el("li"), title = str(r.title) || "Untitled opportunity";
+    var main = el(canMessage() ? "button" : "div", "main");
+    if (main.tagName === "BUTTON") {
+      main.type = "button";
+      main.title = "Ask for the details";
+      main.addEventListener("click", function () { ask("Show details for " + title + " (id " + r.id + ")"); });
+    }
+    main.appendChild(el("span", "title", title));
+    var place = [str(r.city), str(r.state)].filter(Boolean).join(", ");
+    var naics = r.naics && typeof r.naics === "object" ? str(r.naics.code) : "";
+    var meta = [str(r.agency), place, naics && "NAICS " + naics].filter(Boolean).join(" · ");
+    if (meta) main.appendChild(el("span", "meta", meta));
+    var chips = el("span", "chips");
+    if (TYPES[r.type]) chips.appendChild(el("span", "chip t-" + r.type, TYPES[r.type]));
+    if (str(r.set_aside)) chips.appendChild(el("span", "chip", "Set-aside: " + str(r.set_aside)));
+    if (chips.firstChild) main.appendChild(chips);
+    li.appendChild(main);
+
+    var side = el("div", "side"), due = deadline(r), d = el("div", "due " + due[0], due[1]);
+    if (due[2]) d.appendChild(el("small", null, due[2]));
+    side.appendChild(d);
+    var url = str(r.url);
+    if (url.indexOf(LINK_PREFIX) === 0) {
+      var a = el("a", null, "Open on MatchAwards");
+      a.href = url; a.target = "_blank"; a.rel = "noopener noreferrer";
+      a.setAttribute("aria-label", "Open " + title + " on MatchAwards");
+      a.addEventListener("click", function (event) { open(event, url); });
+      side.appendChild(a);
+    }
+    li.appendChild(side);
+    return li;
+  }
+
+  function unavailable(text) {
+    if (current) return;
+    var b = $("body");
+    b.textContent = "";
+    b.removeAttribute("aria-busy");
+    b.appendChild(el("p", "note", text));
+    size();
+  }
+
+  function render(data) {
+    var layout = data && typeof data === "object" && LAYOUTS.filter(function (l) { return l.match(data); })[0];
+    if (!layout) { unavailable("Results unavailable here. See the reply above."); return; }
+    current = data;
+    var b = $("body");
+    b.textContent = "";
+    b.removeAttribute("aria-busy");
+    layout.render(data, b);
+    size();
+  }
+
+  // The card's OWN height: the document's scrollHeight never drops below the frame's
+  // current height, so a host that sized us generously would keep the empty space.
+  function size() {
+    var height = Math.ceil($("card").getBoundingClientRect().height);
+    if (bridged) post({ jsonrpc: "2.0", method: "ui/notifications/size-changed", params: { height: height } });
+  }
+  if (typeof ResizeObserver === "function") new ResizeObserver(size).observe($("card"));
+  function sync() {
+    var o = openai();
+    if (o) { theme(o.theme); if (o.toolOutput) render(o.toolOutput); }
+    else if (current) render(current);
+  }
+  window.addEventListener("openai:set_globals", sync);
+  // No result at all (a host that never sends one): the skeleton resolves to a note, and a late result still renders.
+  setTimeout(function () { unavailable("Results unavailable here. See the reply above."); }, 20000);
+  sync();
+})();
+</script>
+</body>
+</html>
