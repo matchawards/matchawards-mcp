@@ -12,6 +12,7 @@ from mcp import Client, StdioServerParameters
 from mcp.client.streamable_http import streamable_http_client
 
 from matchawards_mcp import server, usage
+from matchawards_mcp import api as ma_api
 
 from test_http import LEGACY, http
 from test_server import api, anyio_backend, page  # noqa: F401  (fixtures)
@@ -23,7 +24,7 @@ SECRET = "zebracornsecret"  # an argument value that must never be stored
 def usage_db(tmp_path, monkeypatch):
     path = tmp_path / "usage.db"
     monkeypatch.setenv("MATCHAWARDS_USAGE_DB", str(path))
-    monkeypatch.setattr(server, "api_budget", None)
+    monkeypatch.setattr(ma_api, "api_budget", None)
     monkeypatch.setattr(server, "ledger", None)
     monkeypatch.setattr(usage, "metrics", usage.Metrics())
     return path
@@ -86,8 +87,8 @@ async def test_busy_and_internal_error_outcomes(api, usage_db, monkeypatch):
     async with http() as hc:
         assert (await post(hc, call("get_opportunity", {"id": "1"}))).status_code == 200
         assert (await post(hc, call("get_opportunity", {"id": "2"}))).status_code == 200  # API budget used up
-        monkeypatch.setattr(server, "_get_one", lambda id: 1 / 0)
-        await post(hc, call("find_contacts", {"id": "3"}))
+        monkeypatch.setattr(ma_api, "get_one", lambda id: 1 / 0)
+        await post(hc, call("get_opportunity", {"id": "3"}))
     assert sorted(r["outcome"] for r in rows(usage_db)) == ["busy", "internal_error", "ok"]
 
 
@@ -260,7 +261,7 @@ async def test_a_failing_ledger_write_is_counted_not_raised(api, usage_db, tmp_p
 @pytest.mark.anyio
 async def test_direct_calls_outside_http_record_nothing(api, usage_db, tmp_path):
     server.ledger = usage.Ledger.open(str(usage_db))
-    await server.get_opportunity("7")
+    await server.mcp.call_tool("get_opportunity", {"id": "7"})  # through the usage wrapper, outside a request
     assert rows(usage_db) == [] and usage.metrics.counts == {}
 
 

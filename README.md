@@ -10,14 +10,19 @@ This is the [Model Context Protocol](https://modelcontextprotocol.io) server for
 
 | Tool | What it returns | Example prompt |
 |---|---|---|
-| `search_contracts` | Federal and state contract opportunities. Filters: NAICS, state, keyword, set-aside, federal or state only, posted within N days, open only, paging. | "Find open roofing contracts in Virginia posted in the last week." |
-| `search_grants` | Federal grant and funding opportunities. Filters: NAICS, keyword, posted within N days, open only, paging (grant notices carry no state). | "Are there open broadband grants?" |
-| `search_jobs` | Job postings from the last 30 days. Filters: NAICS, state, keyword, posted within N days, paging. | "Show electrician jobs in Texas from the last 7 days." |
-| `search_by_naics` | The newest opportunities for up to 10 NAICS codes, of one type: contract, federal, state, grant or job. | "What is new for NAICS 541511 and 541512 at the federal level?" |
-| `get_opportunity` | The full record of one opportunity: description, deadline, agency and contacts (name and title). | "Tell me more about the second result." |
-| `find_contacts` | Only the published points of contact for one opportunity. | "Who do I contact about that solicitation?" |
+| `search_contracts` | Federal and state contract opportunities. Filters: NAICS (up to 10 codes), state, keyword, set-aside, federal or state only, posted within N days, open only, 1 to 50 results, paging. | "Find open roofing contracts in Virginia posted in the last week." |
+| `search_grants` | Federal grant and funding opportunities. Filters: NAICS, keyword, posted within N days, open only, 1 to 50 results, paging (grant notices carry no state). | "Are there open broadband grants?" |
+| `search_jobs` | Job postings from the last 30 days. Filters: NAICS, state, keyword, posted within N days, 1 to 50 results, paging. | "Show electrician jobs in Texas from the last 7 days." |
+| `get_opportunity` | The full record of one opportunity: the search row plus its description and published points of contact (name and title). | "Who do I contact about the second result?" |
 
-Every result carries a `url` on matchawards.com, and the server asks the model to show it to you as a link.
+Every tool is read-only and needs no account: each declares `readOnlyHint`, `idempotentHint`, a title and `securitySchemes: [{"type": "noauth"}]` (in `_meta`). Results are structured: each tool publishes an `outputSchema` and returns `structuredContent`, with the same JSON as text for clients that read only text. Every result carries a `url` on matchawards.com (and a `sam_url` for federal notices), and the server asks the model to show them as markdown links.
+
+### Changes in 1.0
+
+- `search_by_naics` is removed: `search_contracts`, `search_grants` and `search_jobs` take the same `naics` filter on its own.
+- `find_contacts` is removed: `get_opportunity` returns the published contacts with the rest of the record.
+- Results are structured output (`outputSchema` plus `structuredContent`). Fields the API adds later appear in results only once the schema declares them. `get_opportunity` reserves `ai` (AI-generated notes, labelled as such) and `teaming`; both are null for now.
+- Tool annotations are closed-world (`openWorldHint: false`): the tools read the MatchAwards catalog only.
 
 ## Hosted
 
@@ -27,7 +32,7 @@ A hosted endpoint runs at `https://matchawards.com/mcp`. Add it as a remote MCP 
 - **Claude** (claude.ai or Claude Desktop): Settings, Connectors, add a custom connector with the same URL. Claude Code: `claude mcp add --transport http matchawards https://matchawards.com/mcp`.
 - **Cursor**: in `mcp.json`, `{"mcpServers": {"matchawards": {"url": "https://matchawards.com/mcp"}}}`.
 
-The hosted endpoint serves the same six tools. It is limited per client address (IPv6: per /64) to 30 requests per minute and 10 per 5 seconds, per IPv6 /48 to 120 per minute, and to 600 per minute for all clients together; over a limit it answers HTTP 429 with `Retry-After`.
+The hosted endpoint serves the same tools. It is limited per client address (IPv6: per /64) to 30 requests per minute and 10 per 5 seconds, per IPv6 /48 to 120 per minute, and to 600 per minute for all clients together; over a limit it answers HTTP 429 with `Retry-After`.
 
 ## Install
 
@@ -195,6 +200,8 @@ python -m venv .venv
 ```
 
 The tests make no network calls.
+
+`tests/golden/prompts.json` lists prompts with the tool a model should pick (or none), for manual checks of tool selection in a client.
 
 ## License
 

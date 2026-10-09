@@ -7,14 +7,16 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from mcp import Client, StdioServerParameters
+import jsonschema
 from mcp.server.mcpserver.exceptions import ToolError
 
-from matchawards_mcp import __version__, server
+from matchawards_mcp import __version__, server, tools
+from matchawards_mcp import api as ma_api
 
 ROOT = Path(__file__).resolve().parents[1]
 PATH = "/api/public/v1/opportunities"
-TOOLS = ["search_contracts", "search_grants", "search_jobs", "search_by_naics", "get_opportunity", "find_contacts"]
-NOTE = server.LINK_RULE
+TOOLS = ["search_contracts", "search_grants", "search_jobs", "get_opportunity"]
+NOTE = tools.LINK_RULE
 
 
 def row(i):
@@ -45,9 +47,9 @@ def api(monkeypatch):
         reply = api.replies.pop(0) if len(api.replies) > 1 else api.replies[0]
         return reply(req)
 
-    monkeypatch.setattr(server, "client", httpx.AsyncClient(
+    monkeypatch.setattr(ma_api, "client", httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="https://api.test",
-        headers=dict(server.client.headers),
+        headers=dict(ma_api.client.headers),
     ))
     return api
 
@@ -56,27 +58,29 @@ def ok(body):
     return lambda req: httpx.Response(200, json=body)
 
 
+async def run(tool, *args, **kwargs):
+    """Call a tool function directly (no MCP layer) and return its output model as a dict."""
+    return (await tool(*args, **kwargs)).model_dump()
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize("call, path, params", [
-    (lambda: server.search_contracts(), PATH, {"type": "contract", "limit": "20"}),
-    (lambda: server.search_contracts(
+    (lambda: tools.search_contracts(), PATH, {"type": "contract", "limit": "20"}),
+    (lambda: tools.search_contracts(
         naics="236220, 238210", state="va", keyword="roof", set_aside="SBA", type="federal",
         posted_within_days=7, open=False, limit=5, cursor="abc=",
     ), PATH, {"type": "federal", "naics": "236220,238210", "state": "VA", "q": "roof", "set_aside": "SBA",
               "posted_within_days": "7", "open": "false", "limit": "5", "cursor": "abc="}),
-    (lambda: server.search_grants(keyword="broadband", naics="541715", open=True),
+    (lambda: tools.search_grants(keyword="broadband", naics="541715", open=True),
      PATH, {"type": "grant", "naics": "541715", "q": "broadband", "open": "true", "limit": "20"}),
-    (lambda: server.search_by_naics("541715", type="grant"),
-     PATH, {"type": "grant", "naics": "541715", "limit": "20"}),
-    (lambda: server.search_jobs(), PATH, {"type": "job", "posted_within_days": "30", "limit": "20"}),
-    (lambda: server.search_jobs(keyword="electrician", posted_within_days=7),
+    (lambda: tools.search_jobs(), PATH, {"type": "job", "posted_within_days": "30", "limit": "20"}),
+    (lambda: tools.search_jobs(keyword="electrician", posted_within_days=7),
      PATH, {"type": "job", "q": "electrician", "posted_within_days": "7", "limit": "20"}),
-    (lambda: server.search_contracts(cursor="", set_aside=""), PATH, {"type": "contract", "limit": "20"}),
-    (lambda: server.search_by_naics("541511", cursor=""), PATH, {"type": "contract", "naics": "541511", "limit": "20"}),
-    (lambda: server.search_by_naics("541511,541512", type="federal", cursor="c1"),
+    (lambda: tools.search_contracts(cursor="", set_aside=""), PATH, {"type": "contract", "limit": "20"}),
+    (lambda: tools.search_contracts(naics="541511,541512", type="federal", cursor="c1"),
      PATH, {"type": "federal", "naics": "541511,541512", "limit": "20", "cursor": "c1"}),
-    (lambda: server.get_opportunity("abc123"), f"{PATH}/abc123", {}),
-    (lambda: server.find_contacts("abc-123_x"), f"{PATH}/abc-123_x", {}),
+    (lambda: tools.get_opportunity("abc123"), f"{PATH}/abc123", {}),
+    (lambda: tools.get_opportunity("abc-123_x"), f"{PATH}/abc-123_x", {}),
 ])
 async def test_query_building(api, call, path, params):
     await call()
@@ -90,7 +94,8 @@ async def test_query_building(api, call, path, params):
 @pytest.mark.anyio
 async def test_search_returns_rows_cursor_and_link_note(api):
     api.replies = [ok(page([1, 2], has_more=True, cursor="c1"))]
-    assert await server.search_contracts(limit=2) == {**page([1, 2], has_more=True, cursor="c1"), "note": NOTE}
+    out = (await tools.search_contracts(limit=2)).model_dump(exclude_none=True)
+    assert out == {**page([1, 2], has_more=True, cursor="c1"), "note": NOTE}
 
 
 @pytest.mark.anyio
@@ -100,7 +105,7 @@ async def test_sparse_pages_are_followed_with_same_filters_and_deduplicated(api)
         ok(page([2, 3], has_more=True, cursor="c2")),  # 2 repeats across pages
         ok(page([4, 5], has_more=True, cursor="c3")),
     ]
-    out = await server.search_contracts(state="TX", limit=5)
+    out = await run(tools.search_contracts, state="TX", limit=5)
     assert [r["id"] for r in out["results"]] == ["1", "2", "3", "4", "5"]
     assert (out["has_more"], out["next_cursor"]) == (True, "c3")
     sent = [dict(r.url.params) for r in api.requests]
@@ -111,7 +116,7 @@ async def test_sparse_pages_are_followed_with_same_filters_and_deduplicated(api)
 @pytest.mark.anyio
 async def test_following_stops_after_three_requests(api):
     api.replies = [ok(page([], has_more=True, cursor="c"))]
-    out = await server.search_grants(limit=10)
+    out = await run(tools.search_grants, limit=10)
     assert len(api.requests) == 3
     assert (out["results"], out["has_more"], out["next_cursor"]) == ([], True, "c")
 
@@ -119,7 +124,7 @@ async def test_following_stops_after_three_requests(api):
 @pytest.mark.anyio
 async def test_following_stops_when_the_api_has_no_more(api):
     api.replies = [ok(page([1], has_more=False))]
-    out = await server.search_jobs()
+    out = await run(tools.search_jobs)
     assert len(api.requests) == 1
     assert (out["has_more"], out["next_cursor"]) == (False, None)
 
@@ -127,7 +132,7 @@ async def test_following_stops_when_the_api_has_no_more(api):
 @pytest.mark.anyio
 async def test_failed_follow_up_keeps_the_rows_already_collected(api):
     api.replies = [ok(page([1], has_more=True, cursor="c1")), lambda req: httpx.Response(429, headers={"Retry-After": "5"})]
-    out = await server.search_contracts(limit=5)
+    out = await run(tools.search_contracts, limit=5)
     assert [r["id"] for r in out["results"]] == ["1"]
     assert (out["has_more"], out["next_cursor"]) == (True, "c1")
     assert out["warning"].startswith("Stopped after 1 rows: MatchAwards rate limit reached")
@@ -143,13 +148,13 @@ async def test_failed_follow_up_keeps_the_rows_already_collected(api):
 async def test_malformed_results_are_a_tool_error(api, body):
     api.replies = [ok(body)]
     with pytest.raises(ToolError, match="unexpected API response"):
-        await server.search_contracts()
+        await tools.search_contracts()
 
 
 @pytest.mark.anyio
 async def test_malformed_follow_up_page_keeps_rows_with_warning(api):
     api.replies = [ok(page([1], has_more=True, cursor="c1")), ok({"results": [None], "has_more": False})]
-    out = await server.search_contracts(limit=5)
+    out = await run(tools.search_contracts, limit=5)
     assert [r["id"] for r in out["results"]] == ["1"]
     assert "unexpected API response" in out["warning"]
 
@@ -157,26 +162,29 @@ async def test_malformed_follow_up_page_keeps_rows_with_warning(api):
 @pytest.mark.anyio
 async def test_complete_search_has_no_warning(api):
     api.replies = [ok(page([1, 2], has_more=True, cursor="c1"))]
-    assert "warning" not in await server.search_contracts(limit=2)
+    assert (await tools.search_contracts(limit=2)).warning is None
 
 
 @pytest.mark.anyio
-async def test_get_opportunity_passes_json_through_with_link_note(api):
+async def test_get_opportunity_returns_the_detail_with_link_note(api):
     api.replies = [ok({"as_of": "2026-10-07T12:00:00Z", "result": DETAIL})]
-    assert await server.get_opportunity("7") == {**DETAIL, "as_of": "2026-10-07T12:00:00Z", "note": NOTE}
+    out = (await tools.get_opportunity("7")).model_dump(exclude_none=True)
+    assert out == {**DETAIL, "as_of": "2026-10-07T12:00:00Z", "note": NOTE}
 
 
 @pytest.mark.anyio
-async def test_find_contacts_returns_only_id_title_url_and_contacts(api):
-    api.replies = [ok({"as_of": "x", "result": DETAIL})]
-    assert await server.find_contacts("7") == {
-        "id": "7", "title": "Notice 7", "url": "https://matchawards.com/a/posts/7", "contacts": DETAIL["contacts"],
-    }
-    api.replies = [ok({"as_of": "x", "result": row(8)})]
-    assert (await server.find_contacts("8"))["contacts"] == []
+async def test_get_opportunity_contacts_and_reserved_fields(api):
+    api.replies = [ok({"as_of": "x", "result": {**row(8), "contacts": None}})]
+    out = await run(tools.get_opportunity, "8")
+    assert (out["contacts"], out["ai"], out["teaming"]) == ([], None, None)  # ai and teaming: declared, not yet filled
+    api.replies = [ok({"as_of": "x", "result": {**row(8), "ai": {"fit": "Good fit.", "generated": True}}})]
+    assert (await run(tools.get_opportunity, "8"))["ai"] == {"fit": "Good fit.", "generated": True}
     api.replies = [ok(row(9))]  # old top-level shape: not accepted
     with pytest.raises(ToolError, match="no result object"):
-        await server.find_contacts("9")
+        await tools.get_opportunity("9")
+    api.replies = [ok({"as_of": "x", "result": {"title": "no id"}})]
+    with pytest.raises(ToolError, match="unexpected API response \\(1 invalid fields\\)"):
+        await tools.get_opportunity("9")
 
 
 def _raise(exc_type):
@@ -209,9 +217,9 @@ def _raise(exc_type):
 async def test_http_failures_become_tool_errors(api, reply, message):
     api.replies = [reply]
     with pytest.raises(ToolError, match=message):
-        await server.search_contracts()
+        await tools.search_contracts()
     with pytest.raises(ToolError, match=message):
-        await server.get_opportunity("7")
+        await tools.get_opportunity("7")
 
 
 @pytest.mark.anyio
@@ -224,9 +232,8 @@ async def test_http_failures_become_tool_errors(api, reply, message):
     ("search_jobs", {"posted_within_days": 31}),
     ("search_jobs", {"limit": 0}),
     ("search_jobs", {"limit": 51}),
-    ("search_by_naics", {"naics": "541511", "type": "award"}),
     ("get_opportunity", {"id": "../admin"}),
-    ("find_contacts", {"id": ""}),
+    ("get_opportunity", {"id": ""}),
 ])
 async def test_bad_input_is_rejected_before_any_request(api, tool, args):
     with pytest.raises(ToolError):
@@ -257,8 +264,94 @@ async def test_stdio_handshake(mode):
         assert [t.name for t in listed.tools] == TOOLS
         for t in listed.tools:
             a = t.annotations
-            assert (a.read_only_hint, a.destructive_hint, a.idempotent_hint, a.open_world_hint) == (True, False, True, True)
+            hints = (a.read_only_hint, a.destructive_hint, a.idempotent_hint, a.open_world_hint)
+            assert hints == (True, False, True, False)
+            assert t.title and t.output_schema and t.meta == {"securitySchemes": [{"type": "noauth"}]}
         if mode == "auto":
             assert (listed.ttl_ms, listed.cache_scope) == (86_400_000, "public")
         bad = await client.call_tool("search_contracts", {"naics": "12"})
         assert bad.is_error
+
+
+# --- Tool descriptors, structured output, instructions ------------------------------------------------------
+
+def flat(text):
+    return " ".join(text.split())  # docstring line breaks fall mid-phrase
+
+
+@pytest.mark.anyio
+async def test_every_tool_has_title_annotations_noauth_output_schema_and_description_rules():
+    listed = {t.name: t for t in await server.mcp.list_tools()}
+    assert list(listed) == TOOLS
+    for name, t in listed.items():
+        assert t.title, name
+        assert t.annotations.model_dump(by_alias=True, exclude_none=True) == {
+            "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}, name
+        assert t.meta == {"securitySchemes": [{"type": "noauth"}]}, name
+        assert t.output_schema["type"] == "object", name
+        assert t.description.startswith("Use this when "), name
+        assert "\nDo not use for " in t.description and "markdown link" in flat(t.description), name
+        assert "oauth2" not in json.dumps(t.model_dump(mode="json", by_alias=True)).lower(), name
+    for name in ("search_contracts", "search_grants", "search_jobs"):
+        assert "limit (1 to 50" in flat(listed[name].description), name
+        assert "naics (up to 10 codes)" in flat(listed[name].description), name
+    assert "sam_url" in listed["search_contracts"].description and "sam_url" in listed["get_opportunity"].description
+    assert "Open status may lag for grants that closed recently" in flat(listed["search_grants"].description)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("name, args, replies", [
+    ("search_contracts", {}, [ok(page([1, 2]))]),
+    ("search_contracts", {}, [ok(page([]))]),  # no results
+    ("search_contracts", {"limit": 5}, [  # a follow-up page fails: rows so far plus a warning
+        ok(page([1], has_more=True, cursor="c1")), lambda req: httpx.Response(429, headers={"Retry-After": "5"})]),
+    ("search_grants", {}, [ok(page([3]))]),
+    ("search_jobs", {}, [ok({"as_of": None, "results": [{"id": "4", "title": "Electrician", "agency": None,
+                                                         "naics": None, "sam_url": None}], "has_more": False})]),
+    ("get_opportunity", {"id": "7"}, [ok({"as_of": "x", "result": {
+        **DETAIL, "naics": {"code": "238160", "title": "Roofing Contractors"}, "sam_url": "https://sam.gov/opp/1",
+        "no_fixed_deadline": True, "agency_id": "not-declared-yet"}})]),
+    ("get_opportunity", {"id": "8"}, [ok({"as_of": "x", "result": row(8)})]),  # no description, no contacts
+])
+async def test_structured_content_validates_against_output_schema(api, name, args, replies):
+    api.replies = replies
+    schema = {t.name: t.output_schema for t in await server.mcp.list_tools()}[name]
+    out = await server.mcp.call_tool(name, args)
+    assert not out.is_error
+    jsonschema.validate(out.structured_content, schema)
+    assert json.loads(out.content[0].text) == out.structured_content  # hosts without structured output read this
+    if "limit" in args:
+        assert out.structured_content["warning"].startswith("Stopped after 1 rows")
+    assert "agency_id" not in out.structured_content  # undeclared API fields stay out until a model declares them
+
+
+def test_instructions_carry_the_essentials_in_the_first_512_characters():
+    head = server.INSTRUCTIONS[:512]
+    for needle in [*TOOLS, "markdown link", "sam_url", "may be incomplete", "Never call a firm the incumbent.",
+                   "AI-generated text is labelled; keep the label when you quote it.",
+                   "SAM.gov", "Grants.gov", "USAJOBS", "47+ state portals"]:
+        assert needle in head, needle
+
+
+@pytest.mark.anyio
+async def test_job_source_is_sent_only_when_set(api, monkeypatch):
+    await tools.search_jobs()
+    assert "source" not in api.requests[-1].url.params
+    monkeypatch.setattr(tools, "JOB_SOURCE", "usajobs")
+    await tools.search_jobs(keyword="nurse")
+    assert dict(api.requests[-1].url.params) == {
+        "type": "job", "q": "nurse", "posted_within_days": "30", "limit": "20", "source": "usajobs"}
+    await tools.search_contracts()
+    assert "source" not in api.requests[-1].url.params  # jobs only
+
+
+@pytest.mark.anyio
+async def test_golden_prompts_name_only_listed_tools():
+    golden = json.loads((ROOT / "tests" / "golden" / "prompts.json").read_text())
+    listed = {t.name for t in await server.mcp.list_tools()}
+    kinds = {p["kind"] for p in golden["prompts"]}
+    assert kinds == {"direct", "indirect", "negative"} and len(golden["prompts"]) >= 30
+    for p in golden["prompts"]:
+        assert p["prompt"] and set(p["expect"]) <= listed, p
+        assert (p["kind"] == "negative") == (p["expect"] == []), p
+    assert listed == {t for p in golden["prompts"] for t in p["expect"]}  # every tool has a prompt

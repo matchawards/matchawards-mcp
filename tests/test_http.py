@@ -12,7 +12,8 @@ import pytest
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 
-from matchawards_mcp import __version__, server, usage
+from matchawards_mcp import __version__, server, tools, usage
+from matchawards_mcp import api as ma_api
 
 from test_server import TOOLS, api, anyio_backend, page  # noqa: F401  (fixtures)
 
@@ -26,7 +27,7 @@ REAL_FETCH_EGRESS = server.fetch_egress  # conftest swaps it for a failing stub 
 def no_api_budget_leak(monkeypatch, tmp_path):
     """http_app() installs a server-wide API budget and a usage ledger; put the stdio defaults (None) back after
     each test, and keep the ledger in a temporary directory."""
-    monkeypatch.setattr(server, "api_budget", None)
+    monkeypatch.setattr(ma_api, "api_budget", None)
     monkeypatch.setattr(server, "ledger", None)
     monkeypatch.setenv("MATCHAWARDS_USAGE_DB", str(tmp_path / "usage.db"))
 
@@ -74,6 +75,24 @@ async def test_handshake_list_and_call_over_http(api, mode):
     # The API must see this server's own address, never the end user's: nothing from the inbound request leaks.
     for name in ("x-real-ip", "x-forwarded-for", "cf-connecting-ip", "authorization"):
         assert name not in req.headers
+
+
+@pytest.mark.anyio
+async def test_tools_list_on_the_wire():
+    """What a host reads from tools/list: title, the four hints, noauth in _meta, an outputSchema; no oauth2."""
+    async with http() as hc:
+        r = await hc.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                          headers={**LEGACY, "X-Real-IP": "203.0.113.7"})
+    listed = r.json()["result"]["tools"]
+    assert [t["name"] for t in listed] == TOOLS
+    for t in listed:
+        assert t["title"] and t["outputSchema"]["type"] == "object", t["name"]
+        assert t["annotations"] == {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True,
+                                    "openWorldHint": False}, t["name"]
+        # Top level too would suit hosts that look there, but the SDK sends tools/list through the spec's Tool
+        # model, which drops unknown fields: _meta is the only place it reaches the wire.
+        assert t["_meta"]["securitySchemes"] == [{"type": "noauth"}], t["name"]
+    assert "oauth2" not in r.text
 
 
 @pytest.mark.anyio
@@ -399,9 +418,9 @@ async def test_api_budget_in_http_mode(api, monkeypatch):
 
 @pytest.mark.anyio
 async def test_stdio_mode_has_no_api_budget(api):
-    assert server.api_budget is None
+    assert ma_api.api_budget is None
     for _ in range(5):
-        await server.get_opportunity("7")
+        await tools.get_opportunity("7")
     assert len(api.requests) == 5
 
 
@@ -510,7 +529,7 @@ def egress_reply(monkeypatch, reply):
         seen.append(req)
         return reply(req)
 
-    monkeypatch.setattr(server, "client", httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(ma_api, "client", httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     monkeypatch.setattr(server, "fetch_egress", REAL_FETCH_EGRESS)
     return seen
 
