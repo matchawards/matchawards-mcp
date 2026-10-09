@@ -16,7 +16,8 @@ from matchawards_mcp import api as ma_api
 
 ROOT = Path(__file__).resolve().parents[1]
 PATH = "/api/public/v1/opportunities"
-TOOLS = ["search_contracts", "search_grants", "search_jobs", "get_opportunity"]
+TOOLS = ["search_contracts", "search_grants", "search_jobs", "get_opportunity", "lookup_naics", "search_awards",
+         "get_company"]
 NOTE = tools.LINK_RULE
 
 
@@ -209,13 +210,18 @@ async def test_get_opportunity_returns_the_detail_with_link_note(api):
 async def test_get_opportunity_contacts_and_reserved_fields(api):
     api.replies = [ok({"as_of": "x", "result": {**row(8), "contacts": None}})]
     out = await run(tools.get_opportunity, "8")
-    assert (out["contacts"], out["ai"]) == ([], None)  # ai: declared, not yet filled
+    assert (out["contacts"], out["ai"], out["note"]) == ([], None, NOTE)  # no ai from the API: null, no AI label
     assert "teaming" not in out
-    # Sent by the API, but untyped until their models exist: never passed through.
-    api.replies = [ok({"as_of": "x", "result": {**row(8), "ai": {"fit": "Good fit.", "generated": True},
-                                                "teaming": {"angle": "x"}}})]
+    # ai is typed: its declared fields pass, cut to 1000 characters; anything else (and teaming) is dropped.
+    api.replies = [ok({"as_of": "x", "result": {**row(8), "teaming": {"angle": "x"}, "ai": {
+        "fit": "Good fit.", "reasoning": "r" * 1500, "subcontracting": None, "generated": True, "extra": "x",
+        "summary": {"nft_title": "T", "nft_insight": "I", "explanation": "dropped"}}}})]
     out = await run(tools.get_opportunity, "8")
-    assert out["ai"] is None and "teaming" not in out
+    assert out["ai"] == {"fit": "Good fit.", "reasoning": "r" * 1000, "subcontracting": None, "large_prime": None,
+                         "summary": {"nft_title": "T", "nft_insight": "I", "nft_advantage": None}}
+    assert "teaming" not in out and out["note"] == f"{NOTE} {tools.AI_NOTE}"
+    api.replies = [ok({"as_of": "x", "result": {**row(8), "ai": "not an object"}})]
+    assert (await run(tools.get_opportunity, "8"))["ai"] is None
     api.replies = [ok(row(9))]  # old top-level shape: not accepted
     with pytest.raises(ToolError, match="no result object"):
         await tools.get_opportunity("9")

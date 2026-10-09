@@ -5,12 +5,16 @@ Fields the API adds later are dropped (pydantic's default extra="ignore") until 
 published schema only changes on purpose.
 """
 
-import re
-from typing import Any
+from typing import Annotated
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, Field
 
 Text = str | None
+# AI text from the API, cut to 1000 characters (the API cuts it too; a longer value is shortened, not rejected).
+AiText = Annotated[
+    Annotated[str, Field(max_length=1000)] | None, BeforeValidator(lambda v: v[:1000] if isinstance(v, str) else v)
+]
+Agency = Annotated[str | None, BeforeValidator(lambda v: tidy_agency(v) if isinstance(v, str) else v)]
 
 # Kept upper-case when an all-caps agency name is title-cased (tidy_agency).
 ACRONYMS = {
@@ -71,7 +75,7 @@ class OpportunityRow(BaseModel):
     id: str = Field(strict=True, description="Pass to get_opportunity for the description and contacts.")
     type: Text = Field(None, description="federal, state, grant or job.")
     title: Text = None
-    agency: Text = None
+    agency: Agency = None
     office: Text = None
     naics: Naics | None = None
     set_aside: Text = None
@@ -84,11 +88,6 @@ class OpportunityRow(BaseModel):
     sam_url: Text = Field(None, description="The SAM.gov notice (federal only). Show it as a markdown link.")
     solicitation_number: Text = None
 
-    @field_validator("agency")
-    @classmethod
-    def _tidy_agency(cls, v: str | None) -> str | None:
-        return tidy_agency(v)
-
 
 class SearchResult(BaseModel):
     as_of: Text = Field(None, description="When the API generated the results (ISO time).")
@@ -99,10 +98,125 @@ class SearchResult(BaseModel):
     warning: Text = Field(None, description="Set when paging stopped early; the results so far are still valid.")
 
 
+class AiSummary(BaseModel):
+    nft_title: AiText = None
+    nft_insight: AiText = None
+    nft_advantage: AiText = None
+
+
+class AiNotes(BaseModel):
+    """AI-generated notes MatchAwards wrote when it imported the notice. Every field is AI-generated text."""
+
+    fit: AiText = Field(None, description="Who this opportunity suits.")
+    reasoning: AiText = None
+    subcontracting: AiText = Field(None, description="Angles for subcontractors.")
+    large_prime: AiText = Field(None, description="Angles for large prime contractors.")
+    summary: AiSummary | None = None
+
+
+AI_FIELD = Field(None, description="AI-generated notes on this opportunity, or null. Label them as AI-generated "
+                 "when you show or quote them.")
+
+
 class OpportunityDetail(OpportunityRow):
     as_of: Text = None
     description: Text = Field(None, description="Up to 2000 characters.")
     contacts: list[Contact] = Field(default_factory=list, description="Published points of contact; [] if none.")
-    ai: dict[str, Any] | None = Field(None, description="AI-generated notes on this opportunity, or null. "
-                                      "Label them as AI-generated when you show them.")
+    ai: AiNotes | None = AI_FIELD
+    note: Text = None
+
+
+class NaicsCode(BaseModel):
+    code: str = Field(strict=True, description="Six-digit NAICS code; pass it as naics to the search tools.")
+    title: Text = None
+    opportunities_url: Text = Field(None, description="The code's page on matchawards.com, or null. Show it as a "
+                                    "markdown link.")
+
+
+class NaicsLookup(BaseModel):
+    as_of: Text = None
+    results: list[NaicsCode]
+    note: Text = None
+
+
+class Awardee(BaseModel):
+    name: Text = None
+    uei: Text = Field(None, description="Pass to get_company for the firm's award history.")
+    duns: Text = None
+
+
+class Period(BaseModel):
+    start: Text = None
+    end: Text = None
+
+
+class AwardRow(BaseModel):
+    """One award. Federal contract awards fill solicitation_number and contract_number; grant awards fill
+    cfda_number and period, and their title is the recipient's name."""
+
+    id: Text = Field(None, strict=True, description="Award id; null when the award has no page on matchawards.com.")
+    type: Text = Field(None, description="contract_award or grant_award.")
+    title: Text = None
+    awardee: Awardee | None = None
+    amount: float | None = Field(None, description="USD; null when the source value does not parse.")
+    award_date: Text = Field(None, description="Date, YYYY-MM-DD.")
+    period: Period | None = Field(None, description="Grant awards only: start and end dates.")
+    agency: Agency = None
+    agency_id: Text = None
+    naics: Naics | None = None
+    set_aside: Text = None
+    state: Text = None
+    city: Text = None
+    solicitation_number: Text = None
+    contract_number: Text = None
+    cfda_number: Text = None
+    url: Text = Field(None, description="The award on matchawards.com. Show it as a markdown link.")
+    source_url: Text = Field(None, description="The award notice at SAM.gov or USAspending. Show it as a markdown "
+                             "link.")
+
+
+class AwardSearchResult(SearchResult):
+    results: list[AwardRow]
+
+
+class Totals(BaseModel):
+    count: int | None = None
+    amount: float | None = Field(None, description="USD, summed over amounts that parse.")
+
+
+class CompanyTotals(BaseModel):
+    contract_awards: Totals | None = None
+    grant_awards: Totals | None = None
+
+
+class Location(BaseModel):
+    city: Text = None
+    state: Text = None
+    country: Text = None
+
+
+class NaicsCount(Naics):
+    count: int | None = None
+
+
+class AgencyCount(BaseModel):
+    agency: Agency = None
+    agency_id: Text = None
+    count: int | None = None
+
+
+class Company(BaseModel):
+    as_of: Text = None
+    uei: str = Field(strict=True)
+    name: Text = None
+    other_names: list[str] = Field(default_factory=list, description="Other spellings in award records.")
+    duns: Text = None
+    location: Location | None = None
+    totals: CompanyTotals | None = None
+    first_award_date: Text = None
+    last_award_date: Text = None
+    top_naics: list[NaicsCount] = Field(default_factory=list, description="From contract awards only.")
+    top_agencies: list[AgencyCount] = Field(default_factory=list)
+    recent_awards: list[AwardRow] = Field(default_factory=list, description="Up to 10, newest first.")
+    coverage_note: Text = None
     note: Text = None

@@ -4,16 +4,23 @@
 
 *MatchAwards gives AI agents direct access to continuously updated government and business contracts, grants, jobs, awards and collaboration opportunities.*
 
-This is the [Model Context Protocol](https://modelcontextprotocol.io) server for [MatchAwards](https://matchawards.com). It lets Claude, Cursor, VS Code and other MCP clients search US government contract opportunities, grants and jobs. It only reads data, and it needs no account and no API key.
+This is the [Model Context Protocol](https://modelcontextprotocol.io) server for [MatchAwards](https://matchawards.com). It lets Claude, Cursor, VS Code and other MCP clients search US government contract opportunities, grants and jobs, and past contract and grant awards. It only reads data, and it needs no account and no API key.
 
 ## Tools
 
 | Tool | What it returns | Example prompt |
 |---|---|---|
-| `search_contracts` | Federal and state contract opportunities. Filters: NAICS (up to 10 codes), state, keyword, set-aside, federal or state only, posted within N days, open only, 1 to 50 results, paging. | "Find open roofing contracts in Virginia posted in the last week." |
+| `search_contracts` | Federal and state contract opportunities. Filters: NAICS (up to 10 codes), state, keyword, set-aside, federal or state only, posted within N days, open only, agency (by name), 1 to 50 results, paging. | "Find open roofing contracts in Virginia posted in the last week." |
 | `search_grants` | Federal grant and funding opportunities. Filters: NAICS, keyword, posted within N days, open only, 1 to 50 results, paging (grant notices carry no state). | "Are there open broadband grants?" |
 | `search_jobs` | Job postings from the last 30 days. Filters: NAICS, state, keyword, posted within N days, 1 to 50 results, paging. | "Show electrician jobs in Texas from the last 7 days." |
-| `get_opportunity` | The full record of one opportunity: the search row plus its description and published points of contact (name and title). | "Who do I contact about the second result?" |
+| `get_opportunity` | The full record of one opportunity: the search row plus its description, published points of contact (name and title) and, where MatchAwards has them, AI-generated notes (`ai`: fit, reasoning, subcontracting and large-prime angles, summary), labelled as AI-generated. | "Who do I contact about the second result?" |
+| `lookup_naics` | NAICS codes from words ("cybersecurity") or from a 2 to 6 digit code prefix, with each code's page on matchawards.com. 1 to 25 codes. | "What NAICS code covers cybersecurity consulting?" |
+| `search_awards` | Past federal contract awards and grant awards: awardee (name, UEI, DUNS), amount, date, agency, NAICS, set-aside, place, solicitation, contract and CFDA numbers, links to matchawards.com and to SAM.gov or USAspending. Filters: type, NAICS, agency (by name), state, awardee name, UEI, keyword, awarded within N days (up to 1,095), 1 to 50 results, paging. | "Who won VA contracts under NAICS 541512 in the last year?" |
+| `get_company` | One firm's award history by UEI: names, location (city, state, country), contract and grant totals, first and last award dates, top NAICS codes and agencies, the 10 most recent awards. No contact details. | "Show the award history of UEI C3KXNLTAAY98." |
+
+The `agency` filter takes a name. The server looks it up among MatchAwards' agencies (exact name first, then names that start with it), filters by the best match and says in the result's `note` which agency it used and what else matched; when nothing matches, it searches all agencies and says so. Lookups are cached for 10 minutes.
+
+Award records may be incomplete (federal awards especially), so every award result says so. A grant award's title is its recipient's name, so the model is asked to head it with the awardee name and CFDA number instead.
 
 Every tool is read-only and needs no account: each declares `readOnlyHint`, `idempotentHint`, a title and `securitySchemes: [{"type": "noauth"}]` (in `_meta`). Results are structured: each tool publishes an `outputSchema` and returns `structuredContent`, with the same JSON as text for clients that read only text. Every result carries a `url` on matchawards.com (and a `sam_url` for federal notices), and the server asks the model to show them as markdown links.
 
@@ -21,8 +28,9 @@ Every tool is read-only and needs no account: each declares `readOnlyHint`, `ide
 
 - `search_by_naics` is removed: `search_contracts`, `search_grants` and `search_jobs` take the same `naics` filter on its own.
 - `find_contacts` is removed: `get_opportunity` returns the published contacts with the rest of the record.
-- Results are structured output (`outputSchema` plus `structuredContent`). Fields the API adds later appear in results only once the schema declares them. `get_opportunity` reserves `ai` (AI-generated notes, labelled as such); it is null for now.
+- Results are structured output (`outputSchema` plus `structuredContent`). Fields the API adds later appear in results only once the schema declares them. `get_opportunity` returns `ai` (AI-generated notes, labelled as such) where MatchAwards has them, else null.
 - Tool annotations are closed-world (`openWorldHint: false`): the tools read the MatchAwards catalog only.
+- New tools: `lookup_naics`, `search_awards` and `get_company`; `search_contracts` takes an `agency` name.
 
 ## Cards
 
@@ -189,15 +197,16 @@ When `MATCHAWARDS_METRICS_TOKEN` is set, a second listener in the same process (
 
 ## Data
 
-The data is US federal and state contract opportunities, grants and jobs from [matchawards.com](https://matchawards.com). Only public posts are returned, and each result links back to its page on matchawards.com.
+The data is US federal and state contract opportunities, grants, jobs, federal contract awards and grant awards from [matchawards.com](https://matchawards.com). Only public posts are returned, and each result links back to its page on matchawards.com.
 
 - Contract and grant searches return open items by default: a response deadline of today or later, US Eastern. An item with no deadline counts as closed.
 - Job search covers the last 30 days.
 - Results come newest first. When `has_more` is true, the model can ask for the next page with `cursor`.
+- A narrow filter (an agency, a rare name) can scan the newest records without a match while more exist further back; the result's `warning` then says so and gives the `cursor` to continue with.
 - If the first request of a search fails, the tool returns an error. If a later page fails, the tool returns the rows it already has, with a `warning` that says why it stopped.
 - A result row in an unexpected format is left out and counted in `warning`; the rest of the search is returned.
 - Each API call times out after 10 seconds.
-- The API is rate-limited per IP: 60 requests per minute, plus a burst limit of 20 requests per 5 seconds. One search call can use up to three requests when the filters are narrow and results are sparse. When the limit is reached, the tool returns an error that tells the model how many seconds to wait.
+- The API is rate-limited per IP: 60 requests per minute, plus a burst limit of 20 requests per 5 seconds. One search call can use up to three requests when the filters are narrow and results are sparse, plus one to look up an agency name (cached for 10 minutes). When the limit is reached, the tool returns an error that tells the model how many seconds to wait.
 
 ## Development
 

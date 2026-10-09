@@ -1,15 +1,19 @@
-"""The public matchawards.com API: one shared HTTP client, error wording the model can act on, and search paging.
+"""The public matchawards.com API: one shared HTTP client, error wording the model can act on, search paging and
+agency-name resolution.
 
-Every call is a GET to `{MATCHAWARDS_API_BASE}/api/public/v1/opportunities` (a search may follow the cursor for up
-to MAX_PAGES requests) or to `.../opportunities/{id}`.
+Every call is a GET under `{MATCHAWARDS_API_BASE}/api/public/v1/`: `opportunities` and `awards` (a search may follow
+the cursor for up to MAX_PAGES requests), `opportunities/{id}`, `companies/{uei}`, `naics` and `agencies`.
 """
 
+import asyncio
 import os
+import re
+import time
 from typing import Any
 
 import httpx
 from mcp.server.mcpserver.exceptions import ToolError
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from . import __version__
 from .schemas import OpportunityRow
@@ -18,7 +22,12 @@ API_BASE = os.environ.get("MATCHAWARDS_API_BASE", "https://matchawards.com").rst
 USER_AGENT = f"matchawards-mcp/{__version__} (+https://github.com/matchawards/matchawards-mcp)"
 TIMEOUT_S = 10.0  # the API answers within about 2 s by design
 SEARCH_PATH = "/api/public/v1/opportunities"
+AWARDS_PATH = "/api/public/v1/awards"
+AGENCIES_PATH = "/api/public/v1/agencies"
+COMPANIES_PATH = "/api/public/v1/companies"
+NAICS_PATH = "/api/public/v1/naics"
 MAX_PAGES = 3  # API requests one search tool call may make while filling `limit`
+PAGE_LIMIT = 50  # the API's largest `limit`
 
 # HTTP mode only: API calls per minute for the whole server (the API does not rate-limit this server's address,
 # and one search can make up to MAX_PAGES calls). None in stdio mode, where the API's own per-IP limit applies.
@@ -83,8 +92,9 @@ def error_message(r: httpx.Response) -> str:
     return f"MatchAwards rejected the request (HTTP {r.status_code}): {error}"
 
 
-async def get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    """GET one API path; turn every failure into a ToolError the model can act on."""
+async def get(path: str, params: dict[str, Any] | None = None, not_found: str | None = None) -> dict[str, Any]:
+    """GET one API path; turn every failure into a ToolError the model can act on. `not_found` replaces the
+    wording of a 404."""
     query = {k: v for k, v in (params or {}).items() if v is not None and v != ""}  # "" = unset, e.g. cursor=""
     if api_budget is not None and (wait := api_budget.check("api")):
         raise fail("busy", f"MatchAwards is busy right now. Retry in {wait} seconds.")
@@ -103,6 +113,8 @@ async def get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]
         raise fail("rate_limited_upstream", error_message(r))
     if r.status_code == 503 and _error_code(r) == "timeout":
         raise fail("upstream_timeout", error_message(r))
+    if r.status_code == 404 and not_found:
+        raise fail("invalid_input", not_found)
     if r.status_code >= 400:  # 4xx: the API rejected the parameters or the id (grants_unavailable is a 503)
         raise fail("upstream_error" if r.status_code >= 500 else "invalid_input", error_message(r))
     try:
@@ -126,26 +138,36 @@ async def get_one(id: str) -> dict[str, Any]:
     return {**result, "as_of": data.get("as_of")}
 
 
-async def search(type_: str, limit: int = 20, keyword: str | None = None, **filters: Any) -> dict[str, Any]:
-    """Collect up to `limit` unique valid rows. A sparse filter can return a short page with has_more, so
-    follow next_cursor with the same filters, for at most MAX_PAGES requests.
+async def search(type_: str, limit: int = 20, keyword: str | None = None, *, path: str = SEARCH_PATH,
+                 model: type[BaseModel] = OpportunityRow, pages: int = MAX_PAGES, deadline: float | None = None,
+                 **filters: Any) -> dict[str, Any]:
+    """Collect up to `limit` unique valid rows of `model` from `path`. A sparse filter can return a short page,
+    even an empty one, with has_more, so follow next_cursor with the same filters, for at most `pages` requests
+    (each asks for at most PAGE_LIMIT rows), and none past `deadline` (event-loop time).
 
-    A row that is not a valid OpportunityRow is skipped: it does not count toward `limit` and is reported in
-    `warning`, so one bad row does not fail the search. Returns {as_of, results (OpportunityRow), has_more,
-    next_cursor}, plus `warning` when a follow-up page failed or rows were skipped."""
+    A row that is not a valid `model` with an id is skipped: it does not count toward `limit` and is reported in
+    `warning`, so one bad row does not fail the search. Returns {as_of, results, has_more, next_cursor}, plus
+    `warning` when a follow-up page failed (then also `stopped`: True), rows were skipped, or the pages ran out
+    with no row and more to scan."""
     if filters.get("naics"):
         filters["naics"] = ",".join(c.strip() for c in filters["naics"].split(","))
     if filters.get("state"):
         filters["state"] = filters["state"].upper()
     params = {"type": type_, "q": keyword, **filters}
-    rows: dict[str, OpportunityRow] = {}
+    rows: dict[str, BaseModel] = {}
     page: dict[str, Any] = {}
     as_of = warning = None
     skipped = 0
-    for _ in range(MAX_PAGES):
+    stopped = False
+    for _ in range(pages):
         try:
             # Ask only for what is still missing, so no row is read past the cursor and then dropped.
-            next_page = await get(SEARCH_PATH, {**params, "limit": limit - len(rows)})
+            request = get(path, {**params, "limit": min(limit - len(rows), PAGE_LIMIT)})
+            try:
+                left = None if deadline is None else max(0.0, deadline - asyncio.get_running_loop().time())
+                next_page = await asyncio.wait_for(request, left)
+            except asyncio.TimeoutError:  # not the builtin TimeoutError before Python 3.11
+                raise fail("upstream_timeout", "MatchAwards did not answer within this tool's time limit.") from None
             results = next_page.get("results")
             if not isinstance(results, list) or not all(isinstance(r, dict) for r in results):
                 raise fail("bad_response",
@@ -155,13 +177,16 @@ async def search(type_: str, limit: int = 20, keyword: str | None = None, **filt
                 raise  # first page: nothing to return, so the call fails
             # Follow-up page: keep what we have; the last good page's next_cursor still points at the rest.
             warning = f"Stopped after {len(rows)} rows: {e} More results may exist; call again with next_cursor."
+            stopped = True
             break
         page = next_page
         as_of = as_of or page.get("as_of")
         for raw in results:
             try:
-                row = OpportunityRow.model_validate(raw)
+                row = model.model_validate(raw)
             except ValidationError:
+                row = None
+            if row is None or row.id is None:
                 skipped += 1
                 continue
             rows.setdefault(row.id, row)
@@ -174,6 +199,55 @@ async def search(type_: str, limit: int = 20, keyword: str | None = None, **filt
         "has_more": bool(page.get("has_more")),
         "next_cursor": page.get("next_cursor"),
     }
+    if not rows and not warning and out["has_more"] and out["next_cursor"]:
+        # A sparse filter (an agency, a rare name) scans newest first in slices: the pages ran out before a match.
+        warning = (f"No matches in the newest results scanned; more may exist further back. Call again with "
+                   f"cursor={out['next_cursor']} to keep searching.")
     if skipped:
         warning = " ".join(filter(None, [warning, f"{skipped} result(s) skipped: unexpected format."]))
+    if stopped:
+        out["stopped"] = True
     return {**out, "warning": warning} if warning else out
+
+
+# Agency name -> agency ids, for the `agency` filter. Agencies are MatchAwards accounts, and one department can have
+# several (dept_of_defense and department_of_defense), so a name resolves to the best match plus the other
+# accounts of the same department. AGENCY_SLUGS_PER_QUERY of them are sent as agency= (comma-separated).
+AGENCY_SLUGS_PER_QUERY = 1
+AGENCY_TTL_S = 600
+AGENCY_CACHE_MAX = 512
+_agencies: dict[str, tuple[float, list[str], str]] = {}  # query (case-folded) -> (expiry, ids, note)
+
+
+def dept_key(name: str) -> str:
+    """A department name compared loosely: 'United States Department of Defense' and 'Department Of Defense' are
+    both 'department of defense'."""
+    text = re.sub(r"[^a-z0-9 ]+", " ", name.lower().replace("u.s.", " "))
+    return " ".join(re.sub(r"\b(united states|us)\b", " ", text).split())
+
+
+async def resolve_agency(name: str) -> tuple[list[str], str]:
+    """The agency ids for an agency name, best first, and a note saying which agency was used (and the other
+    matches). Ranking: an exact case-insensitive name match, then names starting with `name`, then the API's order.
+    No match is not an error: the ids are [] and the note says the search covers all agencies. Cached in-process
+    for AGENCY_TTL_S."""
+    key = " ".join(name.split()).casefold()
+    hit = _agencies.get(key)
+    if hit and hit[0] > time.monotonic():
+        return hit[1], hit[2]
+    data = await get(AGENCIES_PATH, {"q": " ".join(name.split()), "limit": 10})
+    found = [a for a in data.get("results") or [] if isinstance(a, dict)
+             and isinstance(a.get("agency_id"), str) and isinstance(a.get("name"), str)]
+    found.sort(key=lambda a: 0 if a["name"].casefold() == key else 1 if a["name"].casefold().startswith(key) else 2)
+    if not found:
+        ids, note = [], f"No agency matched '{name}'; showing all agencies."
+    else:
+        best = found[0]
+        ids = [best["agency_id"]] + [a["agency_id"] for a in found[1:] if dept_key(a["name"]) == dept_key(best["name"])]
+        note = f"Filtered by agency: {best['name']} ({best['agency_id']})."
+        if others := [a["name"] for a in found[1:4]]:
+            note += f" Other matches: {', '.join(others)}."
+    if len(_agencies) >= AGENCY_CACHE_MAX:
+        del _agencies[next(iter(_agencies))]  # the oldest entry
+    _agencies[key] = (time.monotonic() + AGENCY_TTL_S, ids, note)
+    return ids, note
