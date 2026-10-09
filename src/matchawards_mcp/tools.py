@@ -10,7 +10,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, Field, ValidationError
 
 from . import api
-from .schemas import OpportunityDetail, OpportunityRow, SearchResult
+from .schemas import OpportunityDetail, SearchResult
 
 LINK_RULE = (
     "Show each item's url to the user verbatim as a markdown link, [title](url); "
@@ -71,21 +71,6 @@ def _parse(model: type[BaseModel], data: dict) -> BaseModel:
         ) from None
 
 
-def _search_result(out: dict, note: str) -> SearchResult:
-    """api.search's output as a SearchResult. A row the model cannot hold is skipped and counted in `warning`, so
-    one bad row does not fail the search; only a bad envelope does."""
-    rows, skipped = [], 0
-    for row in out["results"]:
-        try:
-            rows.append(OpportunityRow.model_validate(row))
-        except ValidationError:
-            skipped += 1
-    warning = out.get("warning")
-    if skipped:
-        warning = " ".join(filter(None, [warning, f"{skipped} result(s) skipped: unexpected format."]))
-    return _parse(SearchResult, {**out, "results": rows, "warning": warning, "note": note})
-
-
 async def search_contracts(
     naics: Naics = None,
     state: State = None,
@@ -115,7 +100,7 @@ async def search_contracts(
         type or "contract", naics=naics, state=state, keyword=keyword, set_aside=set_aside,
         posted_within_days=posted_within_days, open=open, limit=limit, cursor=cursor,
     )
-    return _search_result(out, LINK_RULE)
+    return _parse(SearchResult, {**out, "note": LINK_RULE})
 
 
 async def search_grants(
@@ -142,7 +127,7 @@ async def search_grants(
         "grant", naics=naics, keyword=keyword, posted_within_days=posted_within_days, open=open, limit=limit,
         cursor=cursor,
     )
-    return _search_result(out, GRANT_NOTE)
+    return _parse(SearchResult, {**out, "note": GRANT_NOTE})
 
 
 async def search_jobs(
@@ -168,14 +153,14 @@ async def search_jobs(
         "job", naics=naics, state=state, keyword=keyword, posted_within_days=posted_within_days, limit=limit,
         cursor=cursor, source=JOB_SOURCE,
     )
-    return _search_result(out, LINK_RULE)
+    return _parse(SearchResult, {**out, "note": LINK_RULE})
 
 
 async def get_opportunity(id: OppId) -> OpportunityDetail:
     """Use this when the user wants the details of one search result, or who to contact about it.
 
     Pass the id from a search result. Returns the result's row plus its description (up to 2000 characters) and
-    published points of contact (name and title only). Example: id="abc123".
+    published points of contact (name and title only). Example: id="117402307943537453".
 
     Print url, and sam_url for federal notices, as markdown links.
 

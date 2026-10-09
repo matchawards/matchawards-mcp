@@ -25,7 +25,7 @@ class Contact(BaseModel):
 class OpportunityRow(BaseModel):
     """One search result. Jobs fill title, agency (the employer), state, city, posted_at and url only."""
 
-    id: str = Field(description="Pass to get_opportunity for the description and contacts.")
+    id: str = Field(strict=True, description="Pass to get_opportunity for the description and contacts.")
     type: Text = Field(None, description="federal, state, grant or job.")
     title: Text = None
     agency: Text = None

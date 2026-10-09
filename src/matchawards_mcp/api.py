@@ -9,8 +9,10 @@ from typing import Any
 
 import httpx
 from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import ValidationError
 
 from . import __version__
+from .schemas import OpportunityRow
 
 API_BASE = os.environ.get("MATCHAWARDS_API_BASE", "https://matchawards.com").rstrip("/")
 USER_AGENT = f"matchawards-mcp/{__version__} (+https://github.com/matchawards/matchawards-mcp)"
@@ -108,18 +110,21 @@ async def get_one(id: str) -> dict[str, Any]:
 
 
 async def search(type_: str, limit: int = 20, keyword: str | None = None, **filters: Any) -> dict[str, Any]:
-    """Collect up to `limit` unique rows. A sparse filter can return a short page with has_more, so
+    """Collect up to `limit` unique valid rows. A sparse filter can return a short page with has_more, so
     follow next_cursor with the same filters, for at most MAX_PAGES requests.
 
-    Returns {as_of, results, has_more, next_cursor}, plus `warning` when a follow-up page failed."""
+    A row that is not a valid OpportunityRow is skipped: it does not count toward `limit` and is reported in
+    `warning`, so one bad row does not fail the search. Returns {as_of, results (OpportunityRow), has_more,
+    next_cursor}, plus `warning` when a follow-up page failed or rows were skipped."""
     if filters.get("naics"):
         filters["naics"] = ",".join(c.strip() for c in filters["naics"].split(","))
     if filters.get("state"):
         filters["state"] = filters["state"].upper()
     params = {"type": type_, "q": keyword, **filters}
-    rows: dict[Any, dict[str, Any]] = {}
+    rows: dict[str, OpportunityRow] = {}
     page: dict[str, Any] = {}
     as_of = warning = None
+    skipped = 0
     for _ in range(MAX_PAGES):
         try:
             # Ask only for what is still missing, so no row is read past the cursor and then dropped.
@@ -136,10 +141,13 @@ async def search(type_: str, limit: int = 20, keyword: str | None = None, **filt
             break
         page = next_page
         as_of = as_of or page.get("as_of")
-        for row in results:
-            # Deduplicate on string ids; any other id (missing, a number, a list) cannot be valid, so keep each such
-            # row on its own for the tools to skip and count.
-            rows.setdefault(row["id"] if isinstance(row.get("id"), str) else object(), row)
+        for raw in results:
+            try:
+                row = OpportunityRow.model_validate(raw)
+            except ValidationError:
+                skipped += 1
+                continue
+            rows.setdefault(row.id, row)
         if len(rows) >= limit or not (page.get("has_more") and page.get("next_cursor")):
             break
         params["cursor"] = page["next_cursor"]
@@ -149,4 +157,6 @@ async def search(type_: str, limit: int = 20, keyword: str | None = None, **filt
         "has_more": bool(page.get("has_more")),
         "next_cursor": page.get("next_cursor"),
     }
+    if skipped:
+        warning = " ".join(filter(None, [warning, f"{skipped} result(s) skipped: unexpected format."]))
     return {**out, "warning": warning} if warning else out

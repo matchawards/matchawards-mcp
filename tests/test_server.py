@@ -161,15 +161,32 @@ async def test_malformed_follow_up_page_keeps_rows_with_warning(api):
 
 @pytest.mark.anyio
 async def test_bad_rows_are_skipped_and_counted_not_fatal(api):
+    # A numeric id is invalid (ids are strings: snowflakes exceed 2**53), never coerced.
     api.replies = [ok({**page([1, 2]), "results": [row(1), {"title": "no id"}, {**row(3), "id": 3}, row(2)]})]
     out = await run(tools.search_contracts)
     assert [r["id"] for r in out["results"]] == ["1", "2"]
     assert out["warning"] == "2 result(s) skipped: unexpected format."
-    # With a paging warning too, both are kept.
+
+
+@pytest.mark.anyio
+async def test_skipped_rows_do_not_count_toward_limit(api):
+    api.replies = [
+        ok({**page([1], has_more=True, cursor="c1"), "results": [row(1), {"id": 2}, {"id": None}]}),
+        ok({**page([3, 4], has_more=True, cursor="c2"), "results": [row(3), {"id": ["x"]}, row(4)]}),
+    ]
+    out = await run(tools.search_contracts, limit=3)
+    assert [r["id"] for r in out["results"]] == ["1", "3", "4"]
+    assert [r.url.params["limit"] for r in api.requests] == ["3", "2"]  # only valid rows count toward the limit
+    assert out["warning"] == "3 result(s) skipped: unexpected format."
+    assert (out["has_more"], out["next_cursor"]) == (True, "c2")
+
+
+@pytest.mark.anyio
+async def test_paging_warning_counts_valid_rows_and_keeps_the_skip_count(api):
     api.replies = [ok({**page([1], has_more=True, cursor="c1"), "results": [row(1), {"id": None}]}),
                    lambda req: httpx.Response(500)]
     out = await run(tools.search_jobs, limit=5)
-    assert out["warning"].startswith("Stopped after 2 rows: MatchAwards server error")
+    assert out["warning"].startswith("Stopped after 1 rows: MatchAwards server error")
     assert out["warning"].endswith("call again with next_cursor. 1 result(s) skipped: unexpected format.")
     assert [r["id"] for r in out["results"]] == ["1"]
 
@@ -319,6 +336,9 @@ async def test_every_tool_has_title_annotations_noauth_output_schema_and_descrip
     assert "Open status may lag for grants that closed recently" in flat(listed["search_grants"].description)
 
 
+SKIP_CASE = [ok({**page([]), "results": [row(1), {"id": ["bad"]}]})]  # one row skipped
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize("name, args, replies", [
     ("search_contracts", {}, [ok(page([1, 2]))]),
@@ -332,7 +352,7 @@ async def test_every_tool_has_title_annotations_noauth_output_schema_and_descrip
         **DETAIL, "naics": {"code": "238160", "title": "Roofing Contractors"}, "sam_url": "https://sam.gov/opp/1",
         "no_fixed_deadline": True, "agency_id": "not-declared-yet"}})]),
     ("get_opportunity", {"id": "8"}, [ok({"as_of": "x", "result": row(8)})]),  # no description, no contacts
-    ("search_grants", {}, [ok({**page([]), "results": [row(1), {"id": ["bad"]}]})]),  # one row skipped
+    ("search_grants", {}, SKIP_CASE),
 ])
 async def test_structured_content_validates_against_output_schema(api, name, args, replies):
     api.replies = replies
@@ -343,6 +363,8 @@ async def test_structured_content_validates_against_output_schema(api, name, arg
     assert json.loads(out.content[0].text) == out.structured_content  # hosts without structured output read this
     if "limit" in args:
         assert out.structured_content["warning"].startswith("Stopped after 1 rows")
+    if name == "search_grants" and replies is SKIP_CASE:
+        assert out.structured_content["warning"] == "1 result(s) skipped: unexpected format."
     assert "agency_id" not in out.structured_content  # undeclared API fields stay out until a model declares them
 
 
