@@ -1,15 +1,16 @@
 """The tools. Each docstring is the description the model reads, frozen for directory listings: keep them tight.
+Paragraphs are separated by a blank line; server.py joins the lines inside a paragraph, so no line break falls
+mid-sentence in the published description.
 
 server.py registers TOOLS with their titles, annotations and securitySchemes, and counts every call.
 """
 
 from typing import Annotated, Literal
 
-from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, Field, ValidationError
 
 from . import api
-from .schemas import OpportunityDetail, SearchResult
+from .schemas import OpportunityDetail, OpportunityRow, SearchResult
 
 LINK_RULE = (
     "Show each item's url to the user verbatim as a markdown link, [title](url); "
@@ -40,7 +41,9 @@ SetAside = Annotated[str | None, Field(description="Set-aside code, e.g. 'SBA' o
 PostedWithin = Annotated[
     int | None, Field(ge=1, le=180, description="Only items posted in the last N days, 1 to 180 (default 180).")
 ]
-JobsPostedWithin = Annotated[int, Field(ge=1, le=30, description="Only jobs posted in the last N days, 1 to 30.")]
+JobsPostedWithin = Annotated[
+    int, Field(ge=1, le=30, description="Only jobs posted within the last N days, 1 to 30 (default 30).")
+]
 Open = Annotated[
     bool | None,
     Field(description="true (the default): only items with a response deadline of today or later, US Eastern; "
@@ -57,13 +60,30 @@ OppId = Annotated[
 
 
 def _parse(model: type[BaseModel], data: dict) -> BaseModel:
-    """The API's JSON as an output model; a row the model cannot hold is an upstream fault, not a crash."""
+    """The API's JSON as an output model; JSON the model cannot hold is an upstream fault (bad_response), not a
+    crash."""
     try:
         return model.model_validate(data)
     except ValidationError as e:
-        raise ToolError(
-            f"MatchAwards returned an unexpected API response ({e.error_count()} invalid fields). Retry later."
+        raise api.fail(
+            "bad_response",
+            f"MatchAwards returned an unexpected API response ({e.error_count()} invalid fields). Retry later.",
         ) from None
+
+
+def _search_result(out: dict, note: str) -> SearchResult:
+    """api.search's output as a SearchResult. A row the model cannot hold is skipped and counted in `warning`, so
+    one bad row does not fail the search; only a bad envelope does."""
+    rows, skipped = [], 0
+    for row in out["results"]:
+        try:
+            rows.append(OpportunityRow.model_validate(row))
+        except ValidationError:
+            skipped += 1
+    warning = out.get("warning")
+    if skipped:
+        warning = " ".join(filter(None, [warning, f"{skipped} result(s) skipped: unexpected format."]))
+    return _parse(SearchResult, {**out, "results": rows, "warning": warning, "note": note})
 
 
 async def search_contracts(
@@ -86,14 +106,16 @@ async def search_contracts(
     Filters: naics (up to 10 codes), state, keyword (title only), set_aside (federal only), type (federal or
     state), posted_within_days (1 to 180), open (default true), limit (1 to 50, default 20). If has_more is true,
     call again with cursor=next_cursor and the same filters. Example: naics="238160", state="VA", keyword="roof".
+
     Print each result's url, and sam_url for federal notices, as markdown links.
+
     Do not use for grants (search_grants), jobs (search_jobs) or one result's details (get_opportunity).
     """
     out = await api.search(
         type or "contract", naics=naics, state=state, keyword=keyword, set_aside=set_aside,
         posted_within_days=posted_within_days, open=open, limit=limit, cursor=cursor,
     )
-    return _parse(SearchResult, {**out, "note": LINK_RULE})
+    return _search_result(out, LINK_RULE)
 
 
 async def search_grants(
@@ -108,15 +130,19 @@ async def search_grants(
 
     Filters: naics (up to 10 codes), keyword (title only), posted_within_days (1 to 180), open (default true:
     open grants of any age), limit (1 to 50, default 20). Grant notices carry no state. If has_more is true, call
-    again with cursor=next_cursor and the same filters. Example: keyword="broadband". Open status may lag for
-    grants that closed recently, so check response_deadline. Print each result's url as a markdown link.
+    again with cursor=next_cursor and the same filters. Example: keyword="broadband".
+
+    Open status may lag for grants that closed recently, so check response_deadline.
+
+    Print each result's url as a markdown link.
+
     Do not use for contracts to bid on (search_contracts) or jobs (search_jobs).
     """
     out = await api.search(
         "grant", naics=naics, keyword=keyword, posted_within_days=posted_within_days, open=open, limit=limit,
         cursor=cursor,
     )
-    return _parse(SearchResult, {**out, "note": GRANT_NOTE})
+    return _search_result(out, GRANT_NOTE)
 
 
 async def search_jobs(
@@ -127,19 +153,22 @@ async def search_jobs(
     limit: Limit = 20,
     cursor: Cursor = None,
 ) -> SearchResult:
-    """Use this when the user is looking for a job, or for hiring signals, in the last 30 days.
+    """Use this when the user is looking for a job, or for hiring signals, among postings from the last 30 days.
 
-    Filters: naics (up to 10 codes), state, keyword (title only), posted_within_days (1 to 30, default 30), limit
-    (1 to 50, default 20). Rows carry title, agency (the employer), state, city, posted_at and url. If has_more is
-    true, call again with cursor=next_cursor and the same filters. Example: keyword="electrician", state="TX".
+    Filters: naics (up to 10 codes), state, keyword (title only), posted_within_days (posted within the last 1 to
+    30 days, default 30), limit (1 to 50, default 20). Rows carry title, agency (the employer), state, city,
+    posted_at and url. If has_more is true, call again with cursor=next_cursor and the same filters. Example:
+    keyword="electrician", state="TX".
+
     Print each result's url as a markdown link.
+
     Do not use for contracts (search_contracts) or grants (search_grants).
     """
     out = await api.search(
         "job", naics=naics, state=state, keyword=keyword, posted_within_days=posted_within_days, limit=limit,
         cursor=cursor, source=JOB_SOURCE,
     )
-    return _parse(SearchResult, {**out, "note": LINK_RULE})
+    return _search_result(out, LINK_RULE)
 
 
 async def get_opportunity(id: OppId) -> OpportunityDetail:
@@ -147,12 +176,17 @@ async def get_opportunity(id: OppId) -> OpportunityDetail:
 
     Pass the id from a search result. Returns the result's row plus its description (up to 2000 characters) and
     published points of contact (name and title only). Example: id="abc123".
+
     Print url, and sam_url for federal notices, as markdown links.
+
     Do not use for searching (search_contracts, search_grants, search_jobs) or for contact details beyond the
     published names and titles.
     """
     data = await api.get_one(id)
-    return _parse(OpportunityDetail, {**data, "contacts": data.get("contacts") or [], "note": LINK_RULE})
+    # ai and teaming stay null until their models are typed: no untyped upstream text passes through.
+    return _parse(OpportunityDetail, {
+        **data, "contacts": data.get("contacts") or [], "ai": None, "teaming": None, "note": LINK_RULE,
+    })
 
 
 # Registration order is the tools/list order.

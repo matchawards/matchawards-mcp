@@ -93,6 +93,21 @@ async def test_busy_and_internal_error_outcomes(api, usage_db, monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_a_reply_the_tools_cannot_read_is_bad_response(api, usage_db):
+    api.replies = [
+        lambda req: httpx.Response(200, json={"as_of": "x"}),  # no result object
+        lambda req: httpx.Response(200, json={"as_of": "x", "result": {"title": "no id"}}),  # fails the schema
+        lambda req: httpx.Response(200, json={"results": "nope"}),  # a search envelope without a results list
+    ]
+    async with http() as hc:
+        for body in (call("get_opportunity", {"id": "1"}), call("get_opportunity", {"id": "2"}),
+                     call("search_grants", {})):
+            assert (await post(hc, body)).json()["result"]["isError"] is True
+    assert sorted((r["tool"], r["outcome"]) for r in rows(usage_db)) == [
+        ("get_opportunity", "bad_response"), ("get_opportunity", "bad_response"), ("search_grants", "bad_response")]
+
+
+@pytest.mark.anyio
 async def test_rate_limited_calls_leave_no_row(api, usage_db, monkeypatch):
     monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "2")
     async with http() as hc:

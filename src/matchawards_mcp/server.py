@@ -73,7 +73,7 @@ SECURITY_SCHEMES = [{"type": "noauth"}]
 
 
 def _tool(fn, title: str):
-    """Register a read-only tool; its cleaned docstring is the description the model reads, its return model the
+    """Register a read-only tool; its docstring is the description the model reads, its return model the
     outputSchema.
 
     In --http mode each call that reaches the tool is counted and written to the usage ledger: tool name, outcome,
@@ -98,8 +98,10 @@ def _tool(fn, title: str):
                 ledger.submit(usage.Ledger.write_call, fn.__name__, outcome, req["client"], req["ua"],
                               req["family"], req["fp"], round((time.monotonic() - start) * 1000))
 
+    # One line per paragraph: the docstring's wrapping never reaches the published description.
+    description = "\n\n".join(" ".join(p.split()) for p in inspect.cleandoc(fn.__doc__).split("\n\n"))
     return mcp.tool(title=title, annotations=READ_ONLY, meta={"securitySchemes": SECURITY_SCHEMES},
-                    description=inspect.cleandoc(fn.__doc__))(recorded)
+                    description=description)(recorded)
 
 
 for _fn, _title in tools.TOOLS:

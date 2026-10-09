@@ -34,7 +34,8 @@ client = httpx.AsyncClient(
 
 
 def fail(outcome: str, message: str) -> ToolError:
-    """A ToolError tagged with its usage-ledger outcome. An untagged ToolError is recorded as upstream_error."""
+    """A ToolError tagged with its usage-ledger outcome. An untagged ToolError is recorded as upstream_error;
+    bad_response is a reply in a shape the tools cannot read."""
     e = ToolError(message)
     e.outcome = outcome
     return e
@@ -90,8 +91,9 @@ async def get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]
     except ValueError:
         data = None
     if not isinstance(data, dict):
-        raise ToolError(
-            f"MatchAwards returned an unexpected response (HTTP {r.status_code}, not a JSON object). Retry later."
+        raise fail(
+            "bad_response",
+            f"MatchAwards returned an unexpected response (HTTP {r.status_code}, not a JSON object). Retry later.",
         )
     return data
 
@@ -101,7 +103,7 @@ async def get_one(id: str) -> dict[str, Any]:
     data = await get(f"{SEARCH_PATH}/{id}")
     result = data.get("result")
     if not isinstance(result, dict):
-        raise ToolError("MatchAwards returned an unexpected API response (no result object).")
+        raise fail("bad_response", "MatchAwards returned an unexpected API response (no result object).")
     return {**result, "as_of": data.get("as_of")}
 
 
@@ -124,7 +126,8 @@ async def search(type_: str, limit: int = 20, keyword: str | None = None, **filt
             next_page = await get(SEARCH_PATH, {**params, "limit": limit - len(rows)})
             results = next_page.get("results")
             if not isinstance(results, list) or not all(isinstance(r, dict) for r in results):
-                raise ToolError("MatchAwards returned an unexpected API response (results is not a list of objects).")
+                raise fail("bad_response",
+                           "MatchAwards returned an unexpected API response (results is not a list of objects).")
         except ToolError as e:
             if not page:
                 raise  # first page: nothing to return, so the call fails
@@ -134,7 +137,9 @@ async def search(type_: str, limit: int = 20, keyword: str | None = None, **filt
         page = next_page
         as_of = as_of or page.get("as_of")
         for row in results:
-            rows.setdefault(row.get("id"), row)
+            # Deduplicate on string ids; any other id (missing, a number, a list) cannot be valid, so keep each such
+            # row on its own for the tools to skip and count.
+            rows.setdefault(row["id"] if isinstance(row.get("id"), str) else object(), row)
         if len(rows) >= limit or not (page.get("has_more") and page.get("next_cursor")):
             break
         params["cursor"] = page["next_cursor"]

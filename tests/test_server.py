@@ -160,6 +160,21 @@ async def test_malformed_follow_up_page_keeps_rows_with_warning(api):
 
 
 @pytest.mark.anyio
+async def test_bad_rows_are_skipped_and_counted_not_fatal(api):
+    api.replies = [ok({**page([1, 2]), "results": [row(1), {"title": "no id"}, {**row(3), "id": 3}, row(2)]})]
+    out = await run(tools.search_contracts)
+    assert [r["id"] for r in out["results"]] == ["1", "2"]
+    assert out["warning"] == "2 result(s) skipped: unexpected format."
+    # With a paging warning too, both are kept.
+    api.replies = [ok({**page([1], has_more=True, cursor="c1"), "results": [row(1), {"id": None}]}),
+                   lambda req: httpx.Response(500)]
+    out = await run(tools.search_jobs, limit=5)
+    assert out["warning"].startswith("Stopped after 2 rows: MatchAwards server error")
+    assert out["warning"].endswith("call again with next_cursor. 1 result(s) skipped: unexpected format.")
+    assert [r["id"] for r in out["results"]] == ["1"]
+
+
+@pytest.mark.anyio
 async def test_complete_search_has_no_warning(api):
     api.replies = [ok(page([1, 2], has_more=True, cursor="c1"))]
     assert (await tools.search_contracts(limit=2)).warning is None
@@ -177,8 +192,11 @@ async def test_get_opportunity_contacts_and_reserved_fields(api):
     api.replies = [ok({"as_of": "x", "result": {**row(8), "contacts": None}})]
     out = await run(tools.get_opportunity, "8")
     assert (out["contacts"], out["ai"], out["teaming"]) == ([], None, None)  # ai and teaming: declared, not yet filled
-    api.replies = [ok({"as_of": "x", "result": {**row(8), "ai": {"fit": "Good fit.", "generated": True}}})]
-    assert (await run(tools.get_opportunity, "8"))["ai"] == {"fit": "Good fit.", "generated": True}
+    # Sent by the API, but untyped until their models exist: never passed through.
+    api.replies = [ok({"as_of": "x", "result": {**row(8), "ai": {"fit": "Good fit.", "generated": True},
+                                                "teaming": {"angle": "x"}}})]
+    out = await run(tools.get_opportunity, "8")
+    assert (out["ai"], out["teaming"]) == (None, None)
     api.replies = [ok(row(9))]  # old top-level shape: not accepted
     with pytest.raises(ToolError, match="no result object"):
         await tools.get_opportunity("9")
@@ -290,7 +308,9 @@ async def test_every_tool_has_title_annotations_noauth_output_schema_and_descrip
         assert t.meta == {"securitySchemes": [{"type": "noauth"}]}, name
         assert t.output_schema["type"] == "object", name
         assert t.description.startswith("Use this when "), name
-        assert "\nDo not use for " in t.description and "markdown link" in flat(t.description), name
+        assert "\n\nDo not use for " in t.description and "markdown link" in flat(t.description), name
+        # Line breaks only between paragraphs, never inside a sentence (the listing shows them as they are).
+        assert all(p and "\n" not in p and p.endswith(".") for p in t.description.split("\n\n")), name
         assert "oauth2" not in json.dumps(t.model_dump(mode="json", by_alias=True)).lower(), name
     for name in ("search_contracts", "search_grants", "search_jobs"):
         assert "limit (1 to 50" in flat(listed[name].description), name
@@ -312,6 +332,7 @@ async def test_every_tool_has_title_annotations_noauth_output_schema_and_descrip
         **DETAIL, "naics": {"code": "238160", "title": "Roofing Contractors"}, "sam_url": "https://sam.gov/opp/1",
         "no_fixed_deadline": True, "agency_id": "not-declared-yet"}})]),
     ("get_opportunity", {"id": "8"}, [ok({"as_of": "x", "result": row(8)})]),  # no description, no contacts
+    ("search_grants", {}, [ok({**page([]), "results": [row(1), {"id": ["bad"]}]})]),  # one row skipped
 ])
 async def test_structured_content_validates_against_output_schema(api, name, args, replies):
     api.replies = replies
@@ -323,6 +344,19 @@ async def test_structured_content_validates_against_output_schema(api, name, arg
     if "limit" in args:
         assert out.structured_content["warning"].startswith("Stopped after 1 rows")
     assert "agency_id" not in out.structured_content  # undeclared API fields stay out until a model declares them
+
+
+@pytest.mark.anyio
+async def test_no_email_or_phone_reaches_the_output(api):
+    api.replies = [ok({"as_of": "x", "email": "top@example.com", "phone": "202-555-0100", "result": {
+        **DETAIL, "email": "row@example.com", "phone": "202-555-0101",
+        "contacts": [{"name": "Jo Smith", "title": "Contracting Officer", "email": "jo@example.com",
+                      "phone": "202-555-0102"}],
+    }})]
+    out = await server.mcp.call_tool("get_opportunity", {"id": "7"})
+    assert out.structured_content["contacts"] == [{"name": "Jo Smith", "title": "Contracting Officer"}]
+    for text in (json.dumps(out.structured_content), out.content[0].text):
+        assert "email" not in text and "phone" not in text and "@example.com" not in text and "555-01" not in text
 
 
 def test_instructions_carry_the_essentials_in_the_first_512_characters():

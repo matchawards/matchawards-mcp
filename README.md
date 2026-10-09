@@ -156,7 +156,7 @@ With `--http` the server keeps usage stats in a SQLite file (`MATCHAWARDS_USAGE_
 
 What is recorded:
 
-- **Tool calls**: one row per call that reached a tool: time, tool name, outcome (`ok`, `invalid_input`, `upstream_error`, `rate_limited_upstream`, `busy`, `internal_error`), the client network (IPv4 /24 or IPv6 /48), the User-Agent (first 200 characters), its family (`openai-mcp`, `claude-user`, `claude`, `cursor`, ..., `prober` or `other`) and the latency. Calls stopped by the rate limit are counted in a metric, with no row. Arguments the SDK rejects before the tool runs leave no row either; they still count in the transport table as `tools/call`.
+- **Tool calls**: one row per call that reached a tool: time, tool name, outcome (`ok`, `invalid_input`, `upstream_error`, `bad_response` (a reply the tools cannot read), `rate_limited_upstream`, `busy`, `internal_error`), the client network (IPv4 /24 or IPv6 /48), the User-Agent (first 200 characters), its family (`openai-mcp`, `claude-user`, `claude`, `cursor`, ..., `prober` or `other`) and the latency. Calls stopped by the rate limit are counted in a metric, with no row. Arguments the SDK rejects before the tool runs leave no row either; they still count in the transport table as `tools/call`.
 - **Transport, per day**: one counter per client network, JSON-RPC method (known MCP methods only, anything else is `_other`) and `clientInfo` name and version, with the last User-Agent seen. `clientInfo` is read from the first 8 KiB of an `initialize` body, or from `params._meta` (2026-07-28 clients), as the body streams past; the body is not buffered. At most 50 counters per client network and day; past that they fold into `_other`.
 - **ChatGPT callers**: when `MATCHAWARDS_USAGE_SALT` is set and a request carries `x-openai-subject` (ChatGPT's anonymous per-user id), the tool-call row stores a 16-hex HMAC-SHA256 of it, to count distinct ChatGPT callers (`openai-mcp` family only in the stats). `x-openai-session` is not used: it changes per conversation.
 
@@ -188,6 +188,7 @@ The data is US federal and state contract opportunities, grants and jobs from [m
 - Job search covers the last 30 days.
 - Results come newest first. When `has_more` is true, the model can ask for the next page with `cursor`.
 - If the first request of a search fails, the tool returns an error. If a later page fails, the tool returns the rows it already has, with a `warning` that says why it stopped.
+- A result row in an unexpected format is left out and counted in `warning`; the rest of the search is returned.
 - Each API call times out after 10 seconds.
 - The API is rate-limited per IP: 60 requests per minute, plus a burst limit of 20 requests per 5 seconds. One search call can use up to three requests when the filters are narrow and results are sparse. When the limit is reached, the tool returns an error that tells the model how many seconds to wait.
 
