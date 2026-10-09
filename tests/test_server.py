@@ -17,7 +17,7 @@ from matchawards_mcp import api as ma_api
 ROOT = Path(__file__).resolve().parents[1]
 PATH = "/api/public/v1/opportunities"
 TOOLS = ["search_contracts", "search_grants", "search_jobs", "get_opportunity", "lookup_naics", "search_awards",
-         "get_company"]
+         "get_company", "assess_opportunity", "find_teaming_partners"]
 NOTE = tools.LINK_RULE
 
 

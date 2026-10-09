@@ -116,6 +116,22 @@ async def test_an_api_timeout_is_upstream_timeout(api, usage_db):
 
 
 @pytest.mark.anyio
+async def test_a_composite_cut_short_is_partial(api, usage_db):
+    def reply(req):
+        if req.url.path.endswith("/opportunities/1"):
+            return httpx.Response(200, json={"as_of": "x", "result": {
+                "id": "1", "type": "federal", "naics": {"code": "336413"}, "agency_id": "dept_of_the_air_force"}})
+        return httpx.Response(200, json={"results": [], "has_more": True, "next_cursor": "c"})  # sparse: limit hit
+
+    api.replies = [reply]
+    async with http() as hc:
+        for name in ("assess_opportunity", "find_teaming_partners"):
+            assert (await post(hc, call(name, {"id": "1"}))).json()["result"]["isError"] is False
+    assert sorted((r["tool"], r["outcome"]) for r in rows(usage_db)) == [
+        ("assess_opportunity", "partial"), ("find_teaming_partners", "partial")]
+
+
+@pytest.mark.anyio
 async def test_rate_limited_calls_leave_no_row(api, usage_db, monkeypatch):
     monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "2")
     async with http() as hc:

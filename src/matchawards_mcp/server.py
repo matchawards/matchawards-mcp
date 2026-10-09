@@ -41,9 +41,9 @@ from . import __version__, api, tools, usage
 INSTRUCTIONS = (
     "Read-only US government opportunities and awards. Contracts, RFPs: search_contracts; grants: search_grants; "
     "jobs: search_jobs; details: get_opportunity; NAICS: lookup_naics; who won: search_awards; a firm by UEI: "
-    "get_company. Print url, sam_url and source_url as markdown links. Data (SAM.gov, state portals, Grants.gov, "
-    "USAJOBS) may be incomplete. Never call a firm the incumbent. AI-generated text is labelled; keep the label "
-    "when you quote it. "
+    "get_company; bid brief: assess_opportunity; teaming: find_teaming_partners. Print url, sam_url and source_url "
+    "as markdown links. Data (SAM.gov, state portals, Grants.gov, USAJOBS) may be incomplete. Never call a firm the "
+    "incumbent. AI-generated text is labelled; keep the label when you quote it. "
     "When has_more is true, call again with cursor=next_cursor and the same filters. Nothing here needs an account."
 )
 
@@ -115,7 +115,8 @@ def _tool(fn, title: str):
         start, outcome = time.monotonic(), "internal_error"
         try:
             result = await fn(*args, **kwargs)
-            outcome = "ok"
+            # partial: a composite tool's budget or deadline cut it short (it still answers with what it has).
+            outcome = "partial" if getattr(result, "_partial", False) else "ok"
             return result
         except ToolError as e:
             outcome = getattr(e, "outcome", "upstream_error")

@@ -7,7 +7,7 @@ published schema only changes on purpose.
 
 from typing import Annotated
 
-from pydantic import BaseModel, BeforeValidator, Field
+from pydantic import BaseModel, BeforeValidator, Field, PrivateAttr
 
 Text = str | None
 # AI text from the API, cut to 1000 characters (the API cuts it too; a longer value is shortened, not rejected).
@@ -220,3 +220,80 @@ class Company(BaseModel):
     recent_awards: list[AwardRow] = Field(default_factory=list, description="Up to 10, newest first.")
     coverage_note: Text = None
     note: Text = None
+
+
+class OpportunitySummary(BaseModel):
+    id: str = Field(strict=True)
+    type: Text = None
+    title: Text = None
+    agency: Agency = None
+    naics: Naics | None = None
+    set_aside: Text = None
+    state: Text = None
+    response_deadline: Text = Field(None, description="Date, YYYY-MM-DD; null if none.")
+    days_left: int | None = Field(None, description="Days from today (US Eastern) to response_deadline; negative "
+                                  "once it has passed; null without a deadline or with a placeholder date.")
+    open: bool = Field(description="true: the deadline is today or later, US Eastern (no deadline: false).")
+    url: Text = Field(None, description="The posting on matchawards.com. Show it as a markdown link.")
+    sam_url: Text = Field(None, description="The SAM.gov notice (federal only). Show it as a markdown link.")
+
+
+class Winner(BaseModel):
+    name: Text = None
+    uei: Text = Field(None, description="Pass to get_company for the firm's award history.")
+    awards: int = Field(description="Similar awards won, among those read.")
+    total_amount: float | None = Field(None, description="USD, summed over amounts that parse; null if none do.")
+    last_award_date: Text = None
+
+
+class ValueRange(BaseModel):
+    p25: float
+    median: float
+    p75: float
+
+
+class Assessment(BaseModel):
+    as_of: Text = None
+    opportunity: OpportunitySummary
+    naics_match: bool | None = Field(None, description="Whether the opportunity's NAICS is one of my_naics; null "
+                                     "when my_naics was not given.")
+    set_aside_match: bool | None = Field(None, description="Whether the opportunity is set aside for my_set_aside; "
+                                         "null when it was not given. An opportunity without a set-aside is open "
+                                         "to all firms.")
+    ai: AiNotes | None = AI_FIELD
+    similar_awards: list[AwardRow] = Field(description="The 5 newest similar awards.")
+    typical_winners: list[Winner] = Field(description="Up to 5 firms that won similar work, most awards first, "
+                                          "then largest total.")
+    award_value_range: ValueRange | None = Field(None, description="Quartiles of the similar awards' amounts (USD); "
+                                                 "null with fewer than 3 amounts.")
+    awards_read: int = Field(description="Similar awards the figures are based on.")
+    basis: Text = Field(None, description="'same NAICS and agency', 'same NAICS, all agencies', or null (no NAICS).")
+    coverage_note: Text = None
+    note: Text = None
+    warning: Text = Field(None, description="Set when the award lookup was cut short; the figures cover what was "
+                          "read.")
+    _partial: bool = PrivateAttr(False)
+
+
+class Partner(BaseModel):
+    name: Text = None
+    uei: Text = Field(None, description="Pass to get_company for the firm's award history.")
+    awards_count: int
+    total_amount: float | None = Field(None, description="USD, summed over amounts that parse; null if none do.")
+    last_award_date: Text = None
+    agencies: list[str] = Field(default_factory=list, description="Up to 3 agencies it won them from.")
+    why: str = Field(description="Why it is listed, from the award records.")
+
+
+class TeamingPartners(BaseModel):
+    as_of: Text = None
+    opportunity: OpportunitySummary
+    role: str
+    partners: list[Partner] = Field(description="Up to 10 firms that won similar work.")
+    ai_subcontracting: AiText = Field(None, description="AI-generated notes on subcontracting angles for this "
+                                      "opportunity, or null. Label them as AI-generated when you show them.")
+    coverage_note: Text = None
+    note: Text = None
+    warning: Text = Field(None, description="Set when the award lookup was cut short; the list covers what was "
+                          "read.")
+    _partial: bool = PrivateAttr(False)

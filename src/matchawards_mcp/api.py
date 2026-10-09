@@ -162,10 +162,12 @@ async def search(type_: str, limit: int = 20, keyword: str | None = None, *, pat
     for _ in range(pages):
         try:
             # Ask only for what is still missing, so no row is read past the cursor and then dropped.
-            request = get(path, {**params, "limit": min(limit - len(rows), PAGE_LIMIT)})
+            left = None if deadline is None else deadline - asyncio.get_running_loop().time()
             try:
-                left = None if deadline is None else max(0.0, deadline - asyncio.get_running_loop().time())
-                next_page = await asyncio.wait_for(request, left)
+                if left is not None and left <= 0:
+                    raise asyncio.TimeoutError  # out of time: no request
+                next_page = await asyncio.wait_for(get(path, {**params, "limit": min(limit - len(rows), PAGE_LIMIT)}),
+                                                   left)
             except asyncio.TimeoutError:  # not the builtin TimeoutError before Python 3.11
                 raise fail("upstream_timeout", "MatchAwards did not answer within this tool's time limit.") from None
             results = next_page.get("results")
