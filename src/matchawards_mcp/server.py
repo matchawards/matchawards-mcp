@@ -90,7 +90,7 @@ CARD_META = {
     "openai/widgetCSP": {
         "connect_domains": [],
         "resource_domains": [],
-        "redirect_domains": ["https://matchawards.com", "https://sam.gov", "https://www.usaspending.gov"],
+        "redirect_domains": ["https://matchawards.com"],
     },
     "openai/widgetDescription": (
         "A MatchAwards results card: the opportunities found, with agency, place, deadline, set-aside and NAICS. "

@@ -457,7 +457,7 @@ async def test_card_on_lists_the_resource_and_only_the_search_tools_point_at_it(
     assert (ui["domain"], ui["prefersBorder"]) == ("https://matchawards.com", True)
     assert content.meta["openai/widgetCSP"] == {
         "connect_domains": [], "resource_domains": [],
-        "redirect_domains": ["https://matchawards.com", "https://sam.gov", "https://www.usaspending.gov"],
+        "redirect_domains": ["https://matchawards.com"],
     }
 
 
@@ -467,7 +467,7 @@ def test_card_needs_no_network_and_survives_a_strict_csp():
     assert not re.search(r"\bfetch\(|XMLHttpRequest|WebSocket|EventSource|<link|<img|<iframe|\bsrc=|@import|url\(",
                          html)
     # The one URL in the file is the prefix a row link must start with (the link itself comes from the data).
-    assert set(re.findall(r"https?://[^\s\"'<>)]*", html)) == {"https://matchawards.com/"}
+    assert set(re.findall(r"https?://[^\s\"'<>)]*", html)) == {"https://matchawards.com"}
     # No inline event handlers (a host CSP without 'unsafe-hashes' blocks them), no HTML sinks, no eval.
     assert not re.search(r"<[^>]*\son[a-z]+\s*=", html)
     assert not re.search(r"innerHTML|outerHTML|insertAdjacentHTML|document\.write|\beval\(|new Function", CARD_SCRIPT)
