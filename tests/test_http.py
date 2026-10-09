@@ -41,6 +41,12 @@ async def http(host="matchawards.com", headers=None):
         )
 
 
+def global_cap(monkeypatch, n):
+    """MATCHAWARDS_GLOBAL_PER_MIN=n, with the ChatGPT pool lowered to fit (startup refuses a global cap below it)."""
+    monkeypatch.setenv("MATCHAWARDS_GLOBAL_PER_MIN", str(n))
+    monkeypatch.setenv("MATCHAWARDS_EGRESS_PER_MIN", str(n))
+
+
 def ping(hc, ip=None, path="/mcp", subject=None):
     headers = {**LEGACY, **({"X-Real-IP": ip} if ip else {}), **({"x-openai-subject": subject} if subject else {})}
     return hc.post(path, json=PING, headers=headers)
@@ -229,7 +235,7 @@ def test_rate_limiter_key_count_is_bounded():
 
 @pytest.mark.anyio
 async def test_global_cap_applies_to_everyone(monkeypatch):
-    monkeypatch.setenv("MATCHAWARDS_GLOBAL_PER_MIN", "5")
+    global_cap(monkeypatch, 5)
     async with http() as hc:
         assert [(await ping(hc, f"198.51.100.{i}")).status_code for i in range(5)] == [200] * 5
         r = await ping(hc, "198.51.100.200")  # a fresh client, but the server-wide minute is used up
@@ -238,7 +244,7 @@ async def test_global_cap_applies_to_everyone(monkeypatch):
 
 @pytest.mark.anyio
 async def test_requests_rejected_per_client_do_not_use_the_global_budget(monkeypatch):
-    monkeypatch.setenv("MATCHAWARDS_GLOBAL_PER_MIN", "5")
+    global_cap(monkeypatch, 5)
     monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "3")
     async with http() as hc:
         codes = [(await ping(hc, "198.51.100.1")).status_code for _ in range(10)]
@@ -315,7 +321,7 @@ async def test_a_lying_content_length_is_still_capped_by_the_sdk():
 
 @pytest.mark.anyio
 async def test_one_client_hammering_leaves_the_global_budget_open(monkeypatch):
-    monkeypatch.setenv("MATCHAWARDS_GLOBAL_PER_MIN", "11")  # default burst 10: the abuser gets 10 through
+    global_cap(monkeypatch, 11)  # default burst 10: the abuser gets 10 through
     async with http() as hc:
         codes = [(await ping(hc, "198.51.100.66")).status_code for _ in range(1000)]
         assert codes.count(200) == 10 and codes.count(429) == 990
@@ -326,7 +332,8 @@ async def test_one_client_hammering_leaves_the_global_budget_open(monkeypatch):
 @pytest.mark.parametrize("name, value", [
     ("MATCHAWARDS_RATE_PER_MIN", "0"), ("MATCHAWARDS_RATE_BURST", "ten"), ("MATCHAWARDS_GLOBAL_PER_MIN", "-5"),
     ("MATCHAWARDS_RATE_PER_MIN", ""), ("MATCHAWARDS_TRUSTED_PROXIES", "10.0.0.0/33"), ("MATCHAWARDS_RATE_PER_PREFIX_MIN", "0"),
-    ("MATCHAWARDS_GLOBAL_API_PER_MIN", "x"),
+    ("MATCHAWARDS_GLOBAL_API_PER_MIN", "x"), ("MATCHAWARDS_RATE_PER_SUBJECT_MIN", "0"),
+    ("MATCHAWARDS_RATE_SUBJECT_BURST", "x"), ("MATCHAWARDS_EGRESS_PER_MIN", "-1"),
 ])
 def test_bad_env_stops_startup_with_a_clear_message(monkeypatch, name, value):
     monkeypatch.setenv(name, value)
@@ -336,7 +343,7 @@ def test_bad_env_stops_startup_with_a_clear_message(monkeypatch, name, value):
 
 @pytest.mark.anyio
 async def test_rotating_64s_inside_a_56_is_capped_by_the_48_limit(monkeypatch):
-    monkeypatch.setenv("MATCHAWARDS_GLOBAL_PER_MIN", "150")
+    global_cap(monkeypatch, 150)
     async with http() as hc:
         codes = [(await ping(hc, f"2001:db8:0:ab{i % 256:02x}::{i:x}")).status_code for i in range(300)]
         assert codes.count(200) == 120  # MATCHAWARDS_RATE_PER_PREFIX_MIN, not 256 fresh /64 budgets
@@ -364,7 +371,7 @@ def test_prefix_key():
 
 @pytest.mark.anyio
 async def test_a_global_lockout_does_not_use_up_a_clients_own_budget(monkeypatch):
-    monkeypatch.setenv("MATCHAWARDS_GLOBAL_PER_MIN", "3")
+    global_cap(monkeypatch, 3)
     monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "3")
     now = [1000.0]
     monkeypatch.setattr(server, "time", SimpleNamespace(monotonic=lambda: now[0]))  # this module's clock only
@@ -478,15 +485,19 @@ async def test_ipv6_and_ipv4_mapped_egress_addresses(egress, monkeypatch):
 def test_bundled_snapshot_parses():
     nets = server.parse_egress(json.loads(server.EGRESS_SNAPSHOT.read_text()))
     assert len(nets) > 50
+    assert sum(n.num_addresses for n in nets if n.version == 4) * 3 < server.EGRESS_MAX_IPV4  # room to grow
     assert ipaddress.ip_address(str(nets[0].network_address)) in server.EgressRanges(nets)
 
 
 def test_parse_egress_skips_bad_entries(caplog):
     data = {"prefixes": [{"ipv4Prefix": "192.0.2.0/24"}, {"ipv6Prefix": "2001:db8::/48"}, {"ipv4Prefix": "bad"},
                          {"ipv4Prefix": "192.0.2.1/24"}, {"ipv4Prefix": 5}, {"ipv4Prefix": "0.0.0.0/0"},
-                         {"ipv6Prefix": "::/0"}, "x", None, {}]}
-    assert [str(n) for n in server.parse_egress(data)] == ["192.0.2.0/24", "2001:db8::/48"]
-    assert len([r for r in caplog.records if "skipped a bad entry" in r.getMessage()]) == 8
+                         {"ipv6Prefix": "::/0"}, "x", None, {}, {"ipv4Prefix": "10.0.0.0/16"},
+                         {"ipv4Prefix": "10.2.0.0/15"}, {"ipv6Prefix": "2001:db8::/32"},
+                         {"ipv6Prefix": "2001:db8::/31"}]}
+    assert [str(n) for n in server.parse_egress(data)] == [
+        "192.0.2.0/24", "2001:db8::/48", "10.0.0.0/16", "2001:db8::/32"]  # a /16 is accepted, a /15 is not
+    assert len([r for r in caplog.records if "skipped a bad entry" in r.getMessage()]) == 10
     for bad in (None, [], "x", {}, {"prefixes": "x"}, {"prefixes": []}, {"prefixes": [{"ipv4Prefix": "bad"}]}):
         assert server.parse_egress(bad) is None
 
@@ -529,6 +540,7 @@ async def test_a_refresh_replaces_the_list(monkeypatch):
     lambda req: httpx.Response(200, text="not json {"),
     lambda req: httpx.Response(200, json={"prefixes": [{"ipv4Prefix": "0.0.0.0/0"}]}),
     lambda req: httpx.Response(200, json=["192.0.2.0/24"]),
+    lambda req: httpx.Response(200, json={"prefixes": [{"ipv4Prefix": f"10.{i}.0.0/16"} for i in range(3)]}),  # cap
     lambda req: httpx.Response(503, text="down"),
     lambda req: (_ for _ in ()).throw(httpx.ConnectTimeout("timeout")),
 ])
@@ -551,3 +563,65 @@ async def test_the_bundled_snapshot_is_used_when_the_refresh_fails(monkeypatch):
     async with http() as hc:  # conftest: every fetch fails
         assert [(await ping(hc, snapshot_ip, subject=f"u{i}")).status_code for i in range(5)] == [200] * 5
         assert [(await ping(hc, snapshot_ip, subject="u")).status_code for _ in range(4)] == [200] * 3 + [429]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("peer, codes", [
+    ("127.0.0.1", [200] * 5),  # trusted proxy: X-Real-IP is the egress address, so per subject
+    ("203.0.113.66", [200] * 3 + [429] * 2),  # untrusted peer: X-Real-IP ignored, the peer is limited per IP
+])
+async def test_egress_address_counts_only_through_a_trusted_proxy(egress, monkeypatch, peer, codes):
+    monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "3")
+    app = server.http_app()
+    async with app.router.lifespan_context(app):
+        hc = httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app, client=(peer, 5)),
+                                base_url="http://matchawards.com")
+        assert [(await ping(hc, "192.0.2.10", subject=f"u{i}")).status_code for i in range(5)] == codes
+
+
+@pytest.mark.anyio
+async def test_blank_or_overlong_subject_counts_as_absent(egress, monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_RATE_SUBJECT_BURST", "1")
+    async with http() as hc:
+        for subject in (" ", "\t", "x" * 257):  # each would be locked out after 1 if it were a subject
+            assert [(await ping(hc, "192.0.2.10", subject=subject)).status_code for _ in range(3)] == [200] * 3
+        assert [(await ping(hc, "192.0.2.10", subject="x" * 256)).status_code for _ in range(2)] == [200, 429]
+        assert [(await ping(hc, "192.0.2.10", subject=s)).status_code for s in ("u", " u ")] == [200, 429]
+    assert rejected("rate_limit_subject") == 2
+
+
+@pytest.mark.anyio
+async def test_the_first_of_several_subject_headers_is_used(egress, monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_RATE_SUBJECT_BURST", "3")
+    async with http() as hc:
+        async def twice(first, second):
+            headers = [*LEGACY.items(), ("X-Real-IP", "192.0.2.10"),
+                       ("x-openai-subject", first), ("x-openai-subject", second)]
+            return (await hc.post("/mcp", json=PING, headers=headers)).status_code
+        assert [await twice("u", f"other-{i}") for i in range(4)] == [200] * 3 + [429]
+        assert await twice("v", "u") == 200  # "u" second is not counted
+
+
+@pytest.mark.anyio
+async def test_the_pool_rejects_even_when_the_subject_allows(egress, monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_EGRESS_PER_MIN", "3")
+    async with http() as hc:
+        assert [(await ping(hc, "192.0.2.10", subject=f"u{i}")).status_code for i in range(3)] == [200] * 3
+        r = await ping(hc, "192.0.2.10", subject="u0")  # 1 of its 10-per-5-s burst used
+        assert r.status_code == 429 and 1 <= int(r.headers["Retry-After"]) <= 60
+    assert (rejected("rate_limit_egress"), rejected("rate_limit_subject")) == (1, 0)
+
+
+@pytest.mark.parametrize("content", ['{"prefixes": []}', '{"prefixes": [{"ipv4Prefix": "0.0.0.0/0"}]}', "not json"])
+def test_an_unusable_bundled_snapshot_stops_startup(monkeypatch, tmp_path, content):
+    snapshot = tmp_path / "egress.json"
+    snapshot.write_text(content)
+    monkeypatch.setattr(server, "EGRESS_SNAPSHOT", snapshot)
+    with pytest.raises(SystemExit, match="egress list"):
+        server.http_app()
+
+
+def test_a_global_cap_below_the_chatgpt_pool_stops_startup(monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_GLOBAL_PER_MIN", "100")
+    with pytest.raises(SystemExit, match=r"MATCHAWARDS_GLOBAL_PER_MIN \(100\) must not be below MATCHAWARDS_EGRESS"):
+        server.http_app()

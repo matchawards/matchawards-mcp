@@ -489,13 +489,19 @@ EGRESS_URL = "https://openai.com/chatgpt-connectors.json"
 EGRESS_SNAPSHOT = Path(__file__).parent / "data" / "chatgpt-connectors.json"  # bundled; used until a fetch works
 EGRESS_REFRESH_S = 86_400  # after a good fetch
 EGRESS_RETRY_S = 3_600  # after a failed one
+SUBJECT_MAX_LEN = 256  # a longer x-openai-subject counts as absent
+# A whole list covering more IPv4 addresses than this is rejected: the October 2026 snapshot covers 36,439, so
+# this is about 4x that. Every address in the list skips its per-IP limit, so a list grown far past what OpenAI
+# publishes (an error upstream, or a tampered copy) must not take effect. Raise it if OpenAI's list really grows.
+EGRESS_MAX_IPV4 = 150_000
 egress_log = logging.getLogger("matchawards_mcp.egress")
 
 
 def parse_egress(data) -> list | None:
     """The networks in an egress list ({creationTime, prefixes: [{ipv4Prefix | ipv6Prefix: CIDR}]}), or None if
-    there are none. An entry that is not a CIDR string, or is wider than an IPv4 /8 or IPv6 /32 (every client would
-    become a ChatGPT one and skip its per-IP limit), is skipped and logged."""
+    there are none or they cover more than EGRESS_MAX_IPV4 IPv4 addresses (logged). An entry that is not a CIDR
+    string, or is wider than an IPv4 /16 or IPv6 /32 (its clients would all skip their per-IP limit), is skipped
+    and logged."""
     prefixes = data.get("prefixes") if isinstance(data, dict) else None
     nets = []
     for entry in prefixes if isinstance(prefixes, list) else []:
@@ -504,10 +510,13 @@ def parse_egress(data) -> list | None:
             net = ipaddress.ip_network(raw if isinstance(raw, str) else "")
         except ValueError:
             net = None
-        if net is None or net.prefixlen < (8 if net.version == 4 else 32):
+        if net is None or net.prefixlen < (16 if net.version == 4 else 32):
             egress_log.warning("egress list: skipped a bad entry %.100r", entry)
         else:
             nets.append(net)
+    if (total := sum(n.num_addresses for n in nets if n.version == 4)) > EGRESS_MAX_IPV4:
+        egress_log.warning("egress list rejected: %d IPv4 addresses, more than EGRESS_MAX_IPV4", total)
+        return None
     return nets or None
 
 
@@ -521,7 +530,7 @@ async def fetch_egress() -> list | None:
         egress_log.warning("egress list refresh failed, keeping the last good list: %s", type(e).__name__)
         return None
     if nets is None:
-        egress_log.warning("egress list refresh had no valid prefix, keeping the last good list")
+        egress_log.warning("egress list refresh had no usable list, keeping the last good list")
     return nets
 
 
@@ -576,8 +585,7 @@ class HttpGuard:
             return None  # unlimited; the route itself answers 405 to anything but GET/HEAD
         if path != "/mcp":
             return "path", PlainTextResponse("Not Found", status_code=404)
-        headers = {k: v.decode("latin-1") for k, v in scope["headers"]
-                   if k in (b"host", b"content-length", b"x-openai-subject")}
+        headers = {k: v.decode("latin-1") for k, v in scope["headers"] if k in (b"host", b"content-length")}
         if _host_name(headers.get(b"host", "")) not in self.allowed_hosts:
             return "host", PlainTextResponse("Invalid Host header", status_code=421)
         if scope["method"] != "POST":
@@ -601,10 +609,12 @@ class HttpGuard:
             # Its x-openai-subject (one per user) gets the per-client budget instead, inside a pool for all ChatGPT
             # traffic. Trusted only from these addresses (anyone else could pick a fresh subject per request), and
             # never the User-Agent, which anyone can send.
-            subject = headers.get(b"x-openai-subject")
+            # The first header if there are several; blank or longer than SUBJECT_MAX_LEN counts as absent.
+            subject = next((v for k, v in scope["headers"] if k == b"x-openai-subject"), b"").strip()
+            subject = subject if len(subject) <= SUBJECT_MAX_LEN else b""
             checks = [(self.egress_limiter, "egress", "egress"), (self.global_limiter, "all", "global")]
             if subject:
-                digest = hashlib.blake2s(subject.encode("latin-1"), key=_SUBJECT_SALT, digest_size=16).hexdigest()
+                digest = hashlib.blake2s(subject, key=_SUBJECT_SALT, digest_size=16).hexdigest()
                 checks.insert(0, (self.subject_limiter, digest, "subject"))
         else:
             prefix = prefix_key(key)
@@ -712,6 +722,17 @@ def http_app() -> Starlette:
             "MATCHAWARDS_TRUSTED_PROXIES", "127.0.0.1/32,::1/128").split(",") if n.strip()]
     except ValueError as e:
         raise SystemExit(f"MATCHAWARDS_TRUSTED_PROXIES must be comma-separated CIDRs: {e}") from None
+    global_per_min = _env_int("MATCHAWARDS_GLOBAL_PER_MIN", 1200)
+    egress_per_min = _env_int("MATCHAWARDS_EGRESS_PER_MIN", 600)
+    if global_per_min < egress_per_min:
+        raise SystemExit(f"MATCHAWARDS_GLOBAL_PER_MIN ({global_per_min}) must not be below "
+                         f"MATCHAWARDS_EGRESS_PER_MIN ({egress_per_min}): ChatGPT alone could use the whole cap")
+    try:
+        snapshot = parse_egress(json.loads(EGRESS_SNAPSHOT.read_text()))
+    except (OSError, ValueError):
+        snapshot = None
+    if snapshot is None:
+        raise SystemExit(f"the bundled ChatGPT egress list {EGRESS_SNAPSHOT} has no usable prefix (see the log)")
     app = mcp.streamable_http_app(
         streamable_http_path="/mcp",
         stateless_http=True,
@@ -733,12 +754,12 @@ def http_app() -> Starlette:
         prefix_limiter=RateLimiter(_env_int("MATCHAWARDS_RATE_PER_PREFIX_MIN", 120), 0),
         # Not below MATCHAWARDS_EGRESS_PER_MIN: ChatGPT traffic alone can use its whole pool, and everyone else
         # still needs room under the global cap.
-        global_limiter=RateLimiter(_env_int("MATCHAWARDS_GLOBAL_PER_MIN", 1200), 0),
+        global_limiter=RateLimiter(global_per_min, 0),
         # ChatGPT traffic (from OpenAI's egress addresses): per x-openai-subject, and all of it together.
         subject_limiter=RateLimiter(_env_int("MATCHAWARDS_RATE_PER_SUBJECT_MIN", 30),
                                     _env_int("MATCHAWARDS_RATE_SUBJECT_BURST", 10)),
-        egress_limiter=RateLimiter(_env_int("MATCHAWARDS_EGRESS_PER_MIN", 600), 0),
-        egress=EgressRanges(parse_egress(json.loads(EGRESS_SNAPSHOT.read_text()))),
+        egress_limiter=RateLimiter(egress_per_min, 0),
+        egress=EgressRanges(snapshot),
         allowed_hosts={h.lower() for h in hosts},
         trusted_proxies=trusted,
         usage_salt=os.environ.get("MATCHAWARDS_USAGE_SALT", "").encode() or None,
