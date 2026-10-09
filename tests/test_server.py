@@ -484,3 +484,19 @@ def test_card_renders_from_structured_content_and_never_calls_a_tool():
     from matchawards_mcp.schemas import SearchResult
     assert {"results", "has_more", "warning"} <= SearchResult.model_fields.keys()
     assert 'Array.isArray(d.results) && typeof d.has_more === "boolean"' in CARD_SCRIPT
+
+
+@pytest.mark.parametrize("raw, shown", [
+    ("DEPT OF DEFENSE.DEPT OF THE ARMY.AMC.ARMY CONTRACTING COMMAND.ACC-CTRS.W6QK ACC-APG DIR",
+     "Dept of Defense · Dept of the Army"),
+    ("DEFENSE ADVANCED RESEARCH PROJECTS AGENCY  (DARPA)", "Defense Advanced Research Projects Agency (DARPA)"),
+    ("FEDERAL ACQUISITION SERVICE", "Federal Acquisition Service"),
+    ("Department Of Energy   Office Of Science", "Department of Energy Office of Science"),
+    ("U.S. Customs and Border Protection", "U.S. Customs and Border Protection"),
+    ("NASA", "NASA"),
+    ("Fairfax County Purchasing", "Fairfax County Purchasing"),
+    (None, None),
+])
+def test_agency_names_read_as_people_write_them(raw, shown):
+    from matchawards_mcp.schemas import OpportunityRow
+    assert OpportunityRow.model_validate({"id": "1", "agency": raw}).agency == shown

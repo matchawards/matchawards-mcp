@@ -5,11 +5,54 @@ Fields the API adds later are dropped (pydantic's default extra="ignore") until 
 published schema only changes on purpose.
 """
 
+import re
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 Text = str | None
+
+# Kept upper-case when an all-caps agency name is title-cased (tidy_agency).
+ACRONYMS = {
+    "US", "USA", "VA", "NASA", "GSA", "DLA", "DHS", "DOD", "DOE", "DOJ", "DOL", "DOT", "HHS", "HUD", "USDA", "FAA",
+    "FEMA", "NIH", "CDC", "EPA", "IRS", "ICE", "CBP", "TSA", "NOAA", "NIST", "USACE", "AMC", "ACC", "NAVSEA",
+    "NAVFAC", "NAVAIR", "NAVSUP", "DISA", "DARPA", "DHA", "USPS", "SBA", "OPM", "SSA", "FBI", "DEA", "ATF",
+}
+SMALL_WORDS = {"of", "the", "and", "for", "on", "in", "to", "a", "an", "at", "by"}
+
+
+def _title(text: str) -> str:
+    """An all-caps name in title case: acronyms, codes with digits and (PARENTHESISED) tokens kept."""
+    out = []
+    for i, w in enumerate(text.split()):
+        core = w.strip("(),")
+        if core in ACRONYMS or any(c.isdigit() for c in w) or (w.startswith("(") and w.endswith(")")):
+            out.append(w)
+        elif i and w.lower() in SMALL_WORDS:
+            out.append(w.lower())
+        else:
+            out.append(w.lower().capitalize())
+    return " ".join(out)
+
+
+def tidy_agency(value: str | None) -> str | None:
+    """An agency name as people read it: spaces collapsed, 'Of'/'The' mid-name lower-cased, an all-caps name
+    title-cased ('FEDERAL ACQUISITION SERVICE' -> 'Federal Acquisition Service'), and a SAM.gov agency path
+    ('DEPT OF DEFENSE.DEPT OF THE ARMY.AMC...') cut to its first two distinct levels, 'Dept of Defense · Dept of the
+    Army'. Short all-caps acronyms ('NASA') and mixed-case names otherwise stay as they are."""
+    if not value:
+        return value
+    text = " ".join(value.split())
+    letters = [c for c in text if c.isalpha()]
+    if letters and all(c.isupper() for c in letters):
+        if "." in text and "U.S." not in text:  # a SAM path: its top two levels, without repeats
+            levels = []
+            for part in (p.strip() for p in text.split(".")):
+                if part and part not in levels:
+                    levels.append(part)
+            return " · ".join(_title(p) for p in levels[:2])
+        return text if " " not in text and len(text) <= 6 else _title(text)
+    return " ".join(w.lower() if i and w in ("Of", "The", "And", "For") else w for i, w in enumerate(text.split()))
 
 
 class Naics(BaseModel):
@@ -40,6 +83,11 @@ class OpportunityRow(BaseModel):
     url: Text = Field(None, description="The posting on matchawards.com. Show it as a markdown link.")
     sam_url: Text = Field(None, description="The SAM.gov notice (federal only). Show it as a markdown link.")
     solicitation_number: Text = None
+
+    @field_validator("agency")
+    @classmethod
+    def _tidy_agency(cls, v: str | None) -> str | None:
+        return tidy_agency(v)
 
 
 class SearchResult(BaseModel):

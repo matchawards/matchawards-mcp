@@ -23,7 +23,7 @@ var FIXTURES = {
       opp(2, { type: "state", title: "HVAC maintenance and repair services for county administration buildings, " +
         "public libraries and recreation centers, multi-year term contract", agency: "Fairfax County Purchasing",
         city: "Fairfax", response_deadline: day(0) }),
-      opp(3, { agency: "DEPT OF DEFENSE.DEPT OF THE ARMY.AMC.ARMY CONTRACTING COMMAND.ACC-CTRS.W6QK ACC-APG DIR",
+      opp(3, { agency: "Dept of Defense · Dept of the Army",
         set_aside: "Service-Disabled Veteran-Owned Small Business (SDVOSB) Set-Aside (FAR 19.14)", city: null,
         state: null, response_deadline: day(45) }),
       opp(4, { response_deadline: day(-1), title: "Closed: parking lot resurfacing" }),
