@@ -123,9 +123,19 @@ async def test_assess_falls_back_to_all_agencies_and_says_so(api):
     assert [p.get("agency") for p in params(api, AWARDS)] == ["dept_of_the_air_force", None]
     assert out["basis"] == "same NAICS, all agencies" and out["sample"]["awards_read"] == 2
     assert tools.NO_UEI_NOTE not in out["note"]  # both firms have a UEI
-    assert "No NAICS 336413 awards from this agency were found, so similar awards cover all agencies." in out["note"]
+    assert ("No NAICS 336413 awards from this agency were found in the newest records, so similar awards cover all "
+            "agencies.") in out["note"]
     assert (out["naics_match"], out["set_aside_match"], out["ai"], out["award_value_range"]) == (None, None, None, None)
     assert tools.AI_NOTE not in out["note"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("tool", ["assess_opportunity", "find_teaming_partners"])
+async def test_a_malformed_agency_id_on_the_opportunity_is_never_sent(api, tool):
+    api.replies = [router(detail(agency_id="foo,bar"),
+                          {(None, None): [results(ROWS[:2])], (None, "OK"): [results(ROWS[:2])]})]
+    await call(tool, {"id": OPP["id"]})
+    assert params(api, AWARDS) and all("agency" not in p for p in params(api, AWARDS))
 
 
 @pytest.mark.anyio

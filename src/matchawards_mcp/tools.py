@@ -487,14 +487,14 @@ async def assess_opportunity(
     if not code:
         notes.append("This opportunity has no NAICS code, so no similar awards were looked up.")
     else:
-        if opp.agency_id:
+        if opp.agency_id and api.AGENCY_ID.fullmatch(opp.agency_id):
             used = await _awards(budget, type_, naics=code, agency=opp.agency_id)
             errors.append(used.error)
             basis = "same NAICS and agency"
         if (used is None or not used.rows) and budget["pages"] > 0:
             if used is not None and not used.error:
-                notes.append(f"No NAICS {code} awards from this agency were found, so similar awards cover all "
-                             "agencies.")
+                notes.append(f"No NAICS {code} awards from this agency were found in the newest records, so similar "
+                             "awards cover all agencies.")
             used = await _awards(budget, type_, naics=code)
             errors.append(used.error)
             basis = "same NAICS, all agencies"
@@ -556,7 +556,7 @@ async def find_teaming_partners(
     queries = []  # (where the awards are, filters), run while award pages are left
     if code and opp.state and re.fullmatch(r"[A-Za-z]{2}", opp.state):
         queries.append((f"in {opp.state.upper()}", {"state": opp.state}))
-    if code and opp.agency_id:
+    if code and opp.agency_id and api.AGENCY_ID.fullmatch(opp.agency_id):
         queries.append((f"at {api.clean(opp.agency or 'this agency')}", {"agency": opp.agency_id}))
     ran, notes = [], []  # ran: (place, _Query)
     for place, filters in queries:
