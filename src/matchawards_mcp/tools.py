@@ -438,9 +438,9 @@ def _firms(rows: list[AwardRow]) -> list[dict]:
     # same firm, recorded once with and once without its UEI); with two such groups the name is ambiguous, so not.
     by_name: dict[str, list[str]] = {}
     for key, f in firms.items():
-        if f["uei"]:
-            by_name.setdefault(_name_key(f["name"]), []).append(key)
-    for key in [k for k in firms if k.startswith("name:")]:
+        if f["uei"] and (name_key := _name_key(f["name"] or "")):  # a UEI firm with no usable name takes no rows
+            by_name.setdefault(name_key, []).append(key)
+    for key in [k for k in firms if k.startswith("name:") and k != "name:"]:
         if len(owners := by_name.get(key[len("name:"):], [])) == 1:
             firms[owners[0]]["rows"].extend(firms.pop(key)["rows"])
     for f in firms.values():

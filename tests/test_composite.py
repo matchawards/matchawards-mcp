@@ -453,3 +453,10 @@ def test_rows_without_a_uei_join_the_one_uei_firm_of_the_same_name():
     split = tools._firms([row(1, "ACME LLC", "AAAAAAAAAAAA", 1.0), row(2, "ACME LLC", "BBBBBBBBBBBB", 1.0),
                           row(3, "Acme, LLC", None, 1.0)])
     assert sorted((f["uei"] or "-", f["count"]) for f in split) == [("-", 1), ("AAAAAAAAAAAA", 1), ("BBBBBBBBBBBB", 1)]
+    # A UEI firm without a name, and a blank name, never take or give rows (and don't crash).
+    odd = tools._firms([row(1, None, "CCCCCCCCCCCC", 1.0), row(2, "   ", None, 2.0),
+                        row(3, "   ", "DDDDDDDDDDDD", 3.0)])
+    assert sorted((f["uei"] or "-", f["count"]) for f in odd) == [("-", 1), ("CCCCCCCCCCCC", 1), ("DDDDDDDDDDDD", 1)]
+    # Dates and totals follow the merged rows.
+    [f] = tools._firms([row(1, "Delta Corp", "EEEEEEEEEEEE", 10.0), row(5, "DELTA CORP.", None, 30.0)])
+    assert (f["count"], f["total"], f["first"], f["last"], f["typical"]) == (2, 40.0, "2026-01-01", "2026-01-05", 20.0)
