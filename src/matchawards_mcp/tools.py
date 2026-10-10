@@ -434,6 +434,15 @@ def _firms(rows: list[AwardRow]) -> list[dict]:
         f = firms.setdefault(uei.upper() if uei else f"name:{_name_key(name)}",
                              {"name": name, "uei": uei, "rows": []})
         f["rows"].append(r)
+    # A firm's rows without a UEI join its UEI group when exactly one UEI group has the same normalised name (the
+    # same firm, recorded once with and once without its UEI); with two such groups the name is ambiguous, so not.
+    by_name: dict[str, list[str]] = {}
+    for key, f in firms.items():
+        if f["uei"]:
+            by_name.setdefault(_name_key(f["name"]), []).append(key)
+    for key in [k for k in firms if k.startswith("name:")]:
+        if len(owners := by_name.get(key[len("name:"):], [])) == 1:
+            firms[owners[0]]["rows"].extend(firms.pop(key)["rows"])
     for f in firms.values():
         amounts = [r.amount for r in f["rows"] if r.amount is not None]
         dates = [r.award_date for r in f["rows"] if _date(r.award_date)]

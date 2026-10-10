@@ -438,3 +438,18 @@ async def test_an_invalid_upstream_naics_code_is_not_sent(api):
     api.replies = [router(detail(naics={"code": "33641,3", "title": "x"}), {})]
     out = await tools.assess_opportunity(OPP["id"])
     assert params(api, AWARDS) == [] and out.basis is None
+
+
+def test_rows_without_a_uei_join_the_one_uei_firm_of_the_same_name():
+    from matchawards_mcp.schemas import AwardRow
+
+    def row(i, name, uei, amount):
+        return AwardRow.model_validate({"id": str(i), "awardee": {"name": name, "uei": uei}, "amount": amount,
+                                        "award_date": "2026-01-0%d" % i})
+
+    merged = tools._firms([row(1, "PTI PACIFICA INC", "RMHYV9GDTJD4", 10.0), row(2, "PTI Pacifica, Inc", None, 5.0)])
+    assert [(f["uei"], f["count"], f["total"]) for f in merged] == [("RMHYV9GDTJD4", 2, 15.0)]
+    # Two firms with different UEIs share the name: the row without a UEI can't be placed, so it stays on its own.
+    split = tools._firms([row(1, "ACME LLC", "AAAAAAAAAAAA", 1.0), row(2, "ACME LLC", "BBBBBBBBBBBB", 1.0),
+                          row(3, "Acme, LLC", None, 1.0)])
+    assert sorted((f["uei"] or "-", f["count"]) for f in split) == [("-", 1), ("AAAAAAAAAAAA", 1), ("BBBBBBBBBBBB", 1)]
