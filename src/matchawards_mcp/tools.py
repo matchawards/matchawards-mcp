@@ -550,7 +550,8 @@ async def find_teaming_partners(
     Pass the id from a search result, and optionally role (sub, prime or any). Returns up to 10 firms from
     MatchAwards' award records (same NAICS in the opportunity's state, then at its agency, else anywhere; sample
     gives the dates covered and whether every matching record was read), ranked by how many similar awards they
-    won, each with a why line; get_company(uei) shows the history of a firm with a uei. No contact details. Award records may be
+    won, each with a why line; get_company(uei) shows the history of a firm with a uei. No contact details.
+    Award records may be
     incomplete, so say so; ai_subcontracting is AI-generated, so label it. Never call a firm the incumbent.
     Example: id="117412688283576625".
 
