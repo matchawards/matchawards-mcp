@@ -415,15 +415,25 @@ async def test_show_results_fetches_each_id_once_in_order_and_reports_missing(ap
     assert [r.id for r in out.results] == ["4", "1", "5"]
     assert out.missing == ["2", "3"]
     assert sorted(r.url.path.rsplit("/", 1)[1] for r in api.requests) == ["1", "2", "3", "4", "5"]  # "1" once
-    assert out.note == tools.LINK_RULE and out.as_of == "2026-10-12T09:00:00Z"
+    assert out.note == tools.LINK_RULE + " " + tools.NOT_SHOWN_NOTE and out.as_of == "2026-10-12T09:00:00Z"
     assert not out._partial
 
 
 @pytest.mark.anyio
-async def test_show_results_all_missing_is_not_an_error(api):
+async def test_show_results_with_only_job_or_unknown_ids_says_which_ids_it_takes(api):
+    # An award id (from search_awards) is not an opportunity: the API answers 404 for it.
     api.replies = by_id(_9=NOT_FOUND, _8=httpx.Response(200, json=opp(8, "job")))
-    out = await tools.show_results(["9", "8"])
-    assert out.results == [] and out.missing == ["9", "8"]
+    with pytest.raises(ToolError) as e:
+        await tools.show_results(["9", "8"])
+    assert e.value.outcome == "invalid_input"
+    for needle in ("search_contracts", "search_grants", "search_jobs", "search_awards"):
+        assert needle in str(e.value), needle
+
+
+@pytest.mark.anyio
+async def test_show_results_without_missing_ids_keeps_the_plain_note(api):
+    api.replies = by_id(_1=httpx.Response(200, json=opp(1, "federal")))
+    assert (await tools.show_results(["1"])).note == tools.LINK_RULE
 
 
 @pytest.mark.anyio

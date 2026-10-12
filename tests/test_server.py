@@ -407,7 +407,7 @@ def test_instructions_steer_to_one_multi_naics_search_and_the_cursor():
     assert "call again with that cursor before saying nothing exists" in server.INSTRUCTIONS
     assert "show_results" not in server.INSTRUCTIONS  # the card tool is not there without widgets
     assert len(server.INSTRUCTIONS) <= 1024
-    for name in ("search_contracts", "search_grants"):
+    for name in ("search_contracts", "search_grants", "search_jobs", "search_awards"):
         doc = " ".join(getattr(tools, name).__doc__.split())  # as published: one line per paragraph
         assert "Pass several NAICS codes in one call" in doc and "show_results" not in doc, name
 

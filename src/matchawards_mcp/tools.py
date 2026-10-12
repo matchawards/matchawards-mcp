@@ -182,7 +182,7 @@ async def search_jobs(
     Filters: naics (up to 10 codes), state, keyword (title only), posted_within_days (posted within the last 1 to
     30 days, default 30), limit (1 to 50, default 20). Rows carry title, agency (the employer), state, city,
     posted_at and url. If has_more is true, call again with cursor=next_cursor and the same filters. Example:
-    keyword="electrician", state="TX".
+    keyword="electrician", state="TX". Pass several NAICS codes in one call.
 
     Print each result's url as a markdown link.
 
@@ -274,7 +274,7 @@ async def search_awards(
     agency it matched), state, awardee (part of a name), uei, keyword (matched in the title; a grant award's title
     is its recipient's name), awarded_within_days (1 to 1095, default 365), limit (1 to 50, default 20). If
     has_more is true, call again with cursor=next_cursor and the same filters. Example: naics="541512",
-    agency="Department of Veterans Affairs".
+    agency="Department of Veterans Affairs". Pass several NAICS codes in one call.
 
     Award records may be incomplete, so say so. Head a grant award with its awardee name and CFDA number, not its
     title. Pass an awardee's uei to get_company for its full history.
@@ -639,6 +639,8 @@ SHOW_MAX = 10  # ids per show_results call, each one API request
 # one call, with the searches around it, under the API's per-IP burst limit (20 requests per 5 seconds).
 SHOW_CONCURRENCY = 5
 SHOWN_TYPES = ("federal", "state", "grant")  # the card shows contracts and grants, never jobs
+NOT_SHOWN_NOTE = ("show_results shows contracts and grants: ids from search_contracts or search_grants. Ids from "
+                  "search_jobs or search_awards, and unknown ids, are not shown.")
 
 
 async def show_results(
@@ -646,10 +648,11 @@ async def show_results(
                                       description="Ids from search results, in the order to show them.")],
 ) -> ShownResults:
     """Use this last, after searching, to show the user the opportunities you picked as a card. Pass up to 10
-    ids from search_contracts or search_grants results, best first. The card lists them; do not repeat the list
-    in your reply.
+    ids from search_contracts or search_grants results, best first. Keep your reply to a short summary; the card
+    shows the rows.
 
-    Do not use to search (search_contracts, search_grants) or for one result's details (get_opportunity)."""
+    Ids from search_jobs or search_awards are not shown. Do not use to search (search_contracts, search_grants) or
+    for one result's details (get_opportunity)."""
     order = list(dict.fromkeys(ids))  # a repeated id is fetched and shown once
     slots = asyncio.Semaphore(SHOW_CONCURRENCY)
 
@@ -671,12 +674,15 @@ async def show_results(
               if isinstance(g, ToolError) and getattr(g, "outcome", None) != "invalid_input"}
     if failed and not shown:
         raise next(iter(failed.values()))
+    if not shown:  # every id is unknown, a job or an award id (the opportunity lookup answers 404 for those)
+        raise api.fail("invalid_input", NOT_SHOWN_NOTE)
+    missing = [i for i in order if i not in shown and i not in failed]
     out = ShownResults(
         as_of=next((data.get("as_of") for data, _ in shown.values() if data.get("as_of")), None),
         results=[row for _, row in shown.values()],
-        missing=[i for i in order if i not in shown and i not in failed],
+        missing=missing,
         failed=list(failed),
-        note=LINK_RULE,
+        note=LINK_RULE + " " + NOT_SHOWN_NOTE if missing else LINK_RULE,
         warning=f"{len(failed)} could not be fetched (MatchAwards was busy or failed); call show_results again with "
                 "just those ids to add them." if failed else None,
     )
