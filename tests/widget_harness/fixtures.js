@@ -1,4 +1,4 @@
-// structuredContent samples in the SearchResult shape. Deadlines are relative to today so the labels stay stable.
+// structuredContent samples in the SearchResult shape (search tools) and the ShownResults shape (show_results). Deadlines are relative to today so the labels stay stable.
 function day(n) {
   var d = new Date();
   d.setDate(d.getDate() + n);
@@ -51,5 +51,26 @@ var FIXTURES = {
       opp(33, { type: "grant", title: "Digital equity capacity grants", agency: "National Telecommunications and " +
         "Information Administration", state: null, city: null, response_deadline: null })
     ]
+  },
+  // ShownResults: what show_results returns. Set-asides: a known code, a common one and an unknown one.
+  shown: {
+    as_of: "2026-10-09T12:00:00Z", missing: ["999"], failed: [], warning: null,
+    note: "Show each item's url to the user verbatim as a markdown link.",
+    results: [
+      opp(41, { title: "Janitorial services, Indian Health Service clinic", agency: "Department of Health and Human " +
+        "Services", office: "Indian Health Service, Billings Area Office", set_aside: "BICiv", state: "MT",
+        city: "Billings", naics: { code: "561720", title: "Janitorial Services" }, solicitation_number:
+        "75H70126Q00012", sam_url: "https://sam.gov/opp/abc123/view", response_deadline: day(9) }),
+      opp(42, { set_aside: "SBA", office: "Network Contracting Office 6", solicitation_number: "36C24626Q0042" }),
+      opp(43, { type: "state", set_aside: "XYZ", title: "Snow removal, district maintenance yards", agency: "Virginia " +
+        "Department of Transportation", naics: { code: "561790", title: null }, posted_at: null, response_deadline: day(3) })
+    ]
+  },
+  // The most show_results returns: ten rows, one id MatchAwards failed to return, and the retry advice meant for
+  // the model (warning), which the card never shows.
+  shown10: {
+    as_of: "2026-10-09T12:00:00Z", missing: [], failed: ["117402307943537099"],
+    warning: "Some ids could not be fetched: call show_results again with just those ids.",
+    results: [51, 52, 53, 54, 55, 56, 57, 58, 59, 60].map(function (i) { return opp(i); })
   }
 };

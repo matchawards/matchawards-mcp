@@ -11,9 +11,12 @@
   fixture: a key of FIXTURES (fixtures.js). theme: light or dark. mode:
     bridge  answers ui/initialize, then sends the fixture as ui/notifications/tool-result
     late    the same, with the result 1.5 s later
-    openai  no bridge; window.openai.toolOutput carries the fixture (the ChatGPT compatibility layer)
-    none    no bridge and no result at all
-  Every message from the card is kept in window.messages.
+    openai    no bridge; window.openai.toolOutput carries the fixture (the ChatGPT compatibility layer)
+    nobridge  no bridge; window.openai carries the fixture and the theme only (a host that can't send messages)
+    nomessage the bridge, without the message capability
+    none      no bridge and no result at all
+  Every message from the card is kept in window.messages; the actions alone (everything except the handshake
+  and size notifications) also in window.__sent.
 -->
 <style>
   body { margin: 0; padding: 16px; font: 14px system-ui, sans-serif; background: #F7F7F8; }
@@ -30,15 +33,22 @@
   var fixture = FIXTURES[q.get("fixture") || "full"];
   var theme = q.get("theme") || "light", mode = q.get("mode") || "bridge";
   if (theme === "dark") document.body.className = "dark";
-  window.messages = [];
+  window.messages = []; window.__sent = [];
+  var PLUMBING = ["ui/initialize", "ui/notifications/initialized", "ui/notifications/size-changed"];
   var frame = document.getElementById("card");
   // What a host does: an opaque-origin sandbox with a CSP that allows nothing from the network.
   var csp = "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; " +
     "script-src 'unsafe-inline'; style-src 'unsafe-inline'\">";
-  var openai = mode !== "openai" ? "" : "<script>window.openai = { theme: " + JSON.stringify(theme) +
+  var openai = "";
+  if (mode === "openai") openai = "<script>window.openai = { theme: " + JSON.stringify(theme) +
     ", toolOutput: " + JSON.stringify(fixture) + ", " +
     "sendFollowUpMessage: function (a) { parent.postMessage({ openai: 'sendFollowUpMessage', args: a }, '*'); }, " +
-    "openExternal: function (a) { parent.postMessage({ openai: 'openExternal', args: a }, '*'); } };<\/script>";
+    "openExternal: function (a) { parent.postMessage({ openai: 'openExternal', args: a }, '*'); }, " +
+    "notifyIntrinsicHeight: function (h) { parent.postMessage({ openai: 'notifyIntrinsicHeight', args: h }, '*'); } " +
+    "};<\/script>";
+  if (mode === "nobridge") openai = "<script>window.openai = { theme: " + JSON.stringify(theme) +
+    ", toolOutput: " + JSON.stringify(fixture) + " };<\/script>";
+  if (mode === "nobridge") frame.style.height = "640px";  // nothing reports a height in this mode
   var html = await (await fetch("../../src/matchawards_mcp/data/results-v2.html")).text();
   frame.srcdoc = html.replace("<head>", "<head>" + csp + openai);
 
@@ -47,11 +57,14 @@
     if (event.source !== frame.contentWindow) return;
     var m = event.data;
     window.messages.push(m);
+    if (m && m.openai === "notifyIntrinsicHeight") { frame.style.height = (m.args + 2) + "px"; return; }
+    if (m && PLUMBING.indexOf(m.method) < 0) window.__sent.push(m);
     if (!m || m.jsonrpc !== "2.0") return;
     if (m.method === "ui/initialize") {
-      if (mode === "bridge" || mode === "late") send({ jsonrpc: "2.0", id: m.id, result: {
+      if (mode === "bridge" || mode === "late" || mode === "nomessage") send({ jsonrpc: "2.0", id: m.id, result: {
         protocolVersion: "2026-01-26", hostInfo: { name: "harness", version: "1" },
-        hostCapabilities: { message: {}, openLinks: {} }, hostContext: { theme: theme }
+        hostCapabilities: mode === "nomessage" ? { openLinks: {} } : { message: {}, openLinks: {} },
+        hostContext: { theme: theme }
       } });
     } else if (m.method === "ui/notifications/initialized") {
       var result = { jsonrpc: "2.0", method: "ui/notifications/tool-result",

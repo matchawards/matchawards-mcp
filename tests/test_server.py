@@ -500,6 +500,20 @@ def test_card_renders_from_structured_content_and_never_calls_a_tool():
             in CARD_SCRIPT)
     assert '" could not be shown."' in CARD_SCRIPT
     assert "Array.isArray(d.failed)" in CARD_SCRIPT  # failed counts with missing; old payloads have no failed
+    # show_results' warning is retry advice for the model: the card shows it only for a search page.
+    assert "!shown && str(d.warning)" in CARD_SCRIPT
+
+
+def test_card_rows_expand_and_ask_is_throttled():
+    # A row expands in place (announced); the two actions live in its panel; one ask per 8 s across the card.
+    assert 'setAttribute("aria-expanded"' in CARD_SCRIPT and 'setAttribute("aria-controls"' in CARD_SCRIPT
+    assert "var ASK_PAUSE = 8000;" in CARD_SCRIPT
+    assert "if (Date.now() < askedUntil) return;" in CARD_SCRIPT
+    assert "canMessage() && id" in CARD_SCRIPT  # no Ask button when the host can't send messages
+    assert "var MAX_SHOWN = 10;" in CARD_SCRIPT  # every id show_results takes
+    assert 'BICiv: "Buy Indian (civilian)"' in CARD_SCRIPT
+    # ChatGPT's sizing hint, feature-detected.
+    assert 'typeof o.notifyIntrinsicHeight === "function"' in CARD_SCRIPT
 
 
 @pytest.mark.anyio
