@@ -5,6 +5,7 @@ Fields the API adds later are dropped (pydantic's default extra="ignore") until 
 published schema only changes on purpose.
 """
 
+import re
 from typing import Annotated
 
 from pydantic import BaseModel, BeforeValidator, Field, PrivateAttr
@@ -15,6 +16,17 @@ AiText = Annotated[
     Annotated[str, Field(max_length=1000)] | None, BeforeValidator(lambda v: v[:1000] if isinstance(v, str) else v)
 ]
 Agency = Annotated[str | None, BeforeValidator(lambda v: tidy_agency(v) if isinstance(v, str) else v)]
+
+
+def _six_digit_codes(v) -> list[str] | None:
+    """matched_naics from the API, read leniently: a list (or one code) of six-digit codes; anything else is dropped
+    rather than failing the row."""
+    items = [v] if isinstance(v, str) else v if isinstance(v, list) else []
+    codes = [c.strip() for c in items if isinstance(c, str) and re.fullmatch(r"\s*\d{6}\s*", c)]
+    return codes or None
+
+
+MatchedNaics = Annotated[list[str] | None, BeforeValidator(_six_digit_codes)]
 
 # Kept upper-case when an all-caps agency name is title-cased (tidy_agency).
 ACRONYMS = {
@@ -79,7 +91,7 @@ class OpportunityRow(BaseModel):
     agency_id: Text = Field(None, description="The agency's MatchAwards id.")
     office: Text = None
     naics: Naics | None = None
-    matched_naics: list[str] | None = Field(
+    matched_naics: MatchedNaics = Field(
         None, description="Only when you filtered by naics: the requested codes this record carries. It matches if any "
         "of its NAICS codes does; naics shows its primary code, which may differ.")
     set_aside: Text = None
@@ -188,7 +200,7 @@ class AwardRow(BaseModel):
     agency: Agency = None
     agency_id: Text = None
     naics: Naics | None = None
-    matched_naics: list[str] | None = Field(
+    matched_naics: MatchedNaics = Field(
         None, description="Only when you filtered by naics: the requested codes this record carries. It matches if any "
         "of its NAICS codes does; naics shows its primary code, which may differ.")
     set_aside: Text = None

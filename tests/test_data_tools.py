@@ -599,3 +599,12 @@ def test_naics_filter_says_it_matches_any_of_a_notices_codes():
     assert "any of" in desc and "matched_naics" in desc
     for model in (schemas.OpportunityRow, schemas.AwardRow):
         assert "primary" in model.model_fields["matched_naics"].description
+
+
+@pytest.mark.parametrize("raw, kept", [
+    (["238160", "x", 541512, "12345", " 236220 "], ["238160", "236220"]), ("238160", ["238160"]),
+    ("junk", None), (42, None), ([], None), (None, None),
+])
+def test_matched_naics_keeps_only_six_digit_codes_and_never_fails_the_row(raw, kept):
+    from matchawards_mcp import schemas
+    assert schemas.OpportunityRow.model_validate({"id": "1", "matched_naics": raw}).matched_naics == kept
