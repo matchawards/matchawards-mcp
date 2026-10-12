@@ -1,4 +1,4 @@
-"""Usage stats for --http mode: a SQLite ledger, in-memory Prometheus counters and the `stats` command.
+"""Usage stats for --http mode: a SQLite ledger, in-memory Prometheus metrics and the `stats` command.
 
 Never recorded: tool arguments, request bodies (only the JSON-RPC method and clientInfo are read from the first
 8 KiB of a request), full client addresses (IPv4 is kept per /24, IPv6 per /48) and raw header values.
@@ -15,6 +15,7 @@ import os
 import sqlite3
 import sys
 import threading
+import time
 import typing
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -111,28 +112,96 @@ def fingerprint(headers: dict[bytes, bytes], salt: bytes | None) -> str | None:
     return hmac.new(salt, value, hashlib.sha256).hexdigest()[:16]
 
 
+BUCKETS = (0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30)  # seconds; +Inf is implied
+WINDOWS = (("1h", 3600), ("24h", 86400))
+# Lowercase substring of clientInfo.name -> label. First match wins.
+CLIENT_BUCKETS = (("chatgpt", "chatgpt"), ("openai", "chatgpt"), ("claude", "claude"), ("cursor", "cursor"),
+                  ("visual studio code", "vscode"), ("vscode", "vscode"), ("n8n", "n8n"),
+                  ("matchawards", "matchawards"), ("inspector", "mcp-inspector"))
+
+
+def client_bucket(name: str) -> str:
+    """The clientInfo name folded into a fixed label set, so a caller cannot mint new series."""
+    low = (name or "").strip().lower()
+    if not low:
+        return "unknown"
+    return next((b for word, b in CLIENT_BUCKETS if word in low), "other")
+
+
+class Distinct:
+    """Distinct callers seen in the last hour and day. In memory only (a restart resets it), keyed by a salted hash.
+
+    At most MAX_KEYS per kind: past that the least recently seen key is dropped and counted as an eviction."""
+
+    MAX_KEYS = 100_000
+    KINDS = ("client", "chatgpt_subject")
+
+    def __init__(self):
+        self.salt = os.urandom(16)  # per process: the hashes cannot be matched across restarts or to the ledger
+        self.seen = {k: {} for k in self.KINDS}  # kind -> {hash: last seen (monotonic)}, least recent first
+        self.evicted = {k: 0 for k in self.KINDS}
+        self.lock = threading.Lock()
+
+    def see(self, kind: str, key: str) -> None:
+        h = hashlib.blake2s(key.encode(), key=self.salt, digest_size=8).hexdigest()
+        now = time.monotonic()
+        with self.lock:
+            seen = self.seen[kind]
+            seen.pop(h, None)
+            seen[h] = now
+            cutoff = now - WINDOWS[-1][1]
+            while seen and (next(iter(seen.values())) < cutoff or len(seen) > self.MAX_KEYS):
+                if next(iter(seen.values())) >= cutoff:  # still in the window: dropped for room, not age
+                    self.evicted[kind] += 1
+                seen.pop(next(iter(seen)))
+
+    def count(self, kind: str, window_s: int) -> int:
+        cutoff = time.monotonic() - window_s
+        with self.lock:
+            return sum(1 for t in self.seen[kind].values() if t >= cutoff)
+
+
+distinct = Distinct()
+
+
+def _labels(pairs) -> str:
+    return ",".join(f'{k}="{v.replace(chr(92), chr(92) * 2).replace(chr(34), chr(92) + chr(34))}"' for k, v in pairs)
+
+
 class Metrics:
-    """Counters for the Prometheus text format. Every label value comes from a fixed set."""
+    """Counters and a histogram for the Prometheus text format, plus the distinct-caller gauges at render time.
+    Every label value comes from a fixed set."""
 
     HELP = {
         "mcp_tool_calls_total": "Tool calls by tool and outcome.",
         "mcp_requests_total": "Requests served on /mcp by JSON-RPC method.",
         "mcp_rejected_total": "Requests rejected before the MCP layer, by reason.",
         "mcp_agent_requests_total": "Requests served on /mcp by User-Agent family.",
+        "mcp_clients_total": "initialize requests by client (clientInfo.name folded into a fixed set).",
         "mcp_ledger_errors_total": "Usage ledger writes that failed (the request itself was served).",
     }
+    HISTOGRAM_HELP = {"mcp_tool_duration_seconds": "Tool call latency in seconds, by tool."}
 
     def __init__(self):
         self.counts: Counter = Counter()
+        self.histograms: dict = {}  # (name, labels) -> [count per bucket (not cumulative)..., +Inf, sum]
         self.lock = threading.Lock()  # ledger errors are counted from the writer threads
 
     def inc(self, name: str, **labels: str) -> None:
         with self.lock:
             self.counts[(name, tuple(sorted(labels.items())))] += 1
 
+    def observe(self, name: str, value: float, **labels: str) -> None:
+        i = next((i for i, b in enumerate(BUCKETS) if value <= b), len(BUCKETS))
+        with self.lock:
+            h = self.histograms.setdefault((name, tuple(sorted(labels.items()))), [0] * (len(BUCKETS) + 1) + [0.0])
+            h[i] += 1
+            h[-1] += value
+
     def render(self) -> str:
         with self.lock:
             counts = dict(self.counts)
+            histograms = {k: list(v) for k, v in self.histograms.items()}
         lines = []
         for name, text in self.HELP.items():
             lines += [f"# HELP {name} {text}", f"# TYPE {name} counter"]
@@ -140,9 +209,27 @@ class Metrics:
             if not series and name == "mcp_ledger_errors_total":
                 series = [((), 0)]
             for labels, n in series:
-                body = ",".join(f'{k}="{v.replace(chr(92), chr(92) * 2).replace(chr(34), chr(92) + chr(34))}"'
-                                for k, v in labels)
+                body = _labels(labels)
                 lines.append(f"{name}{{{body}}} {n}" if body else f"{name} {n}")
+        for name, text in self.HISTOGRAM_HELP.items():
+            lines += [f"# HELP {name} {text}", f"# TYPE {name} histogram"]
+            for labels, h in sorted((labels, h) for (metric, labels), h in histograms.items() if metric == name):
+                total = 0
+                for le, n in zip((*map(str, BUCKETS), "+Inf"), h[:-1]):
+                    total += n
+                    lines.append(f"{name}_bucket{{{_labels((*labels, ('le', le)))}}} {total}")
+                lines += [f"{name}_sum{{{_labels(labels)}}} {round(h[-1], 6)}",
+                          f"{name}_count{{{_labels(labels)}}} {total}"]
+        lines += ["# HELP mcp_distinct_callers Distinct callers in the window: client = /24 or /48 without probers "
+                  "or own tests, chatgpt_subject = x-openai-subject from ChatGPT egress. Reset on restart.",
+                  "# TYPE mcp_distinct_callers gauge"]
+        for kind in Distinct.KINDS:
+            for window, seconds in WINDOWS:
+                n = distinct.count(kind, seconds)
+                lines.append(f'mcp_distinct_callers{{kind="{kind}",window="{window}"}} {n}')
+        lines += ["# HELP mcp_distinct_evictions_total Distinct-caller keys dropped to stay under the cap, by kind.",
+                  "# TYPE mcp_distinct_evictions_total counter"]
+        lines += [f'mcp_distinct_evictions_total{{kind="{kind}"}} {distinct.evicted[kind]}' for kind in Distinct.KINDS]
         return "\n".join(lines) + "\n"
 
 

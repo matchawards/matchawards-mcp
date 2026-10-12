@@ -1,4 +1,5 @@
-"""Usage stats in --http mode: the ledger, the transport aggregate, /metrics and the stats command. No network."""
+"""Usage stats in --http mode: the ledger, the transport aggregate, /metrics (counters, latency histogram,
+distinct-caller gauges) and the stats command. No network."""
 
 import json
 import logging
@@ -14,7 +15,7 @@ from mcp.client.streamable_http import streamable_http_client
 from matchawards_mcp import server, usage
 from matchawards_mcp import api as ma_api
 
-from test_http import LEGACY, http
+from test_http import LEGACY, egress, http  # noqa: F401  (egress is a fixture)
 from test_server import api, anyio_backend, page  # noqa: F401  (fixtures)
 
 SECRET = "zebracornsecret"  # an argument value that must never be stored
@@ -27,6 +28,7 @@ def usage_db(tmp_path, monkeypatch):
     monkeypatch.setattr(ma_api, "api_budget", None)
     monkeypatch.setattr(server, "ledger", None)
     monkeypatch.setattr(usage, "metrics", usage.Metrics())
+    monkeypatch.setattr(usage, "distinct", usage.Distinct())
     return path
 
 
@@ -139,7 +141,9 @@ async def test_rate_limited_calls_leave_no_row(api, usage_db, monkeypatch):
     assert codes == [200, 200, 429, 429, 429]
     assert len(rows(usage_db)) == 2
     assert len(rows(usage_db, "transport_daily")) == 1
-    assert 'mcp_rejected_total{reason="rate_limit_client"} 3' in usage.metrics.render()
+    text = usage.metrics.render()
+    assert 'mcp_rejected_total{reason="rate_limit_client"} 3' in text
+    assert 'mcp_tool_duration_seconds_count{tool="get_opportunity"} 2' in text  # the ledger rows, no more
 
 
 INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
@@ -257,8 +261,11 @@ async def test_metrics_listener_needs_the_bearer_token():
     assert (await hc.get("/metrics", headers={"Authorization": "Bearer tok", "X-Real-IP": "1.2.3.4"})).status_code == 200
     r = await hc.get("/metrics", headers={"Authorization": "Bearer tok"})
     assert r.status_code == 200 and r.headers["content-type"].startswith("text/plain")
-    for name in ("mcp_tool_calls_total", "mcp_requests_total", "mcp_rejected_total", "mcp_agent_requests_total"):
+    for name in ("mcp_tool_calls_total", "mcp_requests_total", "mcp_rejected_total", "mcp_agent_requests_total",
+                 "mcp_clients_total", "mcp_distinct_evictions_total"):
         assert f"# TYPE {name} counter" in r.text
+    assert "# TYPE mcp_tool_duration_seconds histogram" in r.text
+    assert "# TYPE mcp_distinct_callers gauge" in r.text
     assert 'mcp_rejected_total{reason="host"} 1' in r.text and "mcp_ledger_errors_total 0" in r.text
     assert (await hc.get("/mcp", headers={"Authorization": "Bearer tok"})).status_code == 404
 
@@ -301,7 +308,8 @@ async def test_a_failing_ledger_write_is_counted_not_raised(api, usage_db, tmp_p
 async def test_direct_calls_outside_http_record_nothing(api, usage_db, tmp_path):
     server.ledger = usage.Ledger.open(str(usage_db))
     await server.mcp.call_tool("get_opportunity", {"id": "7"})  # through the usage wrapper, outside a request
-    assert rows(usage_db) == [] and usage.metrics.counts == {}
+    assert rows(usage_db) == [] and usage.metrics.counts == {} and usage.metrics.histograms == {}
+    assert usage.distinct.seen == {"client": {}, "chatgpt_subject": {}}
 
 
 @pytest.mark.anyio
@@ -315,6 +323,95 @@ async def test_stdio_mode_writes_nothing(tmp_path):
     async with Client(params) as client:
         assert (await client.call_tool("get_opportunity", {"id": "7"})).is_error  # dead upstream
     assert list(tmp_path.iterdir()) == []
+
+
+def test_histogram_buckets_are_cumulative():
+    m = usage.Metrics()
+    for s in (0.05, 0.3, 3.0, 45.0):
+        m.observe("mcp_tool_duration_seconds", s, tool="search_contracts")
+    text = m.render()
+    assert 'mcp_tool_duration_seconds_bucket{tool="search_contracts",le="0.1"} 1' in text
+    assert 'mcp_tool_duration_seconds_bucket{tool="search_contracts",le="0.5"} 2' in text
+    assert 'mcp_tool_duration_seconds_bucket{tool="search_contracts",le="5"} 3' in text
+    assert 'mcp_tool_duration_seconds_bucket{tool="search_contracts",le="+Inf"} 4' in text
+    assert 'mcp_tool_duration_seconds_count{tool="search_contracts"} 4' in text
+    assert 'mcp_tool_duration_seconds_sum{tool="search_contracts"} 48.35' in text
+    assert "# TYPE mcp_tool_duration_seconds histogram" in text
+
+
+def test_distinct_windows_and_hashing(monkeypatch):
+    d = usage.Distinct()
+    now = [1_000_000.0]
+    monkeypatch.setattr(usage.time, "monotonic", lambda: now[0])
+    d.see("client", "203.0.113.0/24")
+    d.see("client", "203.0.113.0/24")
+    d.see("client", "198.51.100.0/24")
+    now[0] += 2 * 3600  # 2 h later: still in 24h, out of 1h
+    d.see("chatgpt_subject", "user-abc")
+    assert d.count("client", 3600) == 0 and d.count("client", 86400) == 2
+    assert d.count("chatgpt_subject", 3600) == 1
+    assert all("203.0.113" not in k for k in d.seen["client"])  # stored hashed only
+    now[0] += 86400  # past the day: expired keys are dropped on the next see, not counted as evictions
+    d.see("client", "192.0.2.0/24")
+    assert len(d.seen["client"]) == 1 and d.evicted["client"] == 0
+
+
+def test_distinct_is_bounded(monkeypatch):
+    monkeypatch.setattr(usage.Distinct, "MAX_KEYS", 3)
+    d = usage.Distinct()
+    for i in range(5):
+        d.see("client", f"10.0.{i}.0/24")
+    assert len(d.seen["client"]) == 3 and d.evicted["client"] == 2
+    usage.distinct = d  # the autouse fixture restores the module's own after the test
+    assert 'mcp_distinct_evictions_total{kind="client"} 2' in usage.metrics.render()
+    assert 'mcp_distinct_evictions_total{kind="chatgpt_subject"} 0' in usage.metrics.render()
+
+
+@pytest.mark.parametrize("name,bucket", [
+    ("openai-mcp", "chatgpt"), ("ChatGPT", "chatgpt"), ("claude-ai", "claude"), ("Cursor", "cursor"),
+    ("Visual Studio Code", "vscode"), ("n8n-nodes-matchawards", "n8n"), ("matchawards-cli", "matchawards"),
+    ("mcp-inspector", "mcp-inspector"), ("", "unknown"), ("acme-bot 1.0", "other"),
+])
+def test_client_bucket(name, bucket):
+    assert usage.client_bucket(name) == bucket
+
+
+@pytest.mark.anyio
+async def test_tool_call_feeds_histogram_distinct_and_clients(api, egress):
+    chatgpt = {"ip": "192.0.2.10", "User-Agent": "openai-mcp/1.0.0", "x-openai-subject": "sub-1"}
+    async with http() as hc:
+        init = {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "openai-mcp", "version": "1"}}}
+        await post(hc, init, **chatgpt)
+        await post(hc, call("search_contracts", {"keyword": SECRET}), **chatgpt)
+        await post(hc, INIT)  # another client (acme-agent, 203.0.113.0/24): the subject header is not sent
+    text = usage.metrics.render()
+    assert 'mcp_tool_duration_seconds_count{tool="search_contracts"} 1' in text
+    assert 'mcp_clients_total{client="chatgpt"} 1' in text and 'mcp_clients_total{client="other"} 1' in text
+    assert 'mcp_distinct_callers{kind="client",window="1h"} 2' in text
+    assert 'mcp_distinct_callers{kind="chatgpt_subject",window="24h"} 1' in text
+    assert SECRET not in text and "sub-1" not in text and "203.0.113" not in text and "192.0.2" not in text
+
+
+@pytest.mark.anyio
+async def test_a_subject_counts_only_from_chatgpt_egress(api, egress):
+    async with http() as hc:
+        await post(hc, call("get_opportunity", {"id": "7"}), **{"x-openai-subject": "spoofed"})  # not egress
+        await post(hc, call("get_opportunity", {"id": "7"}), ip="192.0.2.10",
+                   **{"x-openai-subject": "x" * (server.SUBJECT_MAX_LEN + 1)})  # overlong counts as absent
+    text = usage.metrics.render()
+    assert 'mcp_distinct_callers{kind="chatgpt_subject",window="24h"} 0' in text
+    assert 'mcp_distinct_callers{kind="client",window="24h"} 2' in text
+
+
+@pytest.mark.anyio
+async def test_probers_are_not_distinct_clients(api):
+    async with http() as hc:
+        await post(hc, call("search_contracts", {}), **{"User-Agent": "uptime-monitor/2"})
+        await post(hc, call("search_contracts", {}), **{"User-Agent": "matchawards-test/1"})
+    text = usage.metrics.render()
+    assert 'mcp_distinct_callers{kind="client",window="24h"} 0' in text
+    assert 'mcp_tool_duration_seconds_count{tool="search_contracts"} 2' in text  # still timed
 
 
 def seed(path):

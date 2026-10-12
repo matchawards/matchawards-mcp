@@ -191,7 +191,17 @@ It prints tool calls per tool and outcome, calls per family, real calls vs probe
 
 ### Metrics
 
-When `MATCHAWARDS_METRICS_TOKEN` is set, a second listener in the same process (`MATCHAWARDS_METRICS_HOST:MATCHAWARDS_METRICS_PORT`, default `127.0.0.1:9765`) serves `GET /metrics` in the Prometheus text format, with `Authorization: Bearer <token>` (401 without it). The `/mcp` port never serves `/metrics` (404): it trusts `X-Real-IP` from the proxy, so publish only the metrics port to the network Prometheus scrapes from. Counters (in memory, reset on restart): `mcp_tool_calls_total{tool,outcome}`, `mcp_requests_total{method}`, `mcp_rejected_total{reason}` (`rate_limit_client`, `rate_limit_prefix`, `rate_limit_subject`, `rate_limit_egress`, `rate_limit_global`, `size`, `host`, `path`, `method`), `mcp_agent_requests_total{family}`, `mcp_ledger_errors_total`.
+When `MATCHAWARDS_METRICS_TOKEN` is set, a second listener in the same process (`MATCHAWARDS_METRICS_HOST:MATCHAWARDS_METRICS_PORT`, default `127.0.0.1:9765`) serves `GET /metrics` in the Prometheus text format, with `Authorization: Bearer <token>` (401 without it). The `/mcp` port never serves `/metrics` (404): it trusts `X-Real-IP` from the proxy, so publish only the metrics port to the network Prometheus scrapes from. All metrics are in memory and reset on restart; every label value comes from a fixed set, never a client address, subject or argument.
+
+- `mcp_tool_calls_total{tool,outcome}` (counter): tool calls (the ledger writes one row for each).
+- `mcp_tool_duration_seconds{tool}` (histogram, buckets 0.1 0.25 0.5 1 2.5 5 10 20 30 s): tool call latency, for the same calls.
+- `mcp_requests_total{method}` (counter): requests served on `/mcp` by JSON-RPC method.
+- `mcp_rejected_total{reason}` (counter): `rate_limit_client`, `rate_limit_prefix`, `rate_limit_subject`, `rate_limit_egress`, `rate_limit_global`, `size`, `host`, `path`, `method`.
+- `mcp_agent_requests_total{family}` (counter): requests served by User-Agent family.
+- `mcp_clients_total{client}` (counter): `initialize` requests by `clientInfo.name`, folded into `chatgpt`, `claude`, `cursor`, `vscode`, `n8n`, `matchawards`, `mcp-inspector`, `other` or `unknown`.
+- `mcp_distinct_callers{kind,window}` (gauge, `window` = `1h` or `24h`): distinct `client` networks (/24 or /48, probers and own tests left out) and distinct ChatGPT users (`chatgpt_subject`: `x-openai-subject` on requests from ChatGPT's egress addresses only). Kept as per-process salted hashes, at most 100,000 per kind. The distinct-caller gauges reset on restart, so a 24h value is only complete 24 hours after a start.
+- `mcp_distinct_evictions_total{kind}` (counter): distinct-caller keys dropped to stay under that cap (non-zero only under a flood of new networks).
+- `mcp_ledger_errors_total` (counter): usage ledger writes that failed.
 
 ### Ops notes
 
