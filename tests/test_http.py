@@ -341,6 +341,8 @@ async def test_a_lying_content_length_is_still_capped_by_the_sdk():
 @pytest.mark.anyio
 async def test_one_client_hammering_leaves_the_global_budget_open(monkeypatch):
     global_cap(monkeypatch, 11)  # default burst 10: the abuser gets 10 through
+    # A frozen clock: on a slow machine 1000 requests outlast a refill, and the abuser would earn an 11th.
+    monkeypatch.setattr(server, "time", SimpleNamespace(monotonic=lambda: 1000.0))
     async with http() as hc:
         codes = [(await ping(hc, "198.51.100.66")).status_code for _ in range(1000)]
         assert codes.count(200) == 10 and codes.count(429) == 990
