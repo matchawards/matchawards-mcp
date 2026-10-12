@@ -14,6 +14,7 @@
     openai    no bridge; window.openai.toolOutput carries the fixture (the ChatGPT compatibility layer)
     nobridge  no bridge; window.openai carries the fixture and the theme only (a host that can't send messages)
     nomessage the bridge, without the message capability
+    both      window.openai carries the fixture (and can send messages) at load; the bridge connects 0.5 s later
     none      no bridge and no result at all
   Every message from the card is kept in window.messages; the actions alone (everything except the handshake
   and size notifications) also in window.__sent.
@@ -48,6 +49,10 @@
     "};<\/script>";
   if (mode === "nobridge") openai = "<script>window.openai = { theme: " + JSON.stringify(theme) +
     ", toolOutput: " + JSON.stringify(fixture) + " };<\/script>";
+  if (mode === "both") openai = "<script>window.openai = { theme: " + JSON.stringify(theme) +
+    ", toolOutput: " + JSON.stringify(fixture) + ", " +
+    "sendFollowUpMessage: function (a) { parent.postMessage({ openai: 'sendFollowUpMessage', args: a }, '*'); } " +
+    "};<\/script>";
   if (mode === "nobridge") frame.style.height = "640px";  // nothing reports a height in this mode
   var html = await (await fetch("../../src/matchawards_mcp/data/results-v2.html")).text();
   frame.srcdoc = html.replace("<head>", "<head>" + csp + openai);
@@ -61,11 +66,13 @@
     if (m && PLUMBING.indexOf(m.method) < 0) window.__sent.push(m);
     if (!m || m.jsonrpc !== "2.0") return;
     if (m.method === "ui/initialize") {
-      if (mode === "bridge" || mode === "late" || mode === "nomessage") send({ jsonrpc: "2.0", id: m.id, result: {
+      var answer = { jsonrpc: "2.0", id: m.id, result: {
         protocolVersion: "2026-01-26", hostInfo: { name: "harness", version: "1" },
         hostCapabilities: mode === "nomessage" ? { openLinks: {} } : { message: {}, openLinks: {} },
         hostContext: { theme: theme }
-      } });
+      } };
+      if (mode === "bridge" || mode === "late" || mode === "nomessage") send(answer);
+      if (mode === "both") setTimeout(function () { send(answer); }, 500);
     } else if (m.method === "ui/notifications/initialized") {
       var result = { jsonrpc: "2.0", method: "ui/notifications/tool-result",
         params: { content: [{ type: "text", text: JSON.stringify(fixture) }], structuredContent: fixture } };

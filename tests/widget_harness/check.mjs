@@ -222,6 +222,20 @@ for (const mode of ["nobridge", "nomessage"]) {
   await page.close();
 }
 
+// The data before the bridge (ChatGPT's window.openai layer renders first, the bridge connects later): once the
+// bridge is up the card still reports its height over it, although the re-sent result draws nothing new.
+{
+  const { page, card, errors } = await open("shown", 390, "light", "both");
+  await card.locator(".rows > li").first().waitFor();
+  await page.waitForFunction(() => window.messages.some((m) => m && m.method === "ui/notifications/size-changed"),
+    null, { timeout: 3000 }).catch(() => assert.fail("both: no size-changed after the bridge connected"));
+  const frame = page.frames()[1];
+  await frame.waitForFunction(() => document.documentElement.scrollHeight - innerHeight <= 2, null,
+    { timeout: 3000 }).catch(() => assert.fail("both: the frame never fit the card"));
+  assert.deepEqual(errors, []);
+  await page.close();
+}
+
 // A late result: the skeleton first, then the rows. No result at all: the skeleton resolves to a note.
 {
   const { page, card } = await open("warning", 390, "light", "late");

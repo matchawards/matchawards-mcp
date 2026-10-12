@@ -522,6 +522,8 @@ def test_card_renders_from_structured_content_and_never_calls_a_tool():
     assert "Array.isArray(d.failed)" in CARD_SCRIPT  # failed counts with missing; old payloads have no failed
     # show_results' warning is retry advice for the model: the card shows it only for a search page.
     assert "!shown && str(d.warning)" in CARD_SCRIPT
+    assert 'Array.isArray(d.missing) || typeof d.has_more !== "boolean"' in CARD_SCRIPT  # show_results detection
+    assert "sync();\n    size();" in CARD_SCRIPT  # the height is reported once the bridge is up
 
 
 def test_card_rows_expand_and_ask_is_throttled():
