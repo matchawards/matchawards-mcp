@@ -573,3 +573,29 @@ async def test_without_the_card_nothing_points_at_show_results(api):
     out = await server.mcp.call_tool("search_contracts", {"state": "VA"})
     assert "show_results" not in json.dumps(out.structured_content)
     assert all("show_results" not in t.description for t in await server.mcp.list_tools())
+
+
+@pytest.mark.anyio
+async def test_matched_naics_passes_through_on_opportunities_and_awards(api):
+    hit = {**page([1])["results"][0], "naics": {"code": "236220", "title": "Commercial Building Construction"},
+           "matched_naics": ["238160"]}
+    api.replies = [ok({**page([]), "results": [hit]})]
+    out = await tools.search_contracts(naics="238160")
+    assert out.results[0].matched_naics == ["238160"] and out.results[0].naics.code == "236220"
+    api.replies = [ok({**page([]), "results": [{**award(1), "matched_naics": ["541512"]}]})]
+    out = await tools.search_awards(naics="541512")
+    assert out.results[0].matched_naics == ["541512"]
+
+
+@pytest.mark.anyio
+async def test_matched_naics_is_absent_without_a_naics_filter(api):
+    api.replies = [ok(page([1]))]
+    assert (await tools.search_contracts(state="VA")).results[0].matched_naics is None
+
+
+def test_naics_filter_says_it_matches_any_of_a_notices_codes():
+    from matchawards_mcp import schemas
+    desc = tools.Naics.__metadata__[0].description
+    assert "any of" in desc and "matched_naics" in desc
+    for model in (schemas.OpportunityRow, schemas.AwardRow):
+        assert "primary" in model.model_fields["matched_naics"].description

@@ -79,6 +79,9 @@ class OpportunityRow(BaseModel):
     agency_id: Text = Field(None, description="The agency's MatchAwards id.")
     office: Text = None
     naics: Naics | None = None
+    matched_naics: list[str] | None = Field(
+        None, description="Only when you filtered by naics: the requested codes this record carries. It matches if any "
+        "of its NAICS codes does; naics shows its primary code, which may differ.")
     set_aside: Text = None
     state: Text = None
     city: Text = None
@@ -185,6 +188,9 @@ class AwardRow(BaseModel):
     agency: Agency = None
     agency_id: Text = None
     naics: Naics | None = None
+    matched_naics: list[str] | None = Field(
+        None, description="Only when you filtered by naics: the requested codes this record carries. It matches if any "
+        "of its NAICS codes does; naics shows its primary code, which may differ.")
     set_aside: Text = None
     state: Text = None
     city: Text = None
