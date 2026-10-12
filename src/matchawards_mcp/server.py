@@ -52,7 +52,7 @@ INSTRUCTIONS = (
 CARD_INSTRUCTIONS = "To show the user a list, call show_results last with the ids you picked."
 # With the card on, the searches whose ids show_results takes say so in their description and in every non-empty
 # result's note: the model reads a result's note at the moment it decides what to show.
-SHOW_HINT = ("Pick the best results for the user and call show_results with their ids; it shows them as a card the "
+SHOW_HINT = ("When you are done searching, call show_results once with the best ids; it shows them as a card the "
              "user can pick from.")
 SHOW_SOURCES = ("search_contracts", "search_grants")
 
