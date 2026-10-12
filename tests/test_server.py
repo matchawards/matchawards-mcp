@@ -499,6 +499,7 @@ def test_card_renders_from_structured_content_and_never_calls_a_tool():
     assert ('Array.isArray(d.results) && (typeof d.has_more === "boolean" || Array.isArray(d.missing))'
             in CARD_SCRIPT)
     assert '" could not be shown."' in CARD_SCRIPT
+    assert "Array.isArray(d.failed)" in CARD_SCRIPT  # failed counts with missing; old payloads have no failed
 
 
 @pytest.mark.anyio

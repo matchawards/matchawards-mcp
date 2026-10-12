@@ -217,9 +217,8 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--link); outline-
     else if (hidden) foot = hidden + " more not shown here.";
     else if (d.has_more) foot = "More on MatchAwards: ask for the next page.";
     if (foot) b.appendChild(el("p", "foot", foot));
-    if (d.missing && d.missing.length) {
-      b.appendChild(el("p", "foot", plural(d.missing.length, "result", "results") + " could not be shown."));
-    }
+    var unshown = (Array.isArray(d.missing) ? d.missing.length : 0) + (Array.isArray(d.failed) ? d.failed.length : 0);
+    if (unshown) b.appendChild(el("p", "foot", plural(unshown, "result", "results") + " could not be shown."));
   }
 
   // A matchawards.com page only: parsed, so the card and the host agree on the target (no userinfo, no look-alike).

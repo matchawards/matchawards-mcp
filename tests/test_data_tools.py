@@ -452,12 +452,52 @@ async def test_show_results_fetches_concurrently(api, monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_show_results_has_at_most_five_requests_in_flight(api, monkeypatch):
+    """Without the server's API budget (stdio), ten ids at once could break the API's 20-per-5-seconds burst limit
+    together with the searches around them."""
+    in_flight, peak = 0, 0
+
+    async def handler(req):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.01)  # let every allowed request start before any finishes
+        in_flight -= 1
+        return httpx.Response(200, json=opp(req.url.path.rsplit("/", 1)[1], "federal"))
+
+    monkeypatch.setattr(ma_api, "client", httpx.AsyncClient(transport=httpx.MockTransport(handler),
+                                                            base_url="https://api.test"))
+    out = await tools.show_results([str(i) for i in range(10)])
+    assert len(out.results) == 10 and peak == tools.SHOW_CONCURRENCY == 5
+
+
+@pytest.mark.anyio
 async def test_show_results_an_upstream_failure_on_some_ids_is_partial_not_fatal(api):
     api.replies = by_id(_1=httpx.Response(200, json=opp(1, "federal")), _2=SERVER_ERROR,
                         _3=httpx.Response(200, json={"as_of": "x", "result": {"id": ["bad"]}}))
     out = await tools.show_results(["1", "2", "3"])
-    assert [r.id for r in out.results] == ["1"] and out.missing == ["2", "3"]
+    assert [r.id for r in out.results] == ["1"]
+    assert out.missing == [] and out.failed == ["2", "3"]  # unreadable reply: retryable, not missing
+    assert out.warning == ("2 could not be fetched (MatchAwards was busy or failed); call show_results again with "
+                           "just those ids to add them.")
     assert out._partial  # recorded as partial in the usage ledger
+
+
+@pytest.mark.anyio
+async def test_show_results_splits_missing_from_failed(api):
+    api.replies = by_id(_1=NOT_FOUND, _2=httpx.Response(503, json={"error": "timeout"}, headers={"Retry-After": "9"}),
+                        _3=httpx.Response(200, json=opp(3, "grant")))
+    out = await tools.show_results(["1", "2", "3"])
+    assert [r.id for r in out.results] == ["3"]
+    assert out.missing == ["1"] and out.failed == ["2"]
+    assert out.warning.startswith("1 could not be fetched") and out._partial
+
+
+@pytest.mark.anyio
+async def test_show_results_without_upstream_trouble_has_no_warning(api):
+    api.replies = by_id(_1=NOT_FOUND, _3=httpx.Response(200, json=opp(3, "grant")))
+    out = await tools.show_results(["1", "3"])
+    assert out.failed == [] and out.warning is None and not out._partial
 
 
 @pytest.mark.anyio
