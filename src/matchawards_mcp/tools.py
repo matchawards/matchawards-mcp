@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, ValidationError
 from . import api
 from .schemas import (
     Assessment, AwardRow, AwardSearchResult, Company, NaicsLookup, OpportunityDetail, OpportunityRow,
-    OpportunitySummary, SearchResult, TeamingPartners,
+    OpportunitySummary, SearchResult, ShownResults, TeamingPartners,
 )
 
 LINK_RULE = (
@@ -633,6 +633,56 @@ async def find_teaming_partners(
     return out
 
 
+SHOW_MAX = 10  # ids per show_results call, each one API request
+# API requests show_results has in flight at once. In stdio mode there is no server-wide API budget, so this keeps
+# one call, with the searches around it, under the API's per-IP burst limit (20 requests per 5 seconds).
+SHOW_CONCURRENCY = 5
+SHOWN_TYPES = ("federal", "state", "grant")  # the card shows contracts and grants, never jobs
+
+
+async def show_results(
+    ids: Annotated[list[OppId], Field(min_length=1, max_length=SHOW_MAX,
+                                      description="Ids from search results, in the order to show them.")],
+) -> ShownResults:
+    """Use this last, after searching, to show the user the opportunities you picked as a card. Pass up to 10
+    ids from search_contracts or search_grants results, best first. The card lists them; do not repeat the list
+    in your reply.
+
+    Do not use to search (search_contracts, search_grants) or for one result's details (get_opportunity)."""
+    order = list(dict.fromkeys(ids))  # a repeated id is fetched and shown once
+    slots = asyncio.Semaphore(SHOW_CONCURRENCY)
+
+    async def one(i: str) -> tuple[dict, OpportunityRow] | ToolError:
+        try:
+            async with slots:
+                data = await api.get_one(i)
+            return data, _parse(OpportunityRow, data)
+        except ToolError as e:  # every failure of get_one and _parse; a 404 is one with outcome invalid_input
+            return e
+
+    got = dict(zip(order, await asyncio.gather(*(one(i) for i in order))))
+    shown = {i: g for i, g in got.items() if not isinstance(g, ToolError) and g[1].type in SHOWN_TYPES}
+    # A bad id (404, or one the API rejects) or a job is missing: retrying will not add it. Any other failure
+    # (timeout, 5xx, rate limit, busy, a reply in a shape the tools cannot read) is upstream trouble, so the id is
+    # failed and worth retrying. With no row to show the call fails with that error, since an empty card would hide
+    # rows that may exist; otherwise the card shows what it has, a warning names the retry, and the call is partial.
+    failed = {i: g for i, g in got.items()
+              if isinstance(g, ToolError) and getattr(g, "outcome", None) != "invalid_input"}
+    if failed and not shown:
+        raise next(iter(failed.values()))
+    out = ShownResults(
+        as_of=next((data.get("as_of") for data, _ in shown.values() if data.get("as_of")), None),
+        results=[row for _, row in shown.values()],
+        missing=[i for i in order if i not in shown and i not in failed],
+        failed=list(failed),
+        note=LINK_RULE,
+        warning=f"{len(failed)} could not be fetched (MatchAwards was busy or failed); call show_results again with "
+                "just those ids to add them." if failed else None,
+    )
+    out._partial = bool(failed)
+    return out
+
+
 # Registration order is the tools/list order.
 TOOLS = (
     (search_contracts, "Search government contracts"),
@@ -645,3 +695,5 @@ TOOLS = (
     (assess_opportunity, "Assess an opportunity"),
     (find_teaming_partners, "Find teaming partners"),
 )
+# The card tool: registered only when the card is (MATCHAWARDS_WIDGETS=1), after TOOLS.
+CARD_TOOL = (show_results, "Show results")

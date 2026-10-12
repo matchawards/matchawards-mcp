@@ -435,11 +435,13 @@ CARD_SCRIPT = server.CARD_HTML[server.CARD_HTML.index("<script>"):]
 async def test_card_is_off_by_default():
     assert not server.WIDGETS
     assert await server.mcp.list_resources() == []
-    assert all("ui" not in (t.meta or {}) for t in await server.mcp.list_tools())
+    listed = await server.mcp.list_tools()
+    assert all("ui" not in (t.meta or {}) for t in listed)
+    assert "show_results" not in {t.name for t in listed}  # the card tool exists only with the card
 
 
 @pytest.mark.anyio
-async def test_card_on_lists_the_resource_and_only_the_search_tools_point_at_it():
+async def test_card_on_lists_the_resource_and_only_show_results_points_at_it():
     params = StdioServerParameters(
         command=sys.executable,
         args=["-c", "from matchawards_mcp.server import main; main()"],
@@ -447,17 +449,17 @@ async def test_card_on_lists_the_resource_and_only_the_search_tools_point_at_it(
     )
     async with Client(params) as client:
         listed = {t.name: t for t in (await client.list_tools()).tools}
-        assert list(listed) == TOOLS
+        assert list(listed) == TOOLS + ["show_results"]
         carded = {n for n, t in listed.items() if "ui" in t.meta}
-        assert carded == {"search_contracts", "search_grants"}
+        assert carded == {"show_results"}  # the search tools return data only
         for name, t in listed.items():
             assert t.meta["securitySchemes"] == [{"type": "noauth"}], name  # the card meta merges, never replaces
             assert "openai/outputTemplate" not in t.meta, name
         for name in carded:
-            assert listed[name].meta["ui"] == {"resourceUri": "ui://matchawards/results-v1.html"}
+            assert listed[name].meta["ui"] == {"resourceUri": "ui://matchawards/results-v2.html"}
         [res] = (await client.list_resources()).resources
-        assert (str(res.uri), res.mime_type) == ("ui://matchawards/results-v1.html", "text/html;profile=mcp-app")
-        [content] = (await client.read_resource("ui://matchawards/results-v1.html")).contents
+        assert (str(res.uri), res.mime_type) == ("ui://matchawards/results-v2.html", "text/html;profile=mcp-app")
+        [content] = (await client.read_resource("ui://matchawards/results-v2.html")).contents
     assert content.mime_type == "text/html;profile=mcp-app"
     assert content.text == server.CARD_HTML
     ui = content.meta["ui"]
@@ -491,7 +493,40 @@ def test_card_renders_from_structured_content_and_never_calls_a_tool():
     # The opportunity layout is picked by the shape of SearchResult.
     from matchawards_mcp.schemas import SearchResult
     assert {"results", "has_more", "warning"} <= SearchResult.model_fields.keys()
-    assert 'Array.isArray(d.results) && typeof d.has_more === "boolean"' in CARD_SCRIPT
+    # The opportunity layout takes both SearchResult and ShownResults: results plus has_more, or plus missing.
+    from matchawards_mcp.schemas import ShownResults
+    assert {"results", "missing"} <= ShownResults.model_fields.keys()
+    assert ('Array.isArray(d.results) && (typeof d.has_more === "boolean" || Array.isArray(d.missing))'
+            in CARD_SCRIPT)
+    assert '" could not be shown."' in CARD_SCRIPT
+    assert "Array.isArray(d.failed)" in CARD_SCRIPT  # failed counts with missing; old payloads have no failed
+
+
+@pytest.mark.anyio
+async def test_card_only_on_show_results_and_only_with_widgets(monkeypatch):
+    assert "show_results" not in {t.name for t in await server.mcp.list_tools()}  # WIDGETS off by default
+    monkeypatch.setattr(server, "WIDGETS", True)
+    srv = server.build_mcp()
+    listed = {t.name: t for t in await srv.list_tools()}
+    assert list(listed) == TOOLS + ["show_results"]
+    t = listed["show_results"]
+    assert t.title == "Show results"
+    assert t.meta == {"securitySchemes": [{"type": "noauth"}],
+                      "ui": {"resourceUri": "ui://matchawards/results-v2.html"}}
+    assert t.annotations.read_only_hint and not t.annotations.open_world_hint
+    assert t.input_schema["properties"]["ids"]["minItems"] == 1
+    assert t.input_schema["properties"]["ids"]["maxItems"] == 10
+    assert t.description.startswith("Use this last, after searching, to show the user the opportunities you picked")
+    assert all(p and "\n" not in p and p.endswith(".") for p in t.description.split("\n\n"))
+    for name in TOOLS:
+        assert "ui" not in (listed[name].meta or {}), name
+    [res] = await srv.list_resources()
+    assert str(res.uri) == server.CARD_URI == "ui://matchawards/results-v2.html"
+    assert server.CARD_META["openai/widgetDescription"] == (
+        "A MatchAwards card listing the opportunities you chose to show, with agency, place, deadline and set-aside; "
+        "rows expand for details. It already lists them, so do not repeat the list; add only what matters.")
+    # The module-level server is untouched by building another one.
+    assert "show_results" not in {t.name for t in await server.mcp.list_tools()}
 
 
 @pytest.mark.parametrize("raw, shown", [

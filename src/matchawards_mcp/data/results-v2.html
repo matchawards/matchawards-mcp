@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MatchAwards results</title>
 <!--
-  The MCP Apps result card for search_contracts and search_grants (served as ui://matchawards/results-v1.html).
+  The MCP Apps result card for show_results (served as ui://matchawards/results-v2.html).
   Self-contained on purpose: no network, no CDN, so the resource CSP lists nothing.
   It renders the tool's structuredContent only (never _meta), picking a layout by its shape (LAYOUTS below).
   Every value reaches the DOM through textContent. Two actions at most: a row asks the model for that
@@ -194,7 +194,9 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--link); outline-
   var LAYOUTS = [
     {
       name: "opportunities", render: opportunities,
-      match: function (d) { return Array.isArray(d.results) && typeof d.has_more === "boolean"; }
+      match: function (d) {
+        return Array.isArray(d.results) && (typeof d.has_more === "boolean" || Array.isArray(d.missing));
+      }
     }
   ];
 
@@ -215,6 +217,8 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--link); outline-
     else if (hidden) foot = hidden + " more not shown here.";
     else if (d.has_more) foot = "More on MatchAwards: ask for the next page.";
     if (foot) b.appendChild(el("p", "foot", foot));
+    var unshown = (Array.isArray(d.missing) ? d.missing.length : 0) + (Array.isArray(d.failed) ? d.failed.length : 0);
+    if (unshown) b.appendChild(el("p", "foot", plural(unshown, "result", "results") + " could not be shown."));
   }
 
   // A matchawards.com page only: parsed, so the card and the host agree on the target (no userinfo, no look-alike).

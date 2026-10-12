@@ -99,6 +99,18 @@ class SearchResult(BaseModel):
     warning: Text = Field(None, description="Set when paging stopped early; the results so far are still valid.")
 
 
+class ShownResults(BaseModel):
+    as_of: Text = Field(None, description="When the API generated the first row shown (ISO time).")
+    results: list[OpportunityRow]
+    missing: list[str] = Field(default_factory=list, description="Ids not shown because they were not found or "
+                               "are not a contract or grant (a job). Retrying will not add them.")
+    failed: list[str] = Field(default_factory=list, description="Ids not fetched because MatchAwards was busy or "
+                              "failed. Call show_results again with just these ids to add them.")
+    note: Text = None
+    warning: Text = Field(None, description="Set when some ids could not be fetched (see failed).")
+    _partial: bool = PrivateAttr(False)
+
+
 class AiSummary(BaseModel):
     nft_title: AiText = None
     nft_insight: AiText = None

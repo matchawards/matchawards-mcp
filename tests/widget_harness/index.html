@@ -39,7 +39,7 @@
     ", toolOutput: " + JSON.stringify(fixture) + ", " +
     "sendFollowUpMessage: function (a) { parent.postMessage({ openai: 'sendFollowUpMessage', args: a }, '*'); }, " +
     "openExternal: function (a) { parent.postMessage({ openai: 'openExternal', args: a }, '*'); } };<\/script>";
-  var html = await (await fetch("../../src/matchawards_mcp/data/results-v1.html")).text();
+  var html = await (await fetch("../../src/matchawards_mcp/data/results-v2.html")).text();
   frame.srcdoc = html.replace("<head>", "<head>" + csp + openai);
 
   function send(msg) { frame.contentWindow.postMessage(msg, "*"); }

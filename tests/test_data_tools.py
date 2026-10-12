@@ -1,5 +1,6 @@
 """lookup_naics, search_awards, get_company and the agency-name filter, against a mocked API. No network."""
 
+import asyncio
 import json
 
 import httpx
@@ -380,3 +381,157 @@ async def test_a_long_description_is_cut_at_a_word_boundary(api):
     api.replies = [ok({"as_of": "x", "result": {"id": "7", "description": "word " * 600}})]
     text = (await tools.get_opportunity("7")).description
     assert len(text) <= 2000 and text.endswith("word…")
+
+
+# --- show_results ---------------------------------------------------------------------------------------------
+
+def opp(i, type_, as_of="2026-10-12T09:00:00Z"):
+    return {"as_of": as_of, "result": {"id": str(i), "type": type_, "title": f"Notice {i}",
+                                       "url": f"https://matchawards.com/a/posts/{i}"}}
+
+
+def by_id(**replies):
+    """A reply per opportunity id ({"_1": response}); the calls run concurrently, so a queue would not do."""
+    return [lambda req: replies["_" + req.url.path.rsplit("/", 1)[1]]]
+
+
+NOT_FOUND = httpx.Response(404, json={"error": "not_found"})
+SERVER_ERROR = httpx.Response(500, json={"error": "internal"})
+
+
+@pytest.fixture
+def card_server(monkeypatch):
+    """The server as MATCHAWARDS_WIDGETS=1 builds it."""
+    monkeypatch.setattr(server, "WIDGETS", True)
+    return server.build_mcp()
+
+
+@pytest.mark.anyio
+async def test_show_results_fetches_each_id_once_in_order_and_reports_missing(api):
+    api.replies = by_id(_1=httpx.Response(200, json=opp(1, "federal")), _2=NOT_FOUND,
+                        _3=httpx.Response(200, json=opp(3, "job")), _4=httpx.Response(200, json=opp(4, "grant")),
+                        _5=httpx.Response(200, json=opp(5, "state")))
+    out = await tools.show_results(["4", "1", "2", "3", "1", "5"])
+    assert [r.id for r in out.results] == ["4", "1", "5"]
+    assert out.missing == ["2", "3"]
+    assert sorted(r.url.path.rsplit("/", 1)[1] for r in api.requests) == ["1", "2", "3", "4", "5"]  # "1" once
+    assert out.note == tools.LINK_RULE and out.as_of == "2026-10-12T09:00:00Z"
+    assert not out._partial
+
+
+@pytest.mark.anyio
+async def test_show_results_all_missing_is_not_an_error(api):
+    api.replies = by_id(_9=NOT_FOUND, _8=httpx.Response(200, json=opp(8, "job")))
+    out = await tools.show_results(["9", "8"])
+    assert out.results == [] and out.missing == ["9", "8"]
+
+
+@pytest.mark.anyio
+async def test_show_results_as_of_comes_from_the_first_row_fetched(api):
+    api.replies = by_id(_1=NOT_FOUND, _2=httpx.Response(200, json=opp(2, "federal", as_of=None)),
+                        _3=httpx.Response(200, json=opp(3, "grant", as_of="t3")),
+                        _4=httpx.Response(200, json=opp(4, "grant", as_of="t4")))
+    assert (await tools.show_results(["1", "2", "3", "4"])).as_of == "t3"
+
+
+@pytest.mark.anyio
+async def test_show_results_fetches_concurrently(api, monkeypatch):
+    arrived, everyone = [], asyncio.Event()
+
+    async def handler(req):  # each reply waits until all three requests are in: sequential fetches would stall
+        arrived.append(req)
+        if len(arrived) == 3:
+            everyone.set()
+        await asyncio.wait_for(everyone.wait(), 2)
+        return httpx.Response(200, json=opp(req.url.path.rsplit("/", 1)[1], "federal"))
+
+    monkeypatch.setattr(ma_api, "client", httpx.AsyncClient(transport=httpx.MockTransport(handler),
+                                                            base_url="https://api.test"))
+    out = await tools.show_results(["1", "2", "3"])
+    assert [r.id for r in out.results] == ["1", "2", "3"]
+
+
+@pytest.mark.anyio
+async def test_show_results_has_at_most_five_requests_in_flight(api, monkeypatch):
+    """Without the server's API budget (stdio), ten ids at once could break the API's 20-per-5-seconds burst limit
+    together with the searches around them."""
+    in_flight, peak = 0, 0
+
+    async def handler(req):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.01)  # let every allowed request start before any finishes
+        in_flight -= 1
+        return httpx.Response(200, json=opp(req.url.path.rsplit("/", 1)[1], "federal"))
+
+    monkeypatch.setattr(ma_api, "client", httpx.AsyncClient(transport=httpx.MockTransport(handler),
+                                                            base_url="https://api.test"))
+    out = await tools.show_results([str(i) for i in range(10)])
+    assert len(out.results) == 10 and peak == tools.SHOW_CONCURRENCY == 5
+
+
+@pytest.mark.anyio
+async def test_show_results_an_upstream_failure_on_some_ids_is_partial_not_fatal(api):
+    api.replies = by_id(_1=httpx.Response(200, json=opp(1, "federal")), _2=SERVER_ERROR,
+                        _3=httpx.Response(200, json={"as_of": "x", "result": {"id": ["bad"]}}))
+    out = await tools.show_results(["1", "2", "3"])
+    assert [r.id for r in out.results] == ["1"]
+    assert out.missing == [] and out.failed == ["2", "3"]  # unreadable reply: retryable, not missing
+    assert out.warning == ("2 could not be fetched (MatchAwards was busy or failed); call show_results again with "
+                           "just those ids to add them.")
+    assert out._partial  # recorded as partial in the usage ledger
+
+
+@pytest.mark.anyio
+async def test_show_results_splits_missing_from_failed(api):
+    api.replies = by_id(_1=NOT_FOUND, _2=httpx.Response(503, json={"error": "timeout"}, headers={"Retry-After": "9"}),
+                        _3=httpx.Response(200, json=opp(3, "grant")))
+    out = await tools.show_results(["1", "2", "3"])
+    assert [r.id for r in out.results] == ["3"]
+    assert out.missing == ["1"] and out.failed == ["2"]
+    assert out.warning.startswith("1 could not be fetched") and out._partial
+
+
+@pytest.mark.anyio
+async def test_show_results_without_upstream_trouble_has_no_warning(api):
+    api.replies = by_id(_1=NOT_FOUND, _3=httpx.Response(200, json=opp(3, "grant")))
+    out = await tools.show_results(["1", "3"])
+    assert out.failed == [] and out.warning is None and not out._partial
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("replies, message, outcome", [
+    ({"_1": SERVER_ERROR, "_2": SERVER_ERROR}, r"MatchAwards server error \(HTTP 500\)", "upstream_error"),
+    ({"_1": NOT_FOUND, "_2": httpx.Response(429, headers={"Retry-After": "5"})},
+     "rate limit reached .* Wait 5 seconds", "rate_limited_upstream"),
+    ({"_1": httpx.Response(200, json=opp(1, "job")), "_2": SERVER_ERROR}, r"server error \(HTTP 500\)",
+     "upstream_error"),
+])
+async def test_show_results_with_nothing_fetched_and_an_upstream_failure_raises_it(api, replies, message, outcome):
+    """No row to show and at least one fetch failed for a reason other than a bad id: an empty card would hide rows
+    that may exist, so the call fails with the upstream error (the model can retry)."""
+    api.replies = by_id(**replies)
+    with pytest.raises(ToolError, match=message) as e:
+        await tools.show_results(["1", "2"])
+    assert e.value.outcome == outcome
+
+
+@pytest.mark.anyio
+async def test_show_results_through_the_mcp_layer_validates_against_its_schema(api, card_server):
+    api.replies = by_id(_1=httpx.Response(200, json=opp(1, "federal")), _2=NOT_FOUND)
+    schema = {t.name: t.output_schema for t in await card_server.list_tools()}["show_results"]
+    out = await card_server.call_tool("show_results", {"ids": ["1", "2"]})
+    assert not out.is_error, out.content
+    jsonschema.validate(out.structured_content, schema)
+    assert json.loads(out.content[0].text) == out.structured_content
+    assert [r["id"] for r in out.structured_content["results"]] == ["1"]
+    assert out.structured_content["missing"] == ["2"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("ids", [[], [str(i) for i in range(11)], ["1", "../x"], ["x" * 129]])
+async def test_show_results_bad_ids_are_rejected_before_any_request(api, card_server, ids):
+    with pytest.raises(ToolError):
+        await card_server.call_tool("show_results", {"ids": ids})
+    assert api.requests == []

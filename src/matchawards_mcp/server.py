@@ -51,18 +51,6 @@ INSTRUCTIONS = (
 ledger: usage.Ledger | None = None
 _request: contextvars.ContextVar[dict | None] = contextvars.ContextVar("matchawards_request", default=None)
 
-mcp = MCPServer(
-    name="matchawards",
-    title="MatchAwards",
-    instructions=INSTRUCTIONS,
-    website_url="https://matchawards.com",
-    version=__version__,
-    # The tool list is static: let clients cache it for a day, shared across users.
-    cache_hints={"tools/list": CacheHint(ttl_ms=86_400_000, scope="public")},
-    # No server-initiated notifications, so do not serve subscriptions/listen.
-    subscriptions=False,
-)
-
 # Closed world: the tools read MatchAwards' own catalog, not arbitrary third-party sites.
 READ_ONLY = ToolAnnotations(
     read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False
@@ -71,15 +59,16 @@ READ_ONLY = ToolAnnotations(
 # unknown top-level fields, so a top-level securitySchemes never reaches the wire.
 SECURITY_SCHEMES = [{"type": "noauth"}]
 
-# The result card (MCP Apps): one self-contained HTML resource, no network, that hosts with UI support render for
-# the search tools below from their structuredContent. Off unless MATCHAWARDS_WIDGETS=1: then the resource is listed
-# and those tools point at it in _meta. Results are the same either way. Hosts cache a card by URI, so a breaking
-# change to the HTML bumps the version in CARD_URI.
+# The result card (MCP Apps): one self-contained HTML resource, no network, that hosts with UI support render from
+# show_results' structuredContent. The model calls show_results last, with the rows it picked, so a reply carries
+# one card; the search tools return data only. Off unless MATCHAWARDS_WIDGETS=1: then the resource and show_results
+# are listed, and show_results points at the card in _meta. Hosts cache a card by URI, so a breaking change to the
+# HTML bumps the version in CARD_URI.
 WIDGETS = os.environ.get("MATCHAWARDS_WIDGETS", "").strip() == "1"
-CARD_URI = "ui://matchawards/results-v1.html"
+CARD_URI = "ui://matchawards/results-v2.html"
 CARD_MIME = "text/html;profile=mcp-app"
-CARD_TOOLS = ("search_contracts", "search_grants")
-CARD_HTML = (Path(__file__).parent / "data" / "results-v1.html").read_text(encoding="utf-8")
+CARD_TOOLS = ("show_results",)
+CARD_HTML = (Path(__file__).parent / "data" / "results-v2.html").read_text(encoding="utf-8")
 CARD_META = {
     "ui": {
         "csp": {"connectDomains": [], "resourceDomains": [], "frameDomains": []},
@@ -93,15 +82,14 @@ CARD_META = {
         "redirect_domains": ["https://matchawards.com"],
     },
     "openai/widgetDescription": (
-        "A MatchAwards results card: the opportunities found, with agency, place, deadline, set-aside and NAICS. "
-        "The card already lists them, so do not repeat the whole list; summarize what matters and link the "
-        "results you mention."
+        "A MatchAwards card listing the opportunities you chose to show, with agency, place, deadline and set-aside; "
+        "rows expand for details. It already lists them, so do not repeat the list; add only what matters."
     ),
 }
 
 
-def _tool(fn, title: str):
-    """Register a read-only tool; its docstring is the description the model reads, its return model the
+def _tool(srv: MCPServer, fn, title: str):
+    """Register a read-only tool on `srv`; its docstring is the description the model reads, its return model the
     outputSchema.
 
     In --http mode each call that reaches the tool is counted, timed and written to the usage ledger: tool name,
@@ -134,15 +122,38 @@ def _tool(fn, title: str):
     meta = {"securitySchemes": SECURITY_SCHEMES}
     if WIDGETS and fn.__name__ in CARD_TOOLS:
         meta["ui"] = {"resourceUri": CARD_URI}
-    return mcp.tool(title=title, annotations=READ_ONLY, meta=meta, description=description)(recorded)
+    return srv.tool(title=title, annotations=READ_ONLY, meta=meta, description=description)(recorded)
 
 
-for _fn, _title in tools.TOOLS:
-    _tool(_fn, _title)
+async def healthz(request: Request) -> Response:
+    return PlainTextResponse("ok")
 
-if WIDGETS:
-    mcp.resource(CARD_URI, name="matchawards-results", title="MatchAwards results", mime_type=CARD_MIME,
-                 meta=CARD_META)(lambda: CARD_HTML)
+
+def build_mcp() -> MCPServer:
+    """The server: the data tools, plus show_results and the card when WIDGETS is on, and GET /healthz.
+
+    The module builds it once as `mcp`; tests build another after changing WIDGETS."""
+    srv = MCPServer(
+        name="matchawards",
+        title="MatchAwards",
+        instructions=INSTRUCTIONS,
+        website_url="https://matchawards.com",
+        version=__version__,
+        # The tool list is static: let clients cache it for a day, shared across users.
+        cache_hints={"tools/list": CacheHint(ttl_ms=86_400_000, scope="public")},
+        # No server-initiated notifications, so do not serve subscriptions/listen.
+        subscriptions=False,
+    )
+    for fn, title in tools.TOOLS + ((tools.CARD_TOOL,) if WIDGETS else ()):
+        _tool(srv, fn, title)
+    if WIDGETS:
+        srv.resource(CARD_URI, name="matchawards-results", title="MatchAwards results", mime_type=CARD_MIME,
+                     meta=CARD_META)(lambda: CARD_HTML)
+    srv.custom_route("/healthz", methods=["GET"])(healthz)
+    return srv
+
+
+mcp = build_mcp()
 
 
 # --- HTTP mode -------------------------------------------------------------------------------------------
@@ -470,11 +481,6 @@ class HttpGuard:
                 status,
                 (time.monotonic() - start) * 1000, hashlib.blake2s(key.encode(), key=_LOG_SALT, digest_size=6).hexdigest(),
             )
-
-
-@mcp.custom_route("/healthz", methods=["GET"])
-async def healthz(request: Request) -> Response:
-    return PlainTextResponse("ok")
 
 
 def _env_int(name: str, default: int) -> int:
