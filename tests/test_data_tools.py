@@ -593,12 +593,29 @@ async def test_matched_naics_is_absent_without_a_naics_filter(api):
     assert (await tools.search_contracts(state="VA")).results[0].matched_naics is None
 
 
-def test_naics_filter_says_it_matches_any_of_a_notices_codes():
+def test_naics_filter_and_rows_tell_real_codes_from_ai_suggested_ones():
     from matchawards_mcp import schemas
     desc = tools.Naics.__metadata__[0].description
-    assert "any of" in desc and "matched_naics" in desc
-    for model in (schemas.OpportunityRow, schemas.AwardRow):
-        assert "primary" in model.model_fields["matched_naics"].description
+    assert "ai_matched_naics" in desc and "AI-suggested" in desc and "any of its NAICS codes" not in desc
+    assert "really carries" in schemas.OpportunityRow.model_fields["matched_naics"].description
+    assert "AI-suggested" in schemas.OpportunityRow.model_fields["ai_matched_naics"].description
+    assert "really carries" in schemas.AwardRow.model_fields["matched_naics"].description
+    assert "ai_matched_naics" not in schemas.AwardRow.model_fields  # an award's AI copies never count
+
+
+@pytest.mark.anyio
+async def test_ai_matched_naics_passes_through_on_opportunities(api):
+    hit = {**page([1])["results"][0], "naics": {"code": "236220", "title": "Commercial Building Construction"},
+           "matched_naics": ["236220"], "ai_matched_naics": ["238160"]}
+    api.replies = [ok({**page([]), "results": [hit]})]
+    row = (await tools.search_contracts(naics="236220,238160")).results[0]
+    assert row.matched_naics == ["236220"] and row.ai_matched_naics == ["238160"]
+    assert schemas_row_parses({"id": "2", "ai_matched_naics": "junk"}).ai_matched_naics is None
+
+
+def schemas_row_parses(data):
+    from matchawards_mcp import schemas
+    return schemas.OpportunityRow.model_validate(data)
 
 
 @pytest.mark.parametrize("raw, kept", [

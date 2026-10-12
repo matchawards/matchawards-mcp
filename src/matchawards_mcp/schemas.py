@@ -19,7 +19,7 @@ Agency = Annotated[str | None, BeforeValidator(lambda v: tidy_agency(v) if isins
 
 
 def _six_digit_codes(v) -> list[str] | None:
-    """matched_naics from the API, read leniently: a list (or one code) of six-digit codes; anything else is dropped
+    """matched_naics or ai_matched_naics from the API, read leniently: a list (or one code) of six-digit codes; anything else is dropped
     rather than failing the row."""
     items = [v] if isinstance(v, str) else v if isinstance(v, list) else []
     codes = [c.strip() for c in items if isinstance(c, str) and re.fullmatch(r"\s*\d{6}\s*", c)]
@@ -92,8 +92,11 @@ class OpportunityRow(BaseModel):
     office: Text = None
     naics: Naics | None = None
     matched_naics: MatchedNaics = Field(
-        None, description="Only when you filtered by naics: the requested codes this record carries. It matches if any "
-        "of its NAICS codes does; naics shows its primary code, which may differ.")
+        None, description="Only when you filtered by naics: the requested codes this record really carries (its primary "
+        "code in naics, or another code of a grant program or job).")
+    ai_matched_naics: MatchedNaics = Field(
+        None, description="Only when you filtered by naics: requested codes this notice matched only because "
+        "MatchAwards' AI suggested them, not its own codes. Call such a match AI-suggested.")
     set_aside: Text = None
     state: Text = None
     city: Text = None
@@ -201,8 +204,8 @@ class AwardRow(BaseModel):
     agency_id: Text = None
     naics: Naics | None = None
     matched_naics: MatchedNaics = Field(
-        None, description="Only when you filtered by naics: the requested codes this record carries. It matches if any "
-        "of its NAICS codes does; naics shows its primary code, which may differ.")
+        None, description="Only when you filtered by naics: the requested codes this record really carries (its primary "
+        "code in naics, or another code of a grant program or job).")
     set_aside: Text = None
     state: Text = None
     city: Text = None

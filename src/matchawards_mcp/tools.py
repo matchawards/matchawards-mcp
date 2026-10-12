@@ -44,7 +44,8 @@ Naics = Annotated[
     str | None,
     Field(pattern=r"^\s*\d{6}(\s*,\s*\d{6}){0,9}\s*$",
           description="Up to 10 six-digit NAICS codes, comma-separated, e.g. '236220' or '541511,541512'. "
-          "A record matches if any of its NAICS codes does, not only its primary one (matched_naics says which). "
+          "Federal and state notices can also match through a code MatchAwards' AI suggested: those rows list it in "
+          "ai_matched_naics, so call that match AI-suggested. "
           "Unknown codes are ignored."),
 ]
 State = Annotated[
