@@ -99,6 +99,15 @@ class SearchResult(BaseModel):
     warning: Text = Field(None, description="Set when paging stopped early; the results so far are still valid.")
 
 
+class ShownResults(BaseModel):
+    as_of: Text = Field(None, description="When the API generated the first row shown (ISO time).")
+    results: list[OpportunityRow]
+    missing: list[str] = Field(default_factory=list, description="Ids not shown: not found, or not a contract or "
+                               "grant.")
+    note: Text = None
+    _partial: bool = PrivateAttr(False)
+
+
 class AiSummary(BaseModel):
     nft_title: AiText = None
     nft_insight: AiText = None

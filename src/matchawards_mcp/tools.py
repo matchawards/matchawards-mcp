@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, ValidationError
 from . import api
 from .schemas import (
     Assessment, AwardRow, AwardSearchResult, Company, NaicsLookup, OpportunityDetail, OpportunityRow,
-    OpportunitySummary, SearchResult, TeamingPartners,
+    OpportunitySummary, SearchResult, ShownResults, TeamingPartners,
 )
 
 LINK_RULE = (
@@ -633,6 +633,46 @@ async def find_teaming_partners(
     return out
 
 
+SHOW_MAX = 10  # ids per show_results call, each one API request
+SHOWN_TYPES = ("federal", "state", "grant")  # the card shows contracts and grants, never jobs
+
+
+async def show_results(
+    ids: Annotated[list[OppId], Field(min_length=1, max_length=SHOW_MAX,
+                                      description="Ids from search results, in the order to show them.")],
+) -> ShownResults:
+    """Use this last, after searching, to show the user the opportunities you picked as a card. Pass up to 10
+    ids from search_contracts or search_grants results, best first. The card lists them; do not repeat the list
+    in your reply.
+
+    Do not use to search (search_contracts, search_grants) or for one result's details (get_opportunity)."""
+    order = list(dict.fromkeys(ids))  # a repeated id is fetched and shown once
+
+    async def one(i: str) -> tuple[dict, OpportunityRow] | ToolError:
+        try:
+            data = await api.get_one(i)
+            return data, _parse(OpportunityRow, data)
+        except ToolError as e:  # every failure of get_one and _parse; a 404 is one with outcome invalid_input
+            return e
+
+    got = dict(zip(order, await asyncio.gather(*(one(i) for i in order))))
+    shown = {i: g for i, g in got.items() if not isinstance(g, ToolError) and g[1].type in SHOWN_TYPES}
+    # A bad id (404, or one the API rejects) is just missing. Any other failure (timeout, 5xx, rate limit, a reply
+    # in a shape the tools cannot read) is upstream trouble: with no row to show the call fails with it, since an
+    # empty card would hide rows that may exist; otherwise that id is missing and the call counts as partial.
+    failed = [g for g in got.values() if isinstance(g, ToolError) and getattr(g, "outcome", None) != "invalid_input"]
+    if failed and not shown:
+        raise failed[0]
+    out = ShownResults(
+        as_of=next((data.get("as_of") for data, _ in shown.values() if data.get("as_of")), None),
+        results=[row for _, row in shown.values()],
+        missing=[i for i in order if i not in shown],
+        note=LINK_RULE,
+    )
+    out._partial = bool(failed)
+    return out
+
+
 # Registration order is the tools/list order.
 TOOLS = (
     (search_contracts, "Search government contracts"),
@@ -645,3 +685,5 @@ TOOLS = (
     (assess_opportunity, "Assess an opportunity"),
     (find_teaming_partners, "Find teaming partners"),
 )
+# The card tool: registered only when the card is (MATCHAWARDS_WIDGETS=1), after TOOLS.
+CARD_TOOL = (show_results, "Show results")

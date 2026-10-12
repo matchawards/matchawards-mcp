@@ -36,11 +36,11 @@ Every tool is read-only and needs no account: each declares `readOnlyHint`, `ide
 
 ## Cards
 
-Hosts that render [MCP Apps](https://modelcontextprotocol.io/extensions/apps) (ChatGPT, Claude) can show `search_contracts` and `search_grants` results as an inline card: up to 8 opportunities with title, agency, place, a federal/state/grant badge, the deadline (days left, closed, or no fixed deadline), set-aside and NAICS code, plus any `warning`. Clicking a row asks the model for that opportunity's details; each row's "Open on MatchAwards" link opens its page. The card is one self-contained HTML resource, `ui://matchawards/results-v1.html` (`text/html;profile=mcp-app`): no scripts or styles from elsewhere and no network requests, so its CSP allows nothing. It renders only the tool's `structuredContent`, and never calls a tool itself.
+Hosts that render [MCP Apps](https://modelcontextprotocol.io/extensions/apps) (ChatGPT, Claude) get one inline card per answer: after searching, the model calls `show_results` with up to 10 contract or grant ids it picked, and the card lists up to 8 of them with title, agency, place, a federal/state/grant badge, the deadline (days left, closed, or no fixed deadline), set-aside and NAICS code. Ids it could not show (not found, or a job) are counted under the list. The search tools return data only, with no card. Clicking a row asks the model for that opportunity's details; each row's "Open on MatchAwards" link opens its page. The card is one self-contained HTML resource, `ui://matchawards/results-v2.html` (`text/html;profile=mcp-app`): no scripts or styles from elsewhere and no network requests, so its CSP allows nothing. It renders only the tool's `structuredContent`, and never calls a tool itself.
 
-Cards cover contract and grant search for now; the other tools return their structured results without a card.
+The other tools return their structured results without a card.
 
-Cards are off by default. Set `MATCHAWARDS_WIDGETS=1` to list the resource and point the two search tools at it (`_meta.ui.resourceUri`); tool results are the same either way. `tests/widget_harness/` holds a minimal host page with sample results for checking the card in a browser.
+Cards are off by default. Set `MATCHAWARDS_WIDGETS=1` to list the resource and `show_results`, which points at it (`_meta.ui.resourceUri`); the other tools' results are the same either way. `tests/widget_harness/` holds a minimal host page with sample results for checking the card in a browser.
 
 ## Hosted
 
@@ -167,7 +167,7 @@ Do not trust a broad private range such as `172.16.0.0/12`: it may overlap your 
 | `MATCHAWARDS_METRICS_TOKEN` | unset | `--http` only: Bearer token for `/metrics`. Unset: the metrics listener does not start. |
 | `MATCHAWARDS_METRICS_HOST` | `127.0.0.1` | `--http` only: address of the metrics listener. |
 | `MATCHAWARDS_METRICS_PORT` | `9765` | `--http` only: port of the metrics listener. |
-| `MATCHAWARDS_WIDGETS` | unset | `1`: serve the result card (see Cards). Unset: no card resource, no `_meta.ui` on the tools. |
+| `MATCHAWARDS_WIDGETS` | unset | `1`: serve the result card (see Cards). Unset: no card resource and no `show_results`. |
 
 ## Usage stats (hosted mode)
 
