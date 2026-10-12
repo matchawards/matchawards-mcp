@@ -402,6 +402,26 @@ def test_instructions_carry_the_essentials_in_the_first_512_characters():
         assert needle in head, needle
 
 
+def test_instructions_steer_to_one_multi_naics_search_and_the_cursor():
+    assert "naics='541511,541512'" in server.INSTRUCTIONS and "not one call per code" in server.INSTRUCTIONS
+    assert "call again with that cursor before saying nothing exists" in server.INSTRUCTIONS
+    assert "show_results" not in server.INSTRUCTIONS  # the card tool is not there without widgets
+    assert len(server.INSTRUCTIONS) <= 1024
+    for name in ("search_contracts", "search_grants"):
+        doc = " ".join(getattr(tools, name).__doc__.split())  # as published: one line per paragraph
+        assert "Pass several NAICS codes in one call" in doc and "show_results" not in doc, name
+
+
+@pytest.mark.anyio
+async def test_card_instructions_only_with_widgets(monkeypatch):
+    assert server.mcp.instructions == server.INSTRUCTIONS
+    monkeypatch.setattr(server, "WIDGETS", True)
+    srv = server.build_mcp()
+    assert srv.instructions == server.INSTRUCTIONS + " " + server.CARD_INSTRUCTIONS
+    assert "call show_results last with the ids you picked" in server.CARD_INSTRUCTIONS
+    assert len(srv.instructions) <= 1024
+
+
 @pytest.mark.anyio
 async def test_job_source_is_sent_only_when_set(api, monkeypatch):
     await tools.search_jobs()

@@ -127,7 +127,7 @@ async def search_contracts(
     Filters: naics (up to 10 codes), state, keyword (title only), set_aside (federal only), type (federal or
     state), posted_within_days (1 to 180), open (default true), agency (a name; the note says which agency it
     matched), limit (1 to 50, default 20). If has_more is true, call again with cursor=next_cursor and the same
-    filters. Example: naics="238160", state="VA", keyword="roof".
+    filters. Example: naics="238160", state="VA", keyword="roof". Pass several NAICS codes in one call.
 
     Print each result's url, and sam_url for federal notices, as markdown links.
 
@@ -153,7 +153,8 @@ async def search_grants(
 
     Filters: naics (up to 10 codes), keyword (title only), posted_within_days (1 to 180), open (default true:
     open grants of any age), limit (1 to 50, default 20). Grant notices carry no state. If has_more is true, call
-    again with cursor=next_cursor and the same filters. Example: keyword="broadband".
+    again with cursor=next_cursor and the same filters. Example: keyword="broadband". Pass several NAICS codes in
+    one call.
 
     Open status may lag for grants that closed recently, so check response_deadline.
 

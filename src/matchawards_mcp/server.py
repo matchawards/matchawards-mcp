@@ -44,8 +44,12 @@ INSTRUCTIONS = (
     "get_company; bid brief: assess_opportunity; teaming: find_teaming_partners. Print url, sam_url and source_url "
     "as markdown links. Data (SAM.gov, state portals, Grants.gov, USAJOBS) may be incomplete. Never call a firm the "
     "incumbent. AI-generated text is labelled; keep the label when you quote it. "
-    "When has_more is true, call again with cursor=next_cursor and the same filters. Nothing here needs an account."
+    "When has_more is true, call again with cursor=next_cursor and the same filters. Nothing here needs an account. "
+    "Put several NAICS codes in one search (naics='541511,541512'), not one call per code. A warning with a cursor "
+    "means the scan stopped early: call again with that cursor before saying nothing exists."
 )
+# Added to INSTRUCTIONS only when show_results exists (MATCHAWARDS_WIDGETS=1).
+CARD_INSTRUCTIONS = "To show the user a list, call show_results last with the ids you picked."
 
 # HTTP mode only: the usage ledger (None when disabled, and always in stdio mode) and the request being served.
 ledger: usage.Ledger | None = None
@@ -136,7 +140,7 @@ def build_mcp() -> MCPServer:
     srv = MCPServer(
         name="matchawards",
         title="MatchAwards",
-        instructions=INSTRUCTIONS,
+        instructions=INSTRUCTIONS + (" " + CARD_INSTRUCTIONS if WIDGETS else ""),
         website_url="https://matchawards.com",
         version=__version__,
         # The tool list is static: let clients cache it for a day, shared across users.
