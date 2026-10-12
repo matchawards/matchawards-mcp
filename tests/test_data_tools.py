@@ -596,7 +596,7 @@ async def test_matched_naics_is_absent_without_a_naics_filter(api):
 def test_naics_filter_and_rows_tell_real_codes_from_ai_suggested_ones():
     from matchawards_mcp import schemas
     desc = tools.Naics.__metadata__[0].description
-    assert "ai_matched_naics" in desc and "AI-suggested" in desc and "any of its NAICS codes" not in desc
+    assert "ai_matched_naics" in desc and "AI-suggested" in desc and "search_contracts" in desc
     assert "really carries" in schemas.OpportunityRow.model_fields["matched_naics"].description
     assert "AI-suggested" in schemas.OpportunityRow.model_fields["ai_matched_naics"].description
     assert "really carries" in schemas.AwardRow.model_fields["matched_naics"].description
@@ -618,10 +618,21 @@ def schemas_row_parses(data):
     return schemas.OpportunityRow.model_validate(data)
 
 
+@pytest.mark.parametrize("field", ["matched_naics", "ai_matched_naics"])
 @pytest.mark.parametrize("raw, kept", [
     (["238160", "x", 541512, "12345", " 236220 "], ["238160", "236220"]), ("238160", ["238160"]),
     ("junk", None), (42, None), ([], None), (None, None),
 ])
-def test_matched_naics_keeps_only_six_digit_codes_and_never_fails_the_row(raw, kept):
+def test_matched_naics_keeps_only_six_digit_codes_and_never_fails_the_row(raw, kept, field):
     from matchawards_mcp import schemas
-    assert schemas.OpportunityRow.model_validate({"id": "1", "matched_naics": raw}).matched_naics == kept
+    assert getattr(schemas.OpportunityRow.model_validate({"id": "1", field: raw}), field) == kept
+
+
+@pytest.mark.anyio
+async def test_no_naics_filter_no_match_lists_and_awards_never_show_ai_matches(api):
+    api.replies = [ok(page([1]))]
+    row = (await tools.search_contracts(state="VA")).results[0]
+    assert row.matched_naics is None and row.ai_matched_naics is None
+    api.replies = [ok({**page([]), "results": [{**award(1), "ai_matched_naics": ["541512"]}]})]
+    out = await tools.search_awards(naics="541512")
+    assert "ai_matched_naics" not in out.results[0].model_dump()
