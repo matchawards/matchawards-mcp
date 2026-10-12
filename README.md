@@ -177,7 +177,7 @@ What is recorded:
 
 - **Tool calls**: one row per call that reached a tool: time, tool name, outcome (`ok`, `invalid_input`, `upstream_error`, `bad_response` (a reply the tools cannot read), `upstream_timeout` (the API ran out of time; retry), `partial` (`assess_opportunity` or `find_teaming_partners` answered, but its request or time limit cut the award lookup short), `rate_limited_upstream`, `busy`, `internal_error`), the client network (IPv4 /24 or IPv6 /48), the User-Agent (first 200 characters), its family (`openai-mcp`, `claude-user`, `claude`, `cursor`, ..., `prober` or `other`) and the latency. Calls stopped by the rate limit are counted in a metric, with no row. Arguments the SDK rejects before the tool runs leave no row either; they still count in the transport table as `tools/call`.
 - **Transport, per day**: one counter per client network, JSON-RPC method (known MCP methods only, anything else is `_other`) and `clientInfo` name and version, with the last User-Agent seen. `clientInfo` is read from the first 8 KiB of an `initialize` body, or from `params._meta` (2026-07-28 clients), as the body streams past; the body is not buffered. At most 50 counters per client network and day; past that they fold into `_other`.
-- **ChatGPT callers**: when `MATCHAWARDS_USAGE_SALT` is set and a request carries `x-openai-subject` (ChatGPT's anonymous per-user id), the tool-call row stores a 16-hex HMAC-SHA256 of it, to count distinct ChatGPT callers (`openai-mcp` family only in the stats). `x-openai-session` is not used: it changes per conversation.
+- **ChatGPT callers**: when `MATCHAWARDS_USAGE_SALT` is set and a request from ChatGPT's egress addresses carries `x-openai-subject` (ChatGPT's anonymous per-user id; from any other address it is ignored), the tool-call row stores a 16-hex HMAC-SHA256 of it, to count distinct ChatGPT callers (`openai-mcp` family only in the stats). `x-openai-session` is not used: it changes per conversation.
 
 Never recorded: tool arguments (search terms, ids), request or response bodies, full client addresses, raw header values.
 
@@ -191,7 +191,17 @@ It prints tool calls per tool and outcome, calls per family, real calls vs probe
 
 ### Metrics
 
-When `MATCHAWARDS_METRICS_TOKEN` is set, a second listener in the same process (`MATCHAWARDS_METRICS_HOST:MATCHAWARDS_METRICS_PORT`, default `127.0.0.1:9765`) serves `GET /metrics` in the Prometheus text format, with `Authorization: Bearer <token>` (401 without it). The `/mcp` port never serves `/metrics` (404): it trusts `X-Real-IP` from the proxy, so publish only the metrics port to the network Prometheus scrapes from. Counters (in memory, reset on restart): `mcp_tool_calls_total{tool,outcome}`, `mcp_requests_total{method}`, `mcp_rejected_total{reason}` (`rate_limit_client`, `rate_limit_prefix`, `rate_limit_subject`, `rate_limit_egress`, `rate_limit_global`, `size`, `host`, `path`, `method`), `mcp_agent_requests_total{family}`, `mcp_ledger_errors_total`.
+When `MATCHAWARDS_METRICS_TOKEN` is set, a second listener in the same process (`MATCHAWARDS_METRICS_HOST:MATCHAWARDS_METRICS_PORT`, default `127.0.0.1:9765`) serves `GET /metrics` in the Prometheus text format, with `Authorization: Bearer <token>` (401 without it). The `/mcp` port never serves `/metrics` (404): it trusts `X-Real-IP` from the proxy, so publish only the metrics port to the network Prometheus scrapes from. All metrics are in memory and reset on restart; every label value comes from a fixed set, never a client address, subject or argument.
+
+- `mcp_tool_calls_total{tool,outcome}` (counter): tool calls (the ledger writes one row for each).
+- `mcp_tool_duration_seconds{tool}` (histogram, buckets 0.1 0.25 0.5 1 2.5 5 10 20 30 s): tool call latency, for the same calls.
+- `mcp_requests_total{method}` (counter): requests served on `/mcp` by JSON-RPC method.
+- `mcp_rejected_total{reason}` (counter): `rate_limit_client`, `rate_limit_prefix`, `rate_limit_subject`, `rate_limit_egress`, `rate_limit_global`, `size`, `host`, `path`, `method`.
+- `mcp_agent_requests_total{family}` (counter): requests served by User-Agent family.
+- `mcp_clients_total{client}` (counter): `initialize` requests by `clientInfo.name`, folded into `chatgpt`, `claude`, `cursor`, `vscode`, `n8n`, `matchawards`, `mcp-inspector`, `other` or `unknown`.
+- `mcp_distinct_callers{kind,window}` (gauge, `window` = `1h` or `24h`): distinct `client` networks (/24 or /48, probers and own tests left out) and distinct ChatGPT users (`chatgpt_subject`: `x-openai-subject` on requests from ChatGPT's egress addresses only). Kept as per-process salted hashes, at most 100,000 per kind. The distinct-caller gauges reset on restart, so a 24h value is only complete 24 hours after a start.
+- `mcp_distinct_evictions_total{kind}` (counter): distinct-caller keys dropped to stay under that cap (non-zero only under a flood of new networks or subjects). While it is above zero the distinct counts are a lower bound: a caller rotating subjects or networks can push others out.
+- `mcp_ledger_errors_total` (counter): usage ledger writes that failed.
 
 ### Ops notes
 

@@ -104,8 +104,9 @@ def _tool(fn, title: str):
     """Register a read-only tool; its docstring is the description the model reads, its return model the
     outputSchema.
 
-    In --http mode each call that reaches the tool is counted and written to the usage ledger: tool name, outcome,
-    latency and who called (see HttpGuard). Never the arguments. Outside an HTTP request (stdio) it records nothing."""
+    In --http mode each call that reaches the tool is counted, timed and written to the usage ledger: tool name,
+    outcome, latency and who called (see HttpGuard). Never the arguments. Outside an HTTP request (stdio) it records
+    nothing."""
 
     @functools.wraps(fn)
     async def recorded(*args, **kwargs):
@@ -123,6 +124,7 @@ def _tool(fn, title: str):
             raise
         finally:
             usage.metrics.inc("mcp_tool_calls_total", tool=fn.__name__, outcome=outcome)
+            usage.metrics.observe("mcp_tool_duration_seconds", time.monotonic() - start, tool=fn.__name__)
             if ledger is not None:
                 ledger.submit(usage.Ledger.write_call, fn.__name__, outcome, req["client"], req["ua"],
                               req["family"], req["fp"], round((time.monotonic() - start) * 1000))
@@ -321,6 +323,13 @@ class EgressRanges:
             self.nets, self.due = nets, self.clock() + EGRESS_REFRESH_S
 
 
+def chatgpt_subject(scope) -> bytes:
+    """The x-openai-subject header: the first if there are several, b"" when blank or longer than SUBJECT_MAX_LEN.
+    Means a ChatGPT user only on a request from an egress address (anyone else can send any value)."""
+    subject = next((v for k, v in scope["headers"] if k == b"x-openai-subject"), b"").strip()
+    return subject if len(subject) <= SUBJECT_MAX_LEN else b""
+
+
 def _host_name(host: str) -> str:
     """The Host header without its port, lower-cased: 'matchawards.com:443' -> 'matchawards.com'."""
     name, sep, port = host.rpartition(":")
@@ -332,7 +341,8 @@ class HttpGuard:
     rate limits (429). Writes one access line per request.
 
     A rejection is counted in mcp_rejected_total{reason}. A request passed on to /mcp is counted by JSON-RPC method
-    and User-Agent family, added to the daily transport aggregate, and made visible to the tool wrapper (_tool)."""
+    and User-Agent family (and initialize by client), counted in the distinct-caller gauges, added to the daily
+    transport aggregate, and made visible to the tool wrapper (_tool)."""
 
     def __init__(self, app, limiter: RateLimiter, prefix_limiter: RateLimiter, global_limiter: RateLimiter,
                  subject_limiter: RateLimiter, egress_limiter: RateLimiter, egress: EgressRanges,
@@ -371,9 +381,7 @@ class HttpGuard:
             # Its x-openai-subject (one per user) gets the per-client budget instead, inside a pool for all ChatGPT
             # traffic. Trusted only from these addresses (anyone else could pick a fresh subject per request), and
             # never the User-Agent, which anyone can send.
-            # The first header if there are several; blank or longer than SUBJECT_MAX_LEN counts as absent.
-            subject = next((v for k, v in scope["headers"] if k == b"x-openai-subject"), b"").strip()
-            subject = subject if len(subject) <= SUBJECT_MAX_LEN else b""
+            subject = chatgpt_subject(scope)
             checks = [(self.egress_limiter, "egress", "egress"), (self.global_limiter, "all", "global")]
             if subject:
                 digest = hashlib.blake2s(subject, key=_SUBJECT_SALT, digest_size=16).hexdigest()
@@ -394,15 +402,16 @@ class HttpGuard:
             limiter.record(k)
         return None
 
-    async def serve_mcp(self, scope, receive, send, key: str) -> None:
+    async def serve_mcp(self, scope, receive, send, ip, key: str) -> None:
         """Pass a request on to /mcp, observing it for the usage stats on the way.
 
         The first usage.OBSERVE_BYTES of the body are copied as they stream past (never buffered or replayed), and
         only the JSON-RPC method and clientInfo are read from them, after the response is sent."""
         headers = dict(scope["headers"])
+        subject = chatgpt_subject(scope) if ip in self.egress else b""  # as reject() decided it
         ua = usage.clean(headers.get(b"user-agent", b"").decode("latin-1"), 200)
         req = {"client": usage.truncate_key(key), "ua": ua, "family": usage.classify_ua(ua),
-               "fp": usage.fingerprint(headers, self.usage_salt)}
+               "fp": usage.fingerprint(subject, self.usage_salt)}
         seen = bytearray()
 
         async def observing_receive():
@@ -419,6 +428,12 @@ class HttpGuard:
             method, name, version = usage.parse_body(bytes(seen))
             usage.metrics.inc("mcp_requests_total", method=method)
             usage.metrics.inc("mcp_agent_requests_total", family=req["family"])
+            if method == "initialize":
+                usage.metrics.inc("mcp_clients_total", client=usage.client_bucket(name))
+            if req["family"] not in usage.NOT_REAL:
+                usage.distinct.see("client", req["client"])
+            if subject:
+                usage.distinct.see("chatgpt_subject", subject)
             if ledger is not None:
                 ledger.submit(usage.Ledger.write_transport, req["client"], method, name, version, ua)
 
@@ -440,7 +455,8 @@ class HttpGuard:
                 usage.metrics.inc("mcp_rejected_total", reason=rejected[0])
                 await rejected[1](scope, receive, send_status)
             elif path == "/mcp":
-                await self.serve_mcp({**scope, "path": path, "raw_path": path.encode()}, receive, send_status, key)
+                await self.serve_mcp({**scope, "path": path, "raw_path": path.encode()}, receive, send_status, ip,
+                                     key)
             else:
                 await self.app({**scope, "path": path, "raw_path": path.encode()}, receive, send_status)
         finally:
