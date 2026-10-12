@@ -260,7 +260,7 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--link); outline-
   function opportunities(d, b) {
     // ShownResults (show_results) has no has_more: it lists every id it took, and its warning is retry advice
     // for the model, so the user sees only the footer count of what could not be shown.
-    var shown = typeof d.has_more !== "boolean", max = shown ? MAX_SHOWN : MAX_ROWS;
+    var shown = Array.isArray(d.missing), max = shown ? MAX_SHOWN : MAX_ROWS;  // show_results, not a search page
     var rows = d.results.filter(function (r) { return r && typeof r === "object" && typeof r.id === "string"; });
     var grants = rows.length > 0 && rows.every(function (r) { return r.type === "grant"; });
     var noun = grants ? ["grant", "grants"] : ["opportunity", "opportunities"];
@@ -316,6 +316,7 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--link); outline-
     if (url) {
       var a = el("a", "act", "Open on MatchAwards");
       a.href = url; a.target = "_blank"; a.rel = "noopener noreferrer";
+      a.setAttribute("aria-label", "Open " + title + " on MatchAwards");
       a.addEventListener("click", function (event) { open(event, url); });
       actions.appendChild(a);
     }
@@ -399,11 +400,15 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--link); outline-
 
   // The card's OWN height: the document's scrollHeight never drops below the frame's
   // current height, so a host that sized us generously would keep the empty space.
+  var sized = "";
   function size() {
     var height = Math.ceil($("card").getBoundingClientRect().height), o = openai();
+    var hint = !!(o && typeof o.notifyIntrinsicHeight === "function");
+    if (height + "|" + bridged + "|" + hint === sized) return;  // nothing new to report (ResizeObserver repeats)
+    sized = height + "|" + bridged + "|" + hint;
     if (bridged) post({ jsonrpc: "2.0", method: "ui/notifications/size-changed", params: { height: height } });
     // ChatGPT's own sizing hint (feature-detected): without it a 1-row card keeps empty space under it.
-    if (o && typeof o.notifyIntrinsicHeight === "function") {
+    if (hint) {
       try { o.notifyIntrinsicHeight(height); } catch (e) { /* an older host */ }
     }
   }

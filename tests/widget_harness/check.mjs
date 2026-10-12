@@ -169,7 +169,8 @@ for (const width of [1280, 390]) {
   await card.locator(".rows > li").first().waitFor();
   await card.locator("button.main").first().click();
   await card.locator(".more:visible .ask").click();
-  await card.locator(".more:visible").getByRole("link", { name: "Open on MatchAwards" }).click();
+  // The link's accessible name carries the title: "Open <title> on MatchAwards".
+  await card.locator(".more:visible").getByRole("link", { name: /^Open .+ on MatchAwards$/ }).click();
   const msgs = await sent(page);
   const ask = msgs.find((m) => m.method === "ui/message");
   assert.deepEqual(ask.params, { role: "user", content: [{ type: "text",
