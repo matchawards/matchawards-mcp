@@ -411,7 +411,7 @@ class HttpGuard:
         subject = chatgpt_subject(scope) if ip in self.egress else b""  # as reject() decided it
         ua = usage.clean(headers.get(b"user-agent", b"").decode("latin-1"), 200)
         req = {"client": usage.truncate_key(key), "ua": ua, "family": usage.classify_ua(ua),
-               "fp": usage.fingerprint(headers, self.usage_salt)}
+               "fp": usage.fingerprint(subject, self.usage_salt)}
         seen = bytearray()
 
         async def observing_receive():
@@ -433,7 +433,7 @@ class HttpGuard:
             if req["family"] not in usage.NOT_REAL:
                 usage.distinct.see("client", req["client"])
             if subject:
-                usage.distinct.see("chatgpt_subject", subject.decode("latin-1"))
+                usage.distinct.see("chatgpt_subject", subject)
             if ledger is not None:
                 ledger.submit(usage.Ledger.write_transport, req["client"], method, name, version, ua)
 

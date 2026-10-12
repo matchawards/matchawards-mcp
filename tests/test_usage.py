@@ -217,22 +217,24 @@ def test_ua_classifier(ua, family):
 
 @pytest.mark.parametrize("salt", ["s3cret", None])
 @pytest.mark.anyio
-async def test_chatgpt_fingerprint_is_hmac_and_needs_salt(api, usage_db, monkeypatch, salt):
+async def test_chatgpt_fingerprint_is_hmac_and_needs_salt(api, usage_db, egress, monkeypatch, salt):
     if salt:
         monkeypatch.setenv("MATCHAWARDS_USAGE_SALT", salt)
     async with http() as hc:
+        for header in ({"x-openai-subject": "raw-subject-value"}, {"x-openai-session": "raw-session-value"}):
+            await post(hc, call("get_opportunity", {"id": "7"}), ip="192.0.2.10", **header)
+        # Not from ChatGPT egress: anyone can send the header, so it is not fingerprinted.
         await post(hc, call("get_opportunity", {"id": "7"}), **{"x-openai-subject": "raw-subject-value"})
-        await post(hc, call("get_opportunity", {"id": "7"}), **{"x-openai-session": "raw-session-value"})
     fps = [r["caller_fp"] for r in rows(usage_db)]  # any order
     server.ledger.flush()
     raw = b"".join(p.read_bytes() for p in usage_db.parent.glob("usage.db*"))
     assert b"raw-subject-value" not in raw and b"raw-session-value" not in raw
     if salt:  # x-openai-session is never fingerprinted: it changes per conversation
-        assert sorted(fps, key=str) == sorted([usage.fingerprint({b"x-openai-subject": b"raw-subject-value"},
-                                                                 salt.encode()), None], key=str)
+        assert sorted(fps, key=str) == sorted([usage.fingerprint(b"raw-subject-value", salt.encode()), None, None],
+                                              key=str)
         assert all(len(f) == 16 and int(f, 16) >= 0 for f in fps if f)
     else:
-        assert fps == [None, None]
+        assert fps == [None, None, None]
 
 
 def test_ledger_drops_writes_past_the_queue_bound(tmp_path):
@@ -348,12 +350,49 @@ def test_distinct_windows_and_hashing(monkeypatch):
     d.see("client", "198.51.100.0/24")
     now[0] += 2 * 3600  # 2 h later: still in 24h, out of 1h
     d.see("chatgpt_subject", "user-abc")
-    assert d.count("client", 3600) == 0 and d.count("client", 86400) == 2
-    assert d.count("chatgpt_subject", 3600) == 1
+    assert d.counts("chatgpt_subject") == ({"1h": 1, "24h": 1}, 0)
     assert all("203.0.113" not in k for k in d.seen["client"])  # stored hashed only
+    assert d.counts("client") == ({"1h": 0, "24h": 2}, 0)
     now[0] += 86400  # past the day: expired keys are dropped on the next see, not counted as evictions
     d.see("client", "192.0.2.0/24")
     assert len(d.seen["client"]) == 1 and d.evicted["client"] == 0
+
+
+def test_a_quiet_day_leaves_no_dead_keys(monkeypatch):
+    now = [1_000_000.0]
+    monkeypatch.setattr(usage.time, "monotonic", lambda: now[0])
+    for i in range(3):
+        usage.distinct.see("client", f"10.0.{i}.0/24")
+    usage.distinct.see("chatgpt_subject", "sub")
+    now[0] += 86400 + 1  # no see() since: render alone prunes
+    text = usage.metrics.render()
+    assert 'mcp_distinct_callers{kind="client",window="24h"} 0' in text
+    assert usage.distinct.seen == {"client": {}, "chatgpt_subject": {}}
+
+
+def test_counts_newest_first_stop_at_the_window(monkeypatch):
+    now = [1_000_000.0]
+    monkeypatch.setattr(usage.time, "monotonic", lambda: now[0])
+    d = usage.Distinct()
+    for i in range(5):
+        d.see("client", f"10.0.{i}.0/24")
+        now[0] += 1800  # 30 min apart: the last two are within the hour
+    d.see("client", "10.0.0.0/24")  # seen again: now the newest
+    assert d.counts("client") == ({"1h": 3, "24h": 5}, 0)
+
+
+def test_distinct_hashes_subject_bytes_as_sent():
+    d = usage.Distinct()
+    d.see("chatgpt_subject", b"caf\xe9")
+    d.see("chatgpt_subject", "caf\xe9")  # the utf-8 encoding is other bytes: another caller
+    d.see("chatgpt_subject", b"caf\xe9")
+    assert len(d.seen["chatgpt_subject"]) == 2
+
+
+def test_label_values_escape_backslash_quote_and_newline():
+    m = usage.Metrics()
+    m.inc("mcp_requests_total", method='a\\b"c\nd')
+    assert 'mcp_requests_total{method="a\\\\b\\"c\\nd"} 1' in m.render()
 
 
 def test_distinct_is_bounded(monkeypatch):
@@ -391,6 +430,16 @@ async def test_tool_call_feeds_histogram_distinct_and_clients(api, egress):
     assert 'mcp_distinct_callers{kind="client",window="1h"} 2' in text
     assert 'mcp_distinct_callers{kind="chatgpt_subject",window="24h"} 1' in text
     assert SECRET not in text and "sub-1" not in text and "203.0.113" not in text and "192.0.2" not in text
+
+
+@pytest.mark.anyio
+async def test_a_non_ascii_subject_is_one_caller(api, egress):
+    async with http() as hc:
+        for _ in range(2):  # raw header bytes, as a proxy passes them on: 0xe9 alone is not valid utf-8
+            await post(hc, call("get_opportunity", {"id": "7"}), ip="192.0.2.10", **{"x-openai-subject": b"caf\xe9"})
+    assert len(usage.distinct.seen["chatgpt_subject"]) == 1
+    [h] = usage.distinct.seen["chatgpt_subject"]
+    assert h == usage.hashlib.blake2s(b"caf\xe9", key=usage.distinct.salt, digest_size=8).hexdigest()
 
 
 @pytest.mark.anyio

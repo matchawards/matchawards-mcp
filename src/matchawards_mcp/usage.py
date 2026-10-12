@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 import typing
-from collections import Counter
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -102,14 +102,14 @@ def truncate_key(key: str) -> str:
     return str(net.supernet(new_prefix=24 if net.version == 4 else 48))
 
 
-def fingerprint(headers: dict[bytes, bytes], salt: bytes | None) -> str | None:
-    """16-hex HMAC of x-openai-subject, to count distinct ChatGPT callers. None without salt.
+def fingerprint(subject: bytes, salt: bytes | None) -> str | None:
+    """16-hex HMAC of an x-openai-subject (from ChatGPT egress only), to count distinct ChatGPT callers. None without
+    salt or subject.
 
     Not x-openai-session: it changes per conversation, so it would count conversations, not callers."""
-    value = headers.get(b"x-openai-subject")
-    if not salt or not value:
+    if not salt or not subject:
         return None
-    return hmac.new(salt, value, hashlib.sha256).hexdigest()[:16]
+    return hmac.new(salt, subject, hashlib.sha256).hexdigest()[:16]
 
 
 BUCKETS = (0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30)  # seconds; +Inf is implied
@@ -131,41 +131,64 @@ def client_bucket(name: str) -> str:
 class Distinct:
     """Distinct callers seen in the last hour and day. In memory only (a restart resets it), keyed by a salted hash.
 
-    At most MAX_KEYS per kind: past that the least recently seen key is dropped and counted as an eviction."""
+    At most MAX_KEYS per kind: past that the least recently seen key is dropped and counted as an eviction. Once
+    there are evictions (mcp_distinct_evictions_total > 0) the counts are a lower bound: a caller rotating subjects or
+    networks can push others out."""
 
     MAX_KEYS = 100_000
     KINDS = ("client", "chatgpt_subject")
 
     def __init__(self):
         self.salt = os.urandom(16)  # per process: the hashes cannot be matched across restarts or to the ledger
-        self.seen = {k: {} for k in self.KINDS}  # kind -> {hash: last seen (monotonic)}, least recent first
+        self.seen = {k: OrderedDict() for k in self.KINDS}  # kind -> {hash: last seen (monotonic)}, least recent first
         self.evicted = {k: 0 for k in self.KINDS}
         self.lock = threading.Lock()
 
-    def see(self, kind: str, key: str) -> None:
-        h = hashlib.blake2s(key.encode(), key=self.salt, digest_size=8).hexdigest()
+    def see(self, kind: str, key: str | bytes) -> None:
+        """Count `key` now. Bytes are hashed as given (a subject, the same bytes the rate limiter hashes)."""
+        raw = key if isinstance(key, bytes) else key.encode()
+        h = hashlib.blake2s(raw, key=self.salt, digest_size=8).hexdigest()
         now = time.monotonic()
         with self.lock:
             seen = self.seen[kind]
-            seen.pop(h, None)
             seen[h] = now
-            cutoff = now - WINDOWS[-1][1]
-            while seen and (next(iter(seen.values())) < cutoff or len(seen) > self.MAX_KEYS):
-                if next(iter(seen.values())) >= cutoff:  # still in the window: dropped for room, not age
-                    self.evicted[kind] += 1
-                seen.pop(next(iter(seen)))
+            seen.move_to_end(h)
+            self._prune(seen, now)
+            while len(seen) > self.MAX_KEYS:  # all still in the window: dropped for room, not age
+                seen.popitem(last=False)
+                self.evicted[kind] += 1
 
-    def count(self, kind: str, window_s: int) -> int:
-        cutoff = time.monotonic() - window_s
+    def counts(self, kind: str) -> tuple[dict[str, int], int]:
+        """({window: distinct keys seen in it}, evictions so far), from one locked pass that also drops expired keys.
+
+        Newest first, stopping at the first key older than the shorter windows: the longest is what is left."""
+        now = time.monotonic()
         with self.lock:
-            return sum(1 for t in self.seen[kind].values() if t >= cutoff)
+            seen = self.seen[kind]
+            self._prune(seen, now)
+            out = {name: 0 for name, _ in WINDOWS[:-1]}
+            for t in reversed(seen.values()):
+                if t < now - WINDOWS[-2][1]:
+                    break
+                for name, s in WINDOWS[:-1]:
+                    out[name] += t >= now - s
+            out[WINDOWS[-1][0]] = len(seen)
+            return out, self.evicted[kind]
+
+    @staticmethod
+    def _prune(seen: OrderedDict, now: float) -> None:
+        cutoff = now - WINDOWS[-1][1]
+        while seen and next(iter(seen.values())) < cutoff:
+            seen.popitem(last=False)
 
 
 distinct = Distinct()
 
 
 def _labels(pairs) -> str:
-    return ",".join(f'{k}="{v.replace(chr(92), chr(92) * 2).replace(chr(34), chr(92) + chr(34))}"' for k, v in pairs)
+    """Label pairs in the text format: backslash, double quote and newline escaped."""
+    esc = lambda v: v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")  # noqa: E731
+    return ",".join(f'{k}="{esc(v)}"' for k, v in pairs)
 
 
 class Metrics:
@@ -223,13 +246,12 @@ class Metrics:
         lines += ["# HELP mcp_distinct_callers Distinct callers in the window: client = /24 or /48 without probers "
                   "or own tests, chatgpt_subject = x-openai-subject from ChatGPT egress. Reset on restart.",
                   "# TYPE mcp_distinct_callers gauge"]
-        for kind in Distinct.KINDS:
-            for window, seconds in WINDOWS:
-                n = distinct.count(kind, seconds)
-                lines.append(f'mcp_distinct_callers{{kind="{kind}",window="{window}"}} {n}')
+        snapshot = {kind: distinct.counts(kind) for kind in Distinct.KINDS}
+        for kind, (windows, _) in snapshot.items():
+            lines += [f'mcp_distinct_callers{{kind="{kind}",window="{w}"}} {n}' for w, n in windows.items()]
         lines += ["# HELP mcp_distinct_evictions_total Distinct-caller keys dropped to stay under the cap, by kind.",
                   "# TYPE mcp_distinct_evictions_total counter"]
-        lines += [f'mcp_distinct_evictions_total{{kind="{kind}"}} {distinct.evicted[kind]}' for kind in Distinct.KINDS]
+        lines += [f'mcp_distinct_evictions_total{{kind="{kind}"}} {ev}' for kind, (_, ev) in snapshot.items()]
         return "\n".join(lines) + "\n"
 
 
