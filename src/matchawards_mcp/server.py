@@ -50,6 +50,11 @@ INSTRUCTIONS = (
 )
 # Added to INSTRUCTIONS only when show_results exists (MATCHAWARDS_WIDGETS=1).
 CARD_INSTRUCTIONS = "To show the user a list, call show_results last with the ids you picked."
+# With the card on, the searches whose ids show_results takes say so in their description and in every non-empty
+# result's note: the model reads a result's note at the moment it decides what to show.
+SHOW_HINT = ("Pick the best results for the user and call show_results with their ids; it shows them as a card the "
+             "user can pick from.")
+SHOW_SOURCES = ("search_contracts", "search_grants")
 
 # HTTP mode only: the usage ledger (None when disabled, and always in stdio mode) and the request being served.
 ledger: usage.Ledger | None = None
@@ -92,6 +97,19 @@ CARD_META = {
 }
 
 
+def _with_show_hint(fn):
+    """A search that ends its note with SHOW_HINT when it found anything."""
+
+    @functools.wraps(fn)
+    async def hinted(*args, **kwargs):
+        result = await fn(*args, **kwargs)
+        if result.results:
+            result.note = f"{result.note} {SHOW_HINT}" if result.note else SHOW_HINT
+        return result
+
+    return hinted
+
+
 def _tool(srv: MCPServer, fn, title: str):
     """Register a read-only tool on `srv`; its docstring is the description the model reads, its return model the
     outputSchema.
@@ -99,6 +117,9 @@ def _tool(srv: MCPServer, fn, title: str):
     In --http mode each call that reaches the tool is counted, timed and written to the usage ledger: tool name,
     outcome, latency and who called (see HttpGuard). Never the arguments. Outside an HTTP request (stdio) it records
     nothing."""
+
+    if WIDGETS and fn.__name__ in SHOW_SOURCES:
+        fn = _with_show_hint(fn)
 
     @functools.wraps(fn)
     async def recorded(*args, **kwargs):
@@ -123,6 +144,8 @@ def _tool(srv: MCPServer, fn, title: str):
 
     # One line per paragraph: the docstring's wrapping never reaches the published description.
     description = "\n\n".join(" ".join(p.split()) for p in inspect.cleandoc(fn.__doc__).split("\n\n"))
+    if WIDGETS and fn.__name__ in SHOW_SOURCES:
+        description += "\n\n" + SHOW_HINT
     meta = {"securitySchemes": SECURITY_SCHEMES}
     if WIDGETS and fn.__name__ in CARD_TOOLS:
         meta["ui"] = {"resourceUri": CARD_URI}

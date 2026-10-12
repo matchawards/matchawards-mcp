@@ -545,3 +545,29 @@ async def test_show_results_bad_ids_are_rejected_before_any_request(api, card_se
     with pytest.raises(ToolError):
         await card_server.call_tool("show_results", {"ids": ids})
     assert api.requests == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("name,args", [("search_contracts", {"state": "VA"}), ("search_grants", {"keyword": "broadband"})])
+async def test_with_the_card_search_results_point_at_show_results(api, card_server, name, args):
+    api.replies = [ok(page([1, 2]))]
+    out = await card_server.call_tool(name, args)
+    assert out.structured_content["note"].endswith(server.SHOW_HINT)
+    tool = {t.name: t for t in await card_server.list_tools()}[name]
+    assert tool.description.endswith(server.SHOW_HINT)
+    assert "show_results" in server.SHOW_HINT
+
+
+@pytest.mark.anyio
+async def test_with_the_card_an_empty_search_has_no_show_hint(api, card_server):
+    api.replies = [ok(page([]))]
+    out = await card_server.call_tool("search_contracts", {"state": "VA"})
+    assert server.SHOW_HINT not in (out.structured_content["note"] or "")
+
+
+@pytest.mark.anyio
+async def test_without_the_card_nothing_points_at_show_results(api):
+    api.replies = [ok(page([1]))]
+    out = await server.mcp.call_tool("search_contracts", {"state": "VA"})
+    assert "show_results" not in json.dumps(out.structured_content)
+    assert all("show_results" not in t.description for t in await server.mcp.list_tools())
