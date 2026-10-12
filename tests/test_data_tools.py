@@ -638,3 +638,9 @@ async def test_no_naics_filter_no_match_lists_and_awards_never_show_ai_matches(a
     api.replies = [ok({**page([]), "results": [{**award(1), "ai_matched_naics": ["541512"]}]})]
     out = await tools.search_awards(naics="541512")
     assert "ai_matched_naics" not in out.results[0].model_dump()
+
+
+def test_opportunity_naics_says_state_codes_are_ai_assigned():
+    from matchawards_mcp import schemas
+    assert "On state notices (type state) the naics code itself is AI-assigned." in (
+        schemas.OpportunityRow.model_fields["naics"].description)

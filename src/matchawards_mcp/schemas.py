@@ -19,8 +19,8 @@ Agency = Annotated[str | None, BeforeValidator(lambda v: tidy_agency(v) if isins
 
 
 def _six_digit_codes(v) -> list[str] | None:
-    """matched_naics or ai_matched_naics from the API, read leniently: a list (or one code) of six-digit codes; anything else is dropped
-    rather than failing the row."""
+    """matched_naics or ai_matched_naics from the API, read leniently: a list (or one code) of six-digit codes;
+    anything else is dropped rather than failing the row."""
     items = [v] if isinstance(v, str) else v if isinstance(v, list) else []
     codes = [c.strip() for c in items if isinstance(c, str) and re.fullmatch(r"\s*\d{6}\s*", c)]
     return codes or None
@@ -90,7 +90,7 @@ class OpportunityRow(BaseModel):
     agency: Agency = None
     agency_id: Text = Field(None, description="The agency's MatchAwards id.")
     office: Text = None
-    naics: Naics | None = None
+    naics: Naics | None = Field(None, description="On state notices (type state) the naics code itself is AI-assigned.")
     matched_naics: MatchedNaics = Field(
         None, description="Only when you filtered by naics: the requested codes this record carries: its own "
         "code (in naics) or, for a grant or job, another code of its program or occupation.")
