@@ -92,7 +92,7 @@ class OpportunityRow(BaseModel):
     office: Text = None
     naics: Naics | None = None
     matched_naics: MatchedNaics = Field(
-        None, description="Only when you filtered by naics: the requested codes this record really carries: its own "
+        None, description="Only when you filtered by naics: the requested codes this record carries: its own "
         "code (in naics) or, for a grant or job, another code of its program or occupation.")
     ai_matched_naics: MatchedNaics = Field(
         None, description="Only when you filtered by naics: requested codes this contract notice matched only "
@@ -204,7 +204,7 @@ class AwardRow(BaseModel):
     agency_id: Text = None
     naics: Naics | None = None
     matched_naics: MatchedNaics = Field(
-        None, description="Only when you filtered by naics: the requested codes this award really carries: its own "
+        None, description="Only when you filtered by naics: the requested codes this award carries: its own "
         "code (in naics) or, for a grant award, another code of its program.")
     set_aside: Text = None
     state: Text = None

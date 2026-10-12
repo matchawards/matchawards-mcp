@@ -40,13 +40,19 @@ JOB_SOURCE: str | None = None
 
 # Optional filters are Annotated[X | None, Field(...)] so the description sits at the top level of
 # the JSON schema while the constraint still applies to the non-null value.
+NAICS_PATTERN = r"^\s*\d{6}(\s*,\s*\d{6}){0,9}\s*$"
+NAICS_FILTER = "Up to 10 six-digit NAICS codes, comma-separated, e.g. '236220' or '541511,541512'."
 Naics = Annotated[
     str | None,
-    Field(pattern=r"^\s*\d{6}(\s*,\s*\d{6}){0,9}\s*$",
-          description="Up to 10 six-digit NAICS codes, comma-separated, e.g. '236220' or '541511,541512'. "
-          "A record matches on its own codes (matched_naics). In search_contracts a notice can also match through a "
-          "code MatchAwards' AI suggested: it is listed in ai_matched_naics, so call that match AI-suggested. "
-          "Unknown codes are ignored."),
+    Field(pattern=NAICS_PATTERN, description=f"{NAICS_FILTER} A record matches on its own codes (matched_naics says "
+          "which). Unknown codes are ignored."),
+]
+# search_contracts only: its notices can also match through an AI-suggested code.
+ContractNaics = Annotated[
+    str | None,
+    Field(pattern=NAICS_PATTERN, description=f"{NAICS_FILTER} A notice matches on its own codes (matched_naics says "
+          "which), or through a code MatchAwards' AI suggested: that one is listed in ai_matched_naics, so call the "
+          "match AI-suggested. Unknown codes are ignored."),
 ]
 State = Annotated[
     str | None,
@@ -109,7 +115,7 @@ def _parse(model: type[BaseModel], data: dict) -> BaseModel:
 
 
 async def search_contracts(
-    naics: Naics = None,
+    naics: ContractNaics = None,
     state: State = None,
     keyword: Keyword = None,
     set_aside: SetAside = None,

@@ -595,11 +595,13 @@ async def test_matched_naics_is_absent_without_a_naics_filter(api):
 
 def test_naics_filter_and_rows_tell_real_codes_from_ai_suggested_ones():
     from matchawards_mcp import schemas
-    desc = tools.Naics.__metadata__[0].description
-    assert "ai_matched_naics" in desc and "AI-suggested" in desc and "search_contracts" in desc
-    assert "really carries" in schemas.OpportunityRow.model_fields["matched_naics"].description
+    shared = tools.Naics.__metadata__[0].description
+    assert "matched_naics says which" in shared and "ai_matched_naics" not in shared
+    contracts = tools.ContractNaics.__metadata__[0].description
+    assert "ai_matched_naics" in contracts and "AI-suggested" in contracts
+    assert "codes this record carries" in schemas.OpportunityRow.model_fields["matched_naics"].description
     assert "AI-suggested" in schemas.OpportunityRow.model_fields["ai_matched_naics"].description
-    assert "really carries" in schemas.AwardRow.model_fields["matched_naics"].description
+    assert "codes this award carries" in schemas.AwardRow.model_fields["matched_naics"].description
     assert "ai_matched_naics" not in schemas.AwardRow.model_fields  # an award's AI copies never count
 
 
