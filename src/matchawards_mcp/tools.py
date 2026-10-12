@@ -639,6 +639,8 @@ SHOW_MAX = 10  # ids per show_results call, each one API request
 # one call, with the searches around it, under the API's per-IP burst limit (20 requests per 5 seconds).
 SHOW_CONCURRENCY = 5
 SHOWN_TYPES = ("federal", "state", "grant")  # the card shows contracts and grants, never jobs
+# The rows are in the card (where the host draws it) and in this result's text: a short reply, not the list again.
+SHOWN_REPLY_HINT = "Keep the reply short: which ones to look at first and why; the card has the full rows."
 NOT_SHOWN_NOTE = ("show_results shows contracts and grants: ids from search_contracts or search_grants. Ids from "
                   "search_jobs or search_awards, and unknown ids, are not shown.")
 
@@ -682,7 +684,7 @@ async def show_results(
         results=[row for _, row in shown.values()],
         missing=missing,
         failed=list(failed),
-        note=LINK_RULE + " " + NOT_SHOWN_NOTE if missing else LINK_RULE,
+        note=" ".join([LINK_RULE, SHOWN_REPLY_HINT] + ([NOT_SHOWN_NOTE] if missing else [])),
         warning=f"{len(failed)} could not be fetched (MatchAwards was busy or failed); call show_results again with "
                 "just those ids to add them." if failed else None,
     )

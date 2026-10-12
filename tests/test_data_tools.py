@@ -415,7 +415,8 @@ async def test_show_results_fetches_each_id_once_in_order_and_reports_missing(ap
     assert [r.id for r in out.results] == ["4", "1", "5"]
     assert out.missing == ["2", "3"]
     assert sorted(r.url.path.rsplit("/", 1)[1] for r in api.requests) == ["1", "2", "3", "4", "5"]  # "1" once
-    assert out.note == tools.LINK_RULE + " " + tools.NOT_SHOWN_NOTE and out.as_of == "2026-10-12T09:00:00Z"
+    assert out.note == " ".join([tools.LINK_RULE, tools.SHOWN_REPLY_HINT, tools.NOT_SHOWN_NOTE])
+    assert out.as_of == "2026-10-12T09:00:00Z"
     assert not out._partial
 
 
@@ -433,7 +434,8 @@ async def test_show_results_with_only_job_or_unknown_ids_says_which_ids_it_takes
 @pytest.mark.anyio
 async def test_show_results_without_missing_ids_keeps_the_plain_note(api):
     api.replies = by_id(_1=httpx.Response(200, json=opp(1, "federal")))
-    assert (await tools.show_results(["1"])).note == tools.LINK_RULE
+    assert (await tools.show_results(["1"])).note == tools.LINK_RULE + " " + tools.SHOWN_REPLY_HINT
+    assert "card has the full rows" in tools.SHOWN_REPLY_HINT and "do not" not in tools.SHOWN_REPLY_HINT.lower()
 
 
 @pytest.mark.anyio
