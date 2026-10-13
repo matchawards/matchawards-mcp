@@ -174,11 +174,12 @@ Do not trust a broad private range such as `172.16.0.0/12`: it may overlap your 
 | `MATCHAWARDS_METRICS_TOKEN` | unset | `--http` only: Bearer token for `/metrics`. Unset: the metrics listener does not start. |
 | `MATCHAWARDS_METRICS_HOST` | `127.0.0.1` | `--http` only: address of the metrics listener. |
 | `MATCHAWARDS_METRICS_PORT` | `9765` | `--http` only: port of the metrics listener. |
+| `MATCHAWARDS_USAGE_RETENTION_DAYS` | `180` | `--http` only: days usage-stat rows are kept. |
 | `MATCHAWARDS_WIDGETS` | unset | `1`: serve the result card (see Cards). Unset: no card resource and no `show_results`. |
 
 ## Usage stats (hosted mode)
 
-With `--http` the server keeps usage stats in a SQLite file (`MATCHAWARDS_USAGE_DB`, WAL mode). stdio mode records nothing. Writes run on two background threads and are best-effort: a failed write is counted in `mcp_ledger_errors_total` and never fails a request. Rows older than 365 days are deleted, at most once a day.
+With `--http` the server keeps usage stats in a SQLite file (`MATCHAWARDS_USAGE_DB`, WAL mode). stdio mode records nothing. Writes run on two background threads and are best-effort: a failed write is counted in `mcp_ledger_errors_total` and never fails a request. Rows older than `MATCHAWARDS_USAGE_RETENTION_DAYS` days (default 180) are deleted, at most once a day.
 
 What is recorded:
 
