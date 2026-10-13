@@ -24,7 +24,7 @@ The `agency` filter takes a name. The server looks it up among MatchAwards' agen
 
 Award records may be incomplete (federal awards especially), so every award result says so. The two brief tools describe firms as having won similar work, never as the incumbent; they make at most 1 opportunity request and 6 award requests per call (at most 3 per query, shared by the queries), within 6 seconds, and when either limit cuts the lookup short they answer with what they read and a `warning`. Their `sample` says how many award records the figures rest on, their dates, and whether every matching record was read. A grant award's title is its recipient's name, so the model is asked to head it with the awardee name and CFDA number instead.
 
-Every tool is read-only and needs no account: each declares `readOnlyHint`, `idempotentHint`, a title and `securitySchemes: [{"type": "noauth"}]` (in `_meta`). Results are structured: each tool publishes an `outputSchema` and returns `structuredContent`, with the same JSON as text for clients that read only text. Every result carries a `url` on matchawards.com (and a `sam_url` for federal notices), and the server asks the model to show them as markdown links. Links to matchawards.com carry `utm_source`, `utm_medium` and `utm_campaign` parameters naming the AI host the request came from (for example `utm_source=chatgpt`); links to other sites are left unchanged.
+Every tool is read-only and needs no account (except `my_matches`, a hosted tool that exists only with account linking on; see Linked accounts): each declares `readOnlyHint`, `idempotentHint`, a title and `securitySchemes: [{"type": "noauth"}]` (in `_meta`). Results are structured: each tool publishes an `outputSchema` and returns `structuredContent`, with the same JSON as text for clients that read only text. Every result carries a `url` on matchawards.com (and a `sam_url` for federal notices), and the server asks the model to show them as markdown links. Links to matchawards.com carry `utm_source`, `utm_medium` and `utm_campaign` parameters naming the AI host the request came from (for example `utm_source=chatgpt`); links to other sites are left unchanged.
 
 ### Changes in 1.0.4
 
@@ -189,17 +189,28 @@ Do not trust a broad private range such as `172.16.0.0/12`: it may overlap your 
 | `MATCHAWARDS_AGENT_API_BASE` | `MATCHAWARDS_API_BASE` | `--http` only, linking on: base URL of the account API that checks a linked user's token. |
 | `MATCHAWARDS_WIDGETS` | unset | `1`: serve the result card (see Cards). Unset: no card resource and no `show_results`. |
 
+## Linked accounts
+
+Hosted mode (`--http`) only, and off unless `MATCHAWARDS_AUTH_ISSUER` is set. Off, the tool list, the instructions and every result are the same as without it.
+
+On, a user can link their MatchAwards account (sign in with Google or email on matchawards.com) and gets one more tool, `my_matches`: open contracts matching the NAICS codes, set-aside and state on their MatchAwards profile, with the rows, paging and links of `search_contracts` (`type` narrows to federal or state, `ignore_state` drops the state filter, which skips federal notices without a state). `profile_used` says which filters came from the profile. A profile without NAICS codes gets no search, and a `settings_url` to its match settings instead. Every other tool still needs no account and never reads a token.
+
+- matchawards.com is the OAuth authorization server; this server is only the resource server, and serves its protected-resource metadata (RFC 9728) at `/.well-known/oauth-protected-resource/mcp`. The only scope is `profile:read`. `my_matches` declares `securitySchemes` `[{"type": "noauth"}, {"type": "oauth2", "scopes": ["profile:read"]}]`; every other tool keeps `noauth` only.
+- A `tools/call` of `my_matches` without a usable token gets a challenge naming the metadata and the scope. Claude and other MCP clients get HTTP 401 (403 when the token lacks `profile:read`) with `WWW-Authenticate`, before the tool runs, and start linking on it. ChatGPT (User-Agent `openai-mcp`) links on a tool result instead, so it gets a 200 result with `isError` and the same header value in `_meta["mcp/www_authenticate"]`. When MatchAwards does not answer the token check, the call fails with a "busy, retry" error, never a challenge.
+- The token check is one `GET {MATCHAWARDS_AGENT_API_BASE}/api/agent/v1/me` with the token. Only a token issued for this server (`MATCHAWARDS_RESOURCE`, RFC 8707) is taken. The answer is kept in memory for 60 seconds (a rejected token for 30), under a keyed hash of the token.
+- What is kept: the ledger's `linked` flag on each tool call (whether it ran with a linked account), and in memory a salted hash of the account id for the distinct-account gauge. Tokens, the `Authorization` header and account ids are never stored or logged.
+
 ## Usage stats (hosted mode)
 
 With `--http` the server keeps usage stats in a SQLite file (`MATCHAWARDS_USAGE_DB`, WAL mode). stdio mode records nothing. Writes run on two background threads and are best-effort: a failed write is counted in `mcp_ledger_errors_total` and never fails a request. Rows older than `MATCHAWARDS_USAGE_RETENTION_DAYS` days (default 180) are deleted, at most once a day.
 
 What is recorded:
 
-- **Tool calls**: one row per call that reached a tool: time, tool name, outcome (`ok`, `invalid_input`, `upstream_error`, `bad_response` (a reply the tools cannot read), `upstream_timeout` (the API ran out of time; retry), `partial` (`assess_opportunity` or `find_teaming_partners` answered, but its request or time limit cut the award lookup short), `rate_limited_upstream`, `busy`, `internal_error`), the client network (IPv4 /24 or IPv6 /48), the User-Agent (first 200 characters), its family (`openai-mcp`, `claude-user`, `claude`, `cursor`, ..., `prober` or `other`) and the latency. Calls stopped by the rate limit are counted in a metric, with no row. Arguments the SDK rejects before the tool runs leave no row either; they still count in the transport table as `tools/call`.
+- **Tool calls**: one row per call that reached a tool: time, tool name, outcome (`ok`, `invalid_input`, `upstream_error`, `bad_response` (a reply the tools cannot read), `upstream_timeout` (the API ran out of time; retry), `partial` (`assess_opportunity` or `find_teaming_partners` answered, but its request or time limit cut the award lookup short), `rate_limited_upstream`, `busy`, `internal_error`, `link_required` (`my_matches` answered with the linking challenge)), whether it ran with a linked account (`linked`, 0 or 1; never which account), the client network (IPv4 /24 or IPv6 /48), the User-Agent (first 200 characters), its family (`openai-mcp`, `claude-user`, `claude`, `cursor`, ..., `prober` or `other`) and the latency. Calls stopped by the rate limit are counted in a metric, with no row. Arguments the SDK rejects before the tool runs leave no row either; they still count in the transport table as `tools/call`.
 - **Transport, per day**: one counter per client network, JSON-RPC method (known MCP methods only, anything else is `_other`) and `clientInfo` name and version, with the last User-Agent seen. `clientInfo` is read from the first 8 KiB of an `initialize` body, or from `params._meta` (2026-07-28 clients), as the body streams past; the body is not buffered. At most 50 counters per client network and day; past that they fold into `_other`.
 - **ChatGPT callers**: when `MATCHAWARDS_USAGE_SALT` is set and a request from ChatGPT's egress addresses carries `x-openai-subject` (ChatGPT's anonymous per-user id; from any other address it is ignored), the tool-call row stores a 16-hex HMAC-SHA256 of it, to count distinct ChatGPT callers (`openai-mcp` family only in the stats). `x-openai-session` is not used: it changes per conversation.
 
-Never recorded: tool arguments (search terms, ids), request or response bodies, full client addresses, raw header values.
+Never recorded: tool arguments (search terms, ids), request or response bodies, full client addresses, raw header values, tokens and account ids.
 
 Read the stats with:
 
@@ -207,7 +218,7 @@ Read the stats with:
 matchawards-mcp stats --days 7          # --db PATH to read another file
 ```
 
-It prints tool calls per tool and outcome, calls per family, real calls vs probers vs our own tests (`matchawards-test/` UA), distinct client networks (probers and own tests left out), distinct ChatGPT fingerprints, transport requests per method and the top `clientInfo` names. In Docker: `docker exec <container> matchawards-mcp stats --days 1`.
+It prints tool calls per tool and outcome, calls per family, real calls vs probers vs our own tests (`matchawards-test/` UA), distinct client networks (probers and own tests left out), distinct ChatGPT fingerprints, tool calls with a linked account, transport requests per method and the top `clientInfo` names. In Docker: `docker exec <container> matchawards-mcp stats --days 1`.
 
 ### Metrics
 
@@ -219,9 +230,11 @@ When `MATCHAWARDS_METRICS_TOKEN` is set, a second listener in the same process (
 - `mcp_rejected_total{reason}` (counter): `rate_limit_client`, `rate_limit_prefix`, `rate_limit_subject`, `rate_limit_egress`, `rate_limit_global`, `size`, `host`, `path`, `method`.
 - `mcp_agent_requests_total{family}` (counter): requests served by User-Agent family.
 - `mcp_clients_total{client}` (counter): `initialize` requests by `clientInfo.name`, folded into `chatgpt`, `claude`, `cursor`, `vscode`, `n8n`, `matchawards`, `mcp-inspector`, `other` or `unknown`.
-- `mcp_distinct_callers{kind,window}` (gauge, `window` = `1h` or `24h`): distinct `client` networks (/24 or /48, probers and own tests left out) and distinct ChatGPT users (`chatgpt_subject`: `x-openai-subject` on requests from ChatGPT's egress addresses only). Kept as per-process salted hashes, at most 100,000 per kind. The distinct-caller gauges reset on restart, so a 24h value is only complete 24 hours after a start.
+- `mcp_distinct_callers{kind,window}` (gauge, `window` = `1h` or `24h`): distinct `client` networks (/24 or /48, probers and own tests left out) distinct ChatGPT users (`chatgpt_subject`: `x-openai-subject` on requests from ChatGPT's egress addresses only) and distinct linked accounts (`account`, account linking on). Kept as per-process salted hashes, at most 100,000 per kind. The distinct-caller gauges reset on restart, so a 24h value is only complete 24 hours after a start.
 - `mcp_distinct_evictions_total{kind}` (counter): distinct-caller keys dropped to stay under that cap (non-zero only under a flood of new networks or subjects). While it is above zero the distinct counts are a lower bound: a caller rotating subjects or networks can push others out.
 - `mcp_ledger_errors_total` (counter): usage ledger writes that failed.
+- `mcp_link_challenges_total{host,error}` (counter, account linking on): challenges sent, by `host` (`chatgpt`, `claude`, `other`) and `error` (`invalid_token`, `insufficient_scope`).
+- `mcp_linked_calls_total{tool}` (counter, account linking on): tool calls that ran with a linked account.
 
 ### Ops notes
 

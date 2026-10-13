@@ -16,6 +16,8 @@ from matchawards_mcp import server, usage
 from matchawards_mcp import api as ma_api
 
 from test_http import LEGACY, egress, http  # noqa: F401  (egress is a fixture)
+from test_linking import CLAUDE_UA, ME, OPENAI_UA, TOKEN, issuer, linked, me_api  # noqa: F401  (fixtures)
+from test_linking import call as link_call
 from test_server import api, anyio_backend, page  # noqa: F401  (fixtures)
 
 SECRET = "zebracornsecret"  # an argument value that must never be stored
@@ -311,7 +313,7 @@ async def test_direct_calls_outside_http_record_nothing(api, usage_db, tmp_path)
     server.ledger = usage.Ledger.open(str(usage_db))
     await server.mcp.call_tool("get_opportunity", {"id": "7"})  # through the usage wrapper, outside a request
     assert rows(usage_db) == [] and usage.metrics.counts == {} and usage.metrics.histograms == {}
-    assert usage.distinct.seen == {"client": {}, "chatgpt_subject": {}}
+    assert usage.distinct.seen == {"client": {}, "chatgpt_subject": {}, "account": {}}
 
 
 @pytest.mark.anyio
@@ -367,7 +369,7 @@ def test_a_quiet_day_leaves_no_dead_keys(monkeypatch):
     now[0] += 86400 + 1  # no see() since: render alone prunes
     text = usage.metrics.render()
     assert 'mcp_distinct_callers{kind="client",window="24h"} 0' in text
-    assert usage.distinct.seen == {"client": {}, "chatgpt_subject": {}}
+    assert usage.distinct.seen == {"client": {}, "chatgpt_subject": {}, "account": {}}
 
 
 def test_counts_newest_first_stop_at_the_window(monkeypatch):
@@ -510,3 +512,89 @@ def test_retention_days_defaults_to_180_and_rejects_bad_values():
     for bad in ("0", "-1", "x", ""):
         with pytest.raises(SystemExit, match="MATCHAWARDS_USAGE_RETENTION_DAYS"):
             usage.retention_days(bad)
+
+
+# --- Account linking: challenges, linked calls, distinct accounts, the ledger's linked flag ------------------------
+
+def test_link_metrics_render_with_help_and_type():
+    usage.metrics.inc("mcp_link_challenges_total", host="claude", error="invalid_token")
+    usage.metrics.inc("mcp_linked_calls_total", tool="my_matches")
+    usage.distinct.see("account", "123")
+    text = usage.metrics.render()
+    for name in ("mcp_link_challenges_total", "mcp_linked_calls_total"):
+        assert f"# HELP {name} " in text and f"# TYPE {name} counter" in text
+    assert 'mcp_link_challenges_total{error="invalid_token",host="claude"} 1' in text
+    assert 'mcp_linked_calls_total{tool="my_matches"} 1' in text
+    assert 'mcp_distinct_callers{kind="account",window="24h"} 1' in text
+    assert "account = linked accounts" in text
+    assert 'mcp_distinct_evictions_total{kind="account"} 0' in text
+
+
+@pytest.mark.anyio
+async def test_challenges_are_counted_by_host_and_error_once(linked, me_api, api, monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "100")
+    async with http() as hc:
+        assert (await link_call(hc, ua=CLAUDE_UA)).status_code == 401
+        assert (await link_call(hc, ua="curl/8.0")).status_code == 401
+        assert (await link_call(hc, ua=OPENAI_UA)).json()["result"]["isError"]  # the tool answers it
+        me_api.reply = lambda req: httpx.Response(403)
+        assert (await link_call(hc, ua=CLAUDE_UA, token=TOKEN)).status_code == 403
+        assert (await link_call(hc, ua=OPENAI_UA, token="other-token")).json()["result"]["isError"]
+        me_api.reply = lambda req: httpx.Response(502)  # no answer: never a challenge
+        await link_call(hc, ua=CLAUDE_UA, token="third-token")
+    challenges = {dict(labels)["host"] + "/" + dict(labels)["error"]: n
+                  for (name, labels), n in usage.metrics.counts.items() if name == "mcp_link_challenges_total"}
+    assert challenges == {"claude/invalid_token": 1, "other/invalid_token": 1, "chatgpt/invalid_token": 1,
+                          "claude/insufficient_scope": 1, "chatgpt/insufficient_scope": 1}
+    assert not any(name == "mcp_linked_calls_total" for name, _ in usage.metrics.counts)
+
+
+@pytest.mark.anyio
+async def test_linked_calls_are_counted_and_flagged_without_the_account(linked, me_api, api, usage_db, monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "100")
+    me_api.reply = lambda req: httpx.Response(200, json={**ME, "account": {"id": "acct-zebra-77"}})
+    async with http() as hc:
+        for token in ("tok-a", "tok-b"):  # two tokens of one account: one distinct account
+            assert not (await link_call(hc, token=token)).json()["result"].get("isError")
+        await link_call(hc, ua=OPENAI_UA)  # a challenge: not linked
+        await post(hc, call("search_contracts", {"state": "VA"}), Authorization="Bearer tok-a")  # never checked
+    text = usage.metrics.render()
+    assert 'mcp_linked_calls_total{tool="my_matches"} 2' in text
+    assert 'mcp_distinct_callers{kind="account",window="24h"} 1' in text
+    assert 'mcp_tool_calls_total{outcome="link_required",tool="my_matches"} 1' in text
+    got = sorted((r["tool"], r["outcome"], r["linked"]) for r in rows(usage_db))
+    assert got == [("my_matches", "link_required", 0), ("my_matches", "ok", 1), ("my_matches", "ok", 1),
+                   ("search_contracts", "ok", 0)]
+    raw = b"".join(p.read_bytes() for p in usage_db.parent.glob("usage.db*"))
+    assert b"acct-zebra-77" not in raw and b"tok-a" not in raw
+    assert all("acct-zebra-77" not in k for k in usage.distinct.seen["account"])  # a salted hash only
+
+
+OLD_SCHEMA = """
+CREATE TABLE tool_calls (
+  ts TEXT NOT NULL, tool TEXT NOT NULL, outcome TEXT NOT NULL, client_key TEXT NOT NULL,
+  ua TEXT NOT NULL, family TEXT NOT NULL, caller_fp TEXT, latency_ms INTEGER NOT NULL);
+CREATE INDEX tool_calls_ts ON tool_calls (ts);
+CREATE TABLE transport_daily (
+  day TEXT NOT NULL, client_key TEXT NOT NULL, method TEXT NOT NULL, client_name TEXT NOT NULL,
+  client_version TEXT NOT NULL, count INTEGER NOT NULL, last_ua TEXT NOT NULL,
+  PRIMARY KEY (day, client_key, method, client_name, client_version));
+"""
+
+
+def test_a_ledger_from_before_linking_gets_the_linked_column(usage_db, capsys):
+    conn = sqlite3.connect(usage_db)
+    with conn:
+        conn.executescript(OLD_SCHEMA)
+        conn.execute("INSERT INTO tool_calls VALUES (?, 'search_jobs', 'ok', '192.0.2.0/24', 'x', 'other', NULL, 5)",
+                     (usage._now().isoformat(timespec="seconds"),))
+    conn.close()
+    server.main(["stats", "--db", str(usage_db)])  # read-only, not migrated yet: still prints
+    assert "Tool calls with a linked account" not in capsys.readouterr().out
+    ledger = usage.Ledger.open(str(usage_db))
+    ledger.submit(usage.Ledger.write_call, "my_matches", "ok", "192.0.2.0/24", "x", "other", None, 7, True)
+    server.ledger = ledger
+    assert sorted((r["tool"], r["linked"]) for r in rows(usage_db)) == [("my_matches", 1), ("search_jobs", 0)]
+    assert usage.Ledger.open(str(usage_db)) is not None  # a second open: already there, nothing to add
+    server.main(["stats", "--db", str(usage_db)])
+    assert "Tool calls with a linked account: 1" in capsys.readouterr().out

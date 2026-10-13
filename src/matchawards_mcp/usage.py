@@ -1,7 +1,9 @@
 """Usage stats for --http mode: a SQLite ledger, in-memory Prometheus metrics and the `stats` command.
 
 Never recorded: tool arguments, request bodies (only the JSON-RPC method and clientInfo are read from the first
-8 KiB of a request), full client addresses (IPv4 is kept per /24, IPv6 per /48) and raw header values.
+8 KiB of a request), full client addresses (IPv4 is kept per /24, IPv6 per /48), raw header values, and anything of a
+linked account but whether a call ran with one (a token is never seen here; its account id only as a salted hash in
+the distinct-caller gauges).
 stdio mode imports this module but never opens a ledger or counts anything.
 """
 
@@ -147,7 +149,7 @@ class Distinct:
     networks can push others out."""
 
     MAX_KEYS = 100_000
-    KINDS = ("client", "chatgpt_subject")
+    KINDS = ("client", "chatgpt_subject", "account")  # account: a linked account's id (account linking on)
 
     def __init__(self):
         self.salt = os.urandom(16)  # per process: the hashes cannot be matched across restarts or to the ledger
@@ -213,6 +215,9 @@ class Metrics:
         "mcp_agent_requests_total": "Requests served on /mcp by User-Agent family.",
         "mcp_clients_total": "initialize requests by client (clientInfo.name folded into a fixed set).",
         "mcp_ledger_errors_total": "Usage ledger writes that failed (the request itself was served).",
+        "mcp_link_challenges_total": "Account-linking challenges (HTTP 401/403, or ChatGPT's tool result), by host "
+                                     "(chatgpt, claude, other) and error.",
+        "mcp_linked_calls_total": "Tool calls that ran with a linked account, by tool.",
     }
     HISTOGRAM_HELP = {"mcp_tool_duration_seconds": "Tool call latency in seconds, by tool."}
 
@@ -255,7 +260,8 @@ class Metrics:
                 lines += [f"{name}_sum{{{_labels(labels)}}} {round(h[-1], 6)}",
                           f"{name}_count{{{_labels(labels)}}} {total}"]
         lines += ["# HELP mcp_distinct_callers Distinct callers in the window: client = /24 or /48 without probers "
-                  "or own tests, chatgpt_subject = x-openai-subject from ChatGPT egress. Reset on restart.",
+                  "or own tests, chatgpt_subject = x-openai-subject from ChatGPT egress, account = linked accounts. "
+                  "Reset on restart.",
                   "# TYPE mcp_distinct_callers gauge"]
         snapshot = {kind: distinct.counts(kind) for kind in Distinct.KINDS}
         for kind, (windows, _) in snapshot.items():
@@ -271,13 +277,25 @@ metrics = Metrics()
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tool_calls (
   ts TEXT NOT NULL, tool TEXT NOT NULL, outcome TEXT NOT NULL, client_key TEXT NOT NULL,
-  ua TEXT NOT NULL, family TEXT NOT NULL, caller_fp TEXT, latency_ms INTEGER NOT NULL);
+  ua TEXT NOT NULL, family TEXT NOT NULL, caller_fp TEXT, latency_ms INTEGER NOT NULL,
+  linked INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS tool_calls_ts ON tool_calls (ts);
 CREATE TABLE IF NOT EXISTS transport_daily (
   day TEXT NOT NULL, client_key TEXT NOT NULL, method TEXT NOT NULL, client_name TEXT NOT NULL,
   client_version TEXT NOT NULL, count INTEGER NOT NULL, last_ua TEXT NOT NULL,
   PRIMARY KEY (day, client_key, method, client_name, client_version));
 """
+
+
+def _has_column(conn, table: str, column: str) -> bool:
+    return any(row[1] == column for row in conn.execute(f"PRAGMA table_info({table})"))
+
+
+def migrate(conn) -> None:
+    """Bring a ledger made by an older version up to SCHEMA: tool_calls.linked (1.1) is added when missing, 0 for
+    the rows already there."""
+    if not _has_column(conn, "tool_calls", "linked"):
+        conn.execute("ALTER TABLE tool_calls ADD COLUMN linked INTEGER NOT NULL DEFAULT 0")
 
 
 def _now() -> datetime:
@@ -306,6 +324,7 @@ class Ledger:
             with sqlite3.connect(path) as conn:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.executescript(SCHEMA)
+                migrate(conn)
             conn.close()
         except (OSError, sqlite3.Error) as e:
             log.warning("usage ledger disabled: cannot use %s (%s)", path, e)
@@ -352,10 +371,12 @@ class Ledger:
         self.pruned_day = now.date().isoformat()  # set only after the deletes, so a failed prune is retried
 
     @staticmethod
-    def write_call(conn, tool, outcome, client_key, ua, family, caller_fp, latency_ms) -> None:
-        conn.execute("INSERT INTO tool_calls VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    def write_call(conn, tool, outcome, client_key, ua, family, caller_fp, latency_ms, linked=False) -> None:
+        """One tool call. linked: it ran with a linked account (which one is never stored)."""
+        conn.execute("INSERT INTO tool_calls (ts, tool, outcome, client_key, ua, family, caller_fp, latency_ms, "
+                     "linked) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                      (_now().isoformat(timespec="seconds"), tool, outcome, client_key, ua, family, caller_fp,
-                      latency_ms))
+                      latency_ms, int(linked)))
 
     @staticmethod
     def write_transport(conn, client_key, method, name, version, ua) -> None:
@@ -414,6 +435,9 @@ def stats(conn, days: int) -> str:
     ])
     out.append(f"\nDistinct client keys with tool calls (/24 or /48, no probers or own tests): {real_keys}")
     out.append(f"Distinct ChatGPT callers (x-openai-subject fingerprints): {fps}")
+    if _has_column(conn, "tool_calls", "linked"):  # a ledger no 1.1 server has opened yet has none
+        [(linked,)] = q("SELECT COUNT(*) FROM tool_calls WHERE ts >= ? AND linked = 1", ts)
+        out.append(f"Tool calls with a linked account: {linked}")
     by_method, by_client = Counter(), Counter()
     for method, name, version, count, _ in transport:
         by_method[method] += count

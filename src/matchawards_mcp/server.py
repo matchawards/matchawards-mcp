@@ -151,8 +151,8 @@ def _tool(srv: MCPServer, fn, title: str):
     outputSchema.
 
     In --http mode each call that reaches the tool is counted, timed and written to the usage ledger: tool name,
-    outcome, latency and who called (see HttpGuard). Never the arguments. Outside an HTTP request (stdio) it records
-    nothing."""
+    outcome, latency, who called (see HttpGuard) and whether it ran with a linked account. Never the arguments, nor
+    which account. Outside an HTTP request (stdio) it records nothing."""
 
     if WIDGETS and fn.__name__ in SHOW_SOURCES:
         fn = _with_show_hint(fn)
@@ -162,6 +162,8 @@ def _tool(srv: MCPServer, fn, title: str):
         req = _request.get()
         if req is None:
             return await fn(*args, **kwargs)
+        auth = linking.auth.get()
+        linked = isinstance(auth, linking.Profile)
         start, outcome = time.monotonic(), "internal_error"
         try:
             result = await fn(*args, **kwargs)
@@ -176,9 +178,14 @@ def _tool(srv: MCPServer, fn, title: str):
         finally:
             usage.metrics.inc("mcp_tool_calls_total", tool=fn.__name__, outcome=outcome)
             usage.metrics.observe("mcp_tool_duration_seconds", time.monotonic() - start, tool=fn.__name__)
+            if linked:
+                usage.metrics.inc("mcp_linked_calls_total", tool=fn.__name__)
+            if outcome == "link_required":  # its error, as the tool chose it: insufficient_scope or invalid_token
+                usage.metrics.inc("mcp_link_challenges_total", host=link_host(req["ua"]),
+                                  error=linking.INSUFFICIENT if auth == linking.INSUFFICIENT else linking.INVALID)
             if ledger is not None:
                 ledger.submit(usage.Ledger.write_call, fn.__name__, outcome, req["client"], req["ua"],
-                              req["family"], req["fp"], round((time.monotonic() - start) * 1000))
+                              req["family"], req["fp"], round((time.monotonic() - start) * 1000), linked)
 
     # One line per paragraph: the docstring's wrapping never reaches the published description.
     description = "\n\n".join(" ".join(p.split()) for p in inspect.cleandoc(fn.__doc__).split("\n\n"))
@@ -196,6 +203,13 @@ async def healthz(request: Request) -> Response:
 
 async def protected_resource(request: Request) -> Response:
     return JSONResponse(linking.metadata())
+
+
+def link_host(ua: str) -> str:
+    """The host label of mcp_link_challenges_total: chatgpt, claude or other (a fixed set)."""
+    if linking.is_openai_host(ua):
+        return "chatgpt"
+    return "claude" if usage.classify_ua(ua).startswith("claude") else "other"
 
 
 def build_mcp() -> MCPServer:
@@ -548,8 +562,11 @@ class HttpGuard:
                 if linking.linked_tool(body):
                     outcome = await linking.check(scope)
                     linking.auth.set(outcome)
-                    if outcome in (linking.INVALID, linking.INSUFFICIENT) and not linking.is_openai_host(raw_ua):
+                    if isinstance(outcome, linking.Profile):
+                        usage.distinct.see("account", outcome.account_id)  # hashed with the gauges' own salt
+                    elif outcome in (linking.INVALID, linking.INSUFFICIENT) and not linking.is_openai_host(raw_ua):
                         app = linking.challenge_response(outcome)
+                        usage.metrics.inc("mcp_link_challenges_total", host=link_host(raw_ua), error=outcome)
             await app(scope, app_receive, send)
         finally:
             linking.auth.reset(auth_token)
