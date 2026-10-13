@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 from collections import OrderedDict
@@ -263,6 +264,18 @@ async def test_me_caches_a_profile_until_it_expires(issuer, me_api, monkeypatch)
     assert isinstance(await linking.me(TOKEN), linking.Profile)
     assert len(me_api.requests) == 3
     assert TOKEN.encode() not in b"".join(linking._cache)  # keyed by a hash, never the token
+
+
+@pytest.mark.anyio
+async def test_a_profile_is_never_cached_past_its_token_expiry(issuer, me_api, monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(linking, "clock", lambda: now[0])
+    soon = (datetime.now(timezone.utc) + timedelta(seconds=10)).isoformat()
+    me_api.reply = lambda req: httpx.Response(200, json={**ME, "token_expires_at": soon})
+    assert isinstance(await linking.me(TOKEN), linking.Profile)
+    now[0] += 12  # inside the 60 s cache time, past the token's expiry
+    await linking.me(TOKEN)
+    assert len(me_api.requests) == 2
 
 
 @pytest.mark.anyio
@@ -565,6 +578,9 @@ def test_parse_profile_rejects_a_body_that_is_not_a_profile(body):
     ("javascript:alert(1)", False),
     ("//matchawards.com/settings", False),
     ("https://matchawards.com/a b", False),
+    ("https://evil.example\\.matchawards.com/settings", False),  # a browser goes to evil.example
+    ("https://evil.example%2f.matchawards.com/settings", False),
+    ("https://matchawards.com/settings\\x", False),
     ("https://matchawards.com/\n", False),
     ("https://matchawards.com/" + "a" * 500, False),
     ("", False), (None, False), (["https://matchawards.com/"], False),

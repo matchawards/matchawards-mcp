@@ -260,13 +260,16 @@ def _text(value, pattern: str) -> str | None:
 
 def _site_url(value) -> str | None:
     """An https link to the site (matchawards.com or a subdomain, as links.tagged knows it) with no user:password@,
-    no port other than 443 and no space or control character, at most 500 characters; else None."""
-    if not isinstance(value, str) or len(value) > 500 or any(c <= " " or c == "\x7f" for c in value):
+    no port other than 443, no backslash and no space or control character, at most 500 characters; else None.
+
+    The host must be plain letters, digits, dots and hyphens: a browser reads 'https://evil.example\\.matchawards.com'
+    as a link to evil.example while urlsplit would call it a subdomain of matchawards.com."""
+    if not isinstance(value, str) or len(value) > 500 or "\\" in value or any(c <= " " or c == "\x7f" for c in value):
         return None
     try:
         parts = urlsplit(value)
-        ok = parts.scheme == "https" and links.is_site(parts.hostname) and parts.port in (None, 443) \
-            and "@" not in parts.netloc
+        ok = parts.scheme == "https" and links.plain_netloc(parts.netloc) and links.is_site(parts.hostname) \
+            and parts.port in (None, 443)
     except ValueError:  # e.g. a port that is not a number
         return None
     return value if ok else None
@@ -301,18 +304,25 @@ def parse_profile(data) -> Profile | None:
     )
 
 
-def _expired(value) -> bool:
-    """Whether a /me token_expires_at is a time (ISO 8601; no zone is UTC) already past. Anything else is not."""
+def _seconds_left(value) -> float | None:
+    """Seconds until a /me token_expires_at (ISO 8601; no zone is UTC), negative once past; None when it is not a
+    time."""
     if not isinstance(value, str):
-        return False
+        return None
     value = value.strip()
     if value.endswith(("Z", "z")):  # Python before 3.11 does not read the Z
         value = value[:-1] + "+00:00"
     try:
         when = datetime.fromisoformat(value)
     except ValueError:
-        return False
-    return (when if when.tzinfo else when.replace(tzinfo=timezone.utc)) <= datetime.now(timezone.utc)
+        return None
+    return ((when if when.tzinfo else when.replace(tzinfo=timezone.utc)) - datetime.now(timezone.utc)).total_seconds()
+
+
+def _expired(value) -> bool:
+    """Whether a /me token_expires_at is a time already past. Anything else is not."""
+    left = _seconds_left(value)
+    return left is not None and left <= 0
 
 
 # The check of the request being served: a Profile, a Refusal, or None when it was not checked (stdio, linking off,
@@ -418,5 +428,6 @@ async def me(token: str) -> Profile | Refusal:
     # room): the 200 answers this call only.
     if max(_refused.get(key, -1), _refused_floor) < started:
         _invalid.pop(key, None)
-        _keep(_cache, key, CACHE_TTL_S, profile)
+        left = _seconds_left(data.get("token_expires_at"))  # never keep a profile past its token's expiry
+        _keep(_cache, key, CACHE_TTL_S if left is None else min(CACHE_TTL_S, left), profile)
     return profile

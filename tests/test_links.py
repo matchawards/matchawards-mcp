@@ -76,6 +76,8 @@ def test_the_request_source_is_used():
     "https://evil.example/?u=https://matchawards.com/a",
     "https://matchawards.com@evil.example/a", "mailto:x@matchawards.com", "javascript:alert(1)//matchawards.com",
     "/a/posts/1", "not a url", "http://[::1/a",
+    "https://evil.example\\.matchawards.com/a",  # a browser reads the backslash as a slash: host evil.example
+    "https://evil.example%2f.matchawards.com/a", "https://matchawards.com/a\\b",
 ])
 def test_other_links_are_unchanged(url):
     assert links.tagged(url) == url

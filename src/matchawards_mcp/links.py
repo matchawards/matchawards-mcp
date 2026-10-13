@@ -8,6 +8,7 @@ from the caller's User-Agent family), utm_medium=ai_agent and utm_campaign=match
 """
 
 import contextvars
+import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 MEDIUM = "ai_agent"
@@ -42,6 +43,12 @@ def is_site(host: str | None) -> bool:
     return bool(host) and (host == SITE_DOMAIN or host.endswith("." + SITE_DOMAIN))
 
 
+def plain_netloc(netloc: str) -> bool:
+    """Whether a URL's netloc is a plain host (letters, digits, dots, hyphens) with an optional port: nothing a browser
+    and urlsplit could read as different hosts (no backslash, userinfo, percent-encoding or brackets)."""
+    return bool(re.fullmatch(r"[A-Za-z0-9.-]+(:[0-9]{1,5})?", netloc))
+
+
 def tagged(url: str | None) -> str | None:
     """`url` with the UTM parameters added when it is a link to the site; any other URL unchanged. Its query and
     fragment are kept, and a URL that already has a utm_* parameter is left as it is. None or "" gives None."""
@@ -52,7 +59,7 @@ def tagged(url: str | None) -> str | None:
         host = parts.hostname
     except ValueError:  # e.g. a malformed IPv6 host
         return url
-    if parts.scheme not in ("http", "https") or not is_site(host):
+    if parts.scheme not in ("http", "https") or "\\" in url or not plain_netloc(parts.netloc) or not is_site(host):
         return url
     if any(k.lower().startswith("utm_") for k, _ in parse_qsl(parts.query, keep_blank_values=True)):
         return url
