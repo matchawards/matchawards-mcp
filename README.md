@@ -140,7 +140,7 @@ curl -s http://127.0.0.1:8765/mcp -H 'Content-Type: application/json' \
 
 How requests are handled, in order:
 
-- Repeated and trailing slashes are folded, so `/mcp/` and `//mcp` count as `/mcp`. Any path other than `/mcp` and `/healthz` gets 404.
+- Repeated and trailing slashes are folded, so `/mcp/` and `//mcp` count as `/mcp`. Any path other than `/mcp` and `/healthz` gets 404 (with account linking on, `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp` serve the protected-resource metadata, like `/healthz` on any host and not rate-limited).
 - `GET /healthz` returns `ok` and is not rate-limited.
 - A `Host` header not in `MATCHAWARDS_ALLOWED_HOSTS` (or `127.0.0.1`, `localhost`) gets 421, whatever the method.
 - Only `POST /mcp` is served. `GET`, `DELETE` and `OPTIONS` get 405 (no SSE stream, no sessions, no CORS).
@@ -183,6 +183,9 @@ Do not trust a broad private range such as `172.16.0.0/12`: it may overlap your 
 | `MATCHAWARDS_METRICS_HOST` | `127.0.0.1` | `--http` only: address of the metrics listener. |
 | `MATCHAWARDS_METRICS_PORT` | `9765` | `--http` only: port of the metrics listener. |
 | `MATCHAWARDS_USAGE_RETENTION_DAYS` | `180` | `--http` only: days usage-stat rows are kept. |
+| `MATCHAWARDS_AUTH_ISSUER` | unset | `--http` only: the OAuth authorization server (e.g. `https://matchawards.com`). Set: account linking is on. Unset: no linking, and nothing else changes. |
+| `MATCHAWARDS_RESOURCE` | `<issuer>/mcp` | `--http` only, linking on: this server's public URL, the resource tokens are issued for. |
+| `MATCHAWARDS_AGENT_API_BASE` | `MATCHAWARDS_API_BASE` | `--http` only, linking on: base URL of the account API that checks a linked user's token. |
 | `MATCHAWARDS_WIDGETS` | unset | `1`: serve the result card (see Cards). Unset: no card resource and no `show_results`. |
 
 ## Usage stats (hosted mode)

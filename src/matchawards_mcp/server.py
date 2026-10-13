@@ -35,7 +35,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
-from . import __version__, api, links, tools, usage
+from . import __version__, api, linking, links, tools, usage
 
 # The essentials sit in the first 512 characters: which tool for which intent, links as markdown, where the data
 # comes from and that it may be incomplete, no "incumbent", and that AI text is labelled. test_server.py checks it.
@@ -185,8 +185,13 @@ async def healthz(request: Request) -> Response:
     return PlainTextResponse("ok")
 
 
+async def protected_resource(request: Request) -> Response:
+    return JSONResponse(linking.metadata())
+
+
 def build_mcp() -> MCPServer:
-    """The server: the data tools, plus show_results and the card when WIDGETS is on, and GET /healthz.
+    """The server: the data tools, plus show_results and the card when WIDGETS is on, GET /healthz, and the
+    protected-resource metadata when linking is on (linking.enabled()).
 
     The module builds it once as `mcp`; tests build another after changing WIDGETS."""
     srv = Server(
@@ -206,6 +211,9 @@ def build_mcp() -> MCPServer:
         srv.resource(CARD_URI, name="matchawards-results", title="MatchAwards results", mime_type=CARD_MIME,
                      meta=CARD_META)(lambda: CARD_HTML)
     srv.custom_route("/healthz", methods=["GET"])(healthz)
+    if linking.enabled():
+        for path in sorted(linking.metadata_paths()):
+            srv.custom_route(path, methods=["GET"])(protected_resource)
     return srv
 
 
@@ -218,7 +226,7 @@ access_log = logging.getLogger("matchawards_mcp.access")
 _LOG_SALT = os.urandom(16)  # client keys in the log are hashed with a per-process salt, never written raw
 _SUBJECT_SALT = os.urandom(16)  # x-openai-subject is kept only as a keyed hash, as a rate-limit key
 _LOG_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
-_LOG_PATHS = {"/mcp", "/healthz"}
+_LOG_PATHS = {"/mcp", "/healthz", linking.METADATA_PATH, linking.METADATA_PATH + "/mcp"}
 MAX_BODY_BYTES = 64 * 1024  # a JSON-RPC request to these tools is well under 2 KB
 
 
@@ -420,8 +428,10 @@ class HttpGuard:
 
     def reject(self, scope, path: str, ip, key: str) -> tuple[str, Response] | None:
         """(reason, response) that ends this request here, or None to pass it on."""
-        if path == "/healthz":
-            return None  # unlimited; the route itself answers 405 to anything but GET/HEAD
+        if path == "/healthz" or (linking.enabled() and path in linking.metadata_paths()):
+            # Unlimited, on any Host; the route itself answers 405 to anything but GET/HEAD. The metadata is a
+            # static public document: a host fetches it before it has linked, and from wherever it runs.
+            return None
         if path != "/mcp":
             return "path", PlainTextResponse("Not Found", status_code=404)
         headers = {k: v.decode("latin-1") for k, v in scope["headers"] if k in (b"host", b"content-length")}
@@ -555,6 +565,7 @@ def http_app() -> Starlette:
         "MATCHAWARDS_ALLOWED_HOSTS", "matchawards.com,staging.matchawards.com").split(",") if h.strip()]
     hosts += ["127.0.0.1", "localhost", "[::1]"]
     global ledger
+    linking.check_settings()
     api.api_budget = RateLimiter(_env_int("MATCHAWARDS_GLOBAL_API_PER_MIN", 900), 0)
     ledger = usage.Ledger.open(os.environ.get("MATCHAWARDS_USAGE_DB", usage.DEFAULT_DB))
     # Peers whose X-Real-IP is believed. Loopback only by default; in Docker the deployment names the exact
