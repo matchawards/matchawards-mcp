@@ -50,7 +50,7 @@ A hosted endpoint runs at `https://matchawards.com/mcp`. Add it as a remote MCP 
 - **Claude** (claude.ai or Claude Desktop): Settings, Connectors, add a custom connector with the same URL. Claude Code: `claude mcp add --transport http matchawards https://matchawards.com/mcp`.
 - **Cursor**: in `mcp.json`, `{"mcpServers": {"matchawards": {"url": "https://matchawards.com/mcp"}}}`.
 
-The hosted endpoint serves the same tools. It is limited per client address (IPv6: per /64) to 30 requests per minute and 10 per 5 seconds, per IPv6 /48 to 120 per minute, and to 600 per minute for all clients together; over a limit it answers HTTP 429 with `Retry-After`.
+The hosted endpoint serves the same tools. It is limited per client address (IPv6: per /64) to 30 requests per minute and 10 per 5 seconds, per IPv6 /48 to 120 per minute, and to 1200 per minute for all clients together (ChatGPT's shared pool: 600); over a limit it answers HTTP 429 with `Retry-After`.
 
 ## Install
 
