@@ -15,7 +15,7 @@ CAMPAIGN = "matchawards_mcp"
 DEFAULT_SOURCE = "mcp"  # stdio, an unknown or test client, or no request at all
 
 # The site: matchawards.com and its subdomains (www, staging). Not the API base host: the server may reach the API
-# through an internal address (http://web:3000) while the links in its answers name the public site.
+# through an internal address while the links in its answers name the public site.
 SITE_DOMAIN = "matchawards.com"
 
 # utm_source for the request being served (HTTP mode sets it per request, see server.HttpGuard).

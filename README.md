@@ -26,6 +26,13 @@ Award records may be incomplete (federal awards especially), so every award resu
 
 Every tool is read-only and needs no account: each declares `readOnlyHint`, `idempotentHint`, a title and `securitySchemes: [{"type": "noauth"}]` (in `_meta`). Results are structured: each tool publishes an `outputSchema` and returns `structuredContent`, with the same JSON as text for clients that read only text. Every result carries a `url` on matchawards.com (and a `sam_url` for federal notices), and the server asks the model to show them as markdown links. Links to matchawards.com carry `utm_source`, `utm_medium` and `utm_campaign` parameters naming the AI host the request came from (for example `utm_source=chatgpt`); links to other sites are left unchanged.
 
+### Changes in 1.0.2
+
+- Cards come from a new tool, `show_results`, which the model calls once with the ids it picked; the search tools return data only. The card (`results-v2.html`) expands a row in place and has an "Ask about this" button.
+- Results filtered by `naics` say which requested codes matched: `matched_naics` (the record's own codes) and, on contract notices, `ai_matched_naics` (codes MatchAwards' AI suggested).
+- Links to matchawards.com carry UTM parameters naming the AI host.
+- Hosted server: the shared limit is 1200 requests per minute, and `/metrics` adds tool latency, distinct-caller and client counts.
+
 ### Changes in 1.0
 
 - `search_by_naics` is removed: `search_contracts`, `search_grants` and `search_jobs` take the same `naics` filter on its own.
@@ -36,7 +43,7 @@ Every tool is read-only and needs no account: each declares `readOnlyHint`, `ide
 
 ## Cards
 
-Hosts that render [MCP Apps](https://modelcontextprotocol.io/extensions/apps) (ChatGPT, Claude) get one inline card per answer: after searching, the model calls `show_results` with up to 10 contract or grant ids it picked, and the card lists up to 8 of them with title, agency, place, a federal/state/grant badge, the deadline (days left, closed, or no fixed deadline), set-aside and NAICS code. Ids it could not show (not found, a job, or not fetched because MatchAwards was busy) are counted under the list. The search tools return data only, with no card. Clicking a row asks the model for that opportunity's details; each row's "Open on MatchAwards" link opens its page. The card is one self-contained HTML resource, `ui://matchawards/results-v2.html` (`text/html;profile=mcp-app`): no scripts or styles from elsewhere and no network requests, so its CSP allows nothing. It renders only the tool's `structuredContent`, and never calls a tool itself.
+Hosts that render [MCP Apps](https://modelcontextprotocol.io/extensions/apps) (ChatGPT, Claude) get one inline card per answer: after searching, the model calls `show_results` with up to 10 contract or grant ids it picked, and the card lists up to 8 of them with title, agency, place, a federal/state/grant badge, the deadline (days left, closed, or no fixed deadline), set-aside and NAICS code. Ids it could not show (not found, a job, or not fetched because MatchAwards was busy) are counted under the list. The search tools return data only, with no card. Clicking a row expands it (posted date, solicitation, office, NAICS, set-aside); its "Ask about this" button asks the model for that opportunity's details, and its "Open on MatchAwards" link opens its page. The card is one self-contained HTML resource, `ui://matchawards/results-v2.html` (`text/html;profile=mcp-app`): no scripts or styles from elsewhere and no network requests, so its CSP allows nothing. It renders only the tool's `structuredContent`, and never calls a tool itself.
 
 The other tools return their structured results without a card.
 
