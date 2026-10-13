@@ -3,9 +3,9 @@ bearer check and the challenge a host starts linking on.
 
 matchawards.com is the authorization server; this server is only a resource server. It never sees a password or
 an authorization code, and keeps no token: it checks one by calling `GET {MATCHAWARDS_AGENT_API_BASE}/api/agent/v1/me`
-with it, and keeps a good answer in memory for CACHE_TTL_S under a keyed hash of the token (the key is random per
-process, so the hash means nothing outside it). The token, the Authorization header and that hash are never logged,
-stored or echoed.
+with it, and keeps a good answer in memory for CACHE_TTL_S (a token /me rejects for INVALID_TTL_S) under a keyed hash
+of the token (the key is random per process, so the hash means nothing outside it). The token, the Authorization
+header and that hash are never logged, stored or echoed.
 
 Only a tools/call of a LINKED_TOOLS tool is checked; everything else (initialize, tools/list, the other tools) never
 is. A host links on one of two challenge shapes, both naming the same metadata: an HTTP 401 (403 for a missing
@@ -43,7 +43,8 @@ SCOPE = "profile:read"
 ME_PATH = "/api/agent/v1/me"
 METADATA_PATH = "/.well-known/oauth-protected-resource"
 CACHE_TTL_S = 60
-CACHE_MAX = 10_000
+INVALID_TTL_S = 30  # a token /me rejected, so a client repeating it is not checked on every call
+CACHE_MAX = 10_000  # per cache (profiles, rejected tokens)
 
 # The three ways a check can fail. invalid_token and insufficient_scope are the RFC 6750 error codes the challenge
 # carries; unavailable (MatchAwards down, slow or answering nonsense) is never a challenge: asking the user to link
@@ -203,11 +204,32 @@ def challenge_result(error: str, text: str) -> CallToolResult:
 
 _SALT = os.urandom(16)
 clock = time.monotonic  # tests move it
-_cache: OrderedDict[bytes, tuple[float, Profile]] = OrderedDict()  # keyed token hash -> (expiry, profile), LRU
+# keyed token hash -> (expiry, answer), least recently used first. Two caches, so a flood of bad tokens cannot push
+# out the good ones.
+_cache: OrderedDict[bytes, tuple[float, Profile]] = OrderedDict()
+_invalid: OrderedDict[bytes, tuple[float, str]] = OrderedDict()
 
 
 def _key(token: str) -> bytes:
     return hashlib.blake2s(token.encode("ascii"), key=_SALT, digest_size=16).digest()
+
+
+def _cached(cache: OrderedDict, key: bytes):
+    """The answer kept under `key` while it has not expired, else None."""
+    hit = cache.get(key)
+    if hit is not None:
+        if hit[0] > clock():
+            cache.move_to_end(key)
+            return hit[1]
+        del cache[key]
+    return None
+
+
+def _keep(cache: OrderedDict, key: bytes, ttl: float, answer) -> None:
+    cache[key] = (clock() + ttl, answer)
+    cache.move_to_end(key)
+    while len(cache) > CACHE_MAX:
+        cache.popitem(last=False)  # the least recently used
 
 
 def _text(value, pattern: str) -> str | None:
@@ -216,9 +238,9 @@ def _text(value, pattern: str) -> str | None:
 
 
 def parse_profile(data) -> Profile | None:
-    """A Profile from a /me body, or None when it is not one (no account id, naics not a list). Fields in the wrong
-    shape are dropped (None), and only NAICS codes of 2 to 6 digits are kept, so nothing from the body reaches a
-    search filter or a result unchecked."""
+    """A Profile from a /me body, or None when it is not one (no account id, naics not a list); me() checks its
+    resource. Fields in the wrong shape are dropped (None), and only NAICS codes of 2 to 6 digits are kept, so nothing
+    from the body reaches a search filter or a result unchecked."""
     if not isinstance(data, dict) or not isinstance(data.get("account"), dict):
         return None
     account_id = data["account"].get("id")
@@ -253,20 +275,26 @@ async def check(scope) -> Profile | Refusal:
     return INVALID if token is None else await me(token)
 
 
+def _same_resource(value) -> bool:
+    """Whether a /me body's resource names this server (a trailing slash on either side ignored)."""
+    return isinstance(value, str) and value.strip().rstrip("/") == resource().rstrip("/")
+
+
 async def me(token: str) -> Profile | Refusal:
     """The profile `token` belongs to, from /me (cached CACHE_TTL_S), or why there is none: INVALID (401: unknown,
-    expired or revoked), INSUFFICIENT (403: the token lacks SCOPE) or UNAVAILABLE (no answer in time, a network error,
-    any other status, a body that is not a profile, or the server-wide API budget spent).
+    expired or revoked; or a profile for a token issued for another resource, or with no resource named),
+    INSUFFICIENT (403: the token lacks SCOPE) or UNAVAILABLE (no answer in time, a network error, any other status,
+    a body that is not a profile, or the server-wide API budget spent).
 
-    Only a profile is cached; a refusal is asked again next time. The log says which failure it was, never the
-    token, the header or the token's hash."""
+    /me names the resource (RFC 8707) the token was issued for. Only a token issued for this server's resource()
+    is taken: one a client got for another service is not a key to this one.
+
+    A profile is cached for CACHE_TTL_S and INVALID for INVALID_TTL_S; INSUFFICIENT and UNAVAILABLE are asked again
+    next time. The log says which failure it was, never the token, the header or the token's hash."""
     key = _key(token)
-    hit = _cache.get(key)
+    hit = _cached(_cache, key) or _cached(_invalid, key)
     if hit is not None:
-        if hit[0] > clock():
-            _cache.move_to_end(key)
-            return hit[1]
-        del _cache[key]
+        return hit
     if api.api_budget is not None and api.api_budget.check("api"):
         return UNAVAILABLE
     try:
@@ -275,6 +303,7 @@ async def me(token: str) -> Profile | Refusal:
         log.warning("profile check failed: %s", type(e).__name__)
         return UNAVAILABLE
     if r.status_code == 401:
+        _keep(_invalid, key, INVALID_TTL_S, INVALID)
         return INVALID
     if r.status_code == 403:
         return INSUFFICIENT
@@ -282,13 +311,16 @@ async def me(token: str) -> Profile | Refusal:
         log.warning("profile check failed: HTTP %d", r.status_code)
         return UNAVAILABLE
     try:
-        profile = parse_profile(r.json())
+        data = r.json()
     except ValueError:
-        profile = None
+        data = None
+    profile = parse_profile(data)
     if profile is None:
         log.warning("profile check failed: the answer is not a profile")
         return UNAVAILABLE
-    _cache[key] = (clock() + CACHE_TTL_S, profile)
-    while len(_cache) > CACHE_MAX:
-        _cache.popitem(last=False)  # the least recently used
+    if not _same_resource(data.get("resource")):
+        log.warning("profile check refused: the token was not issued for this resource")
+        _keep(_invalid, key, INVALID_TTL_S, INVALID)
+        return INVALID
+    _keep(_cache, key, CACHE_TTL_S, profile)
     return profile

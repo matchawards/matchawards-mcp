@@ -32,7 +32,7 @@ METADATA = {
 PATHS = ("/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp")
 TOKEN = "tok-AbC123._~+/xyz=="
 ME = {"account": {"id": "123", "username": "acme"}, "organization": "Acme LLC", "naics": ["541512", "541511"],
-      "set_aside": "SBA", "state": "va", "uei": "ABCDEF123456"}
+      "set_aside": "SBA", "state": "va", "uei": "ABCDEF123456", "resource": "https://matchawards.com/mcp"}
 
 
 def profile(account_id="123", **kw):
@@ -55,13 +55,25 @@ def me_api(monkeypatch):
         cookies=linking.client.cookies.jar,  # the same no-cookies policy
     ))
     monkeypatch.setattr(linking, "_cache", OrderedDict())
+    monkeypatch.setattr(linking, "_invalid", OrderedDict())
     return me_api
 
 
+def forget():
+    """Empty both token caches (profiles and rejected tokens)."""
+    linking._cache.clear()
+    linking._invalid.clear()
+
+
 @pytest.fixture
-def linked(monkeypatch):
-    """Linking on (MATCHAWARDS_AUTH_ISSUER=https://matchawards.com), with the server rebuilt for it."""
+def issuer(monkeypatch):
+    """MATCHAWARDS_AUTH_ISSUER=https://matchawards.com: linking on, so resource() is https://matchawards.com/mcp."""
     monkeypatch.setattr(linking, "ISSUER", ISSUER)
+
+
+@pytest.fixture
+def linked(issuer, monkeypatch):
+    """Linking on, with the server rebuilt for it."""
     monkeypatch.setattr(server, "mcp", server.build_mcp())
 
 
@@ -179,7 +191,7 @@ def test_bearer(headers, token):
 
 
 @pytest.mark.anyio
-async def test_me_asks_with_the_token_and_returns_the_profile(me_api):
+async def test_me_asks_with_the_token_and_returns_the_profile(issuer, me_api):
     got = await linking.me(TOKEN)
     assert got == linking.Profile(account_id="123", username="acme", organization="Acme LLC",
                                   naics=("541512", "541511"), set_aside="SBA", state="VA", uei="ABCDEF123456")
@@ -191,14 +203,14 @@ async def test_me_asks_with_the_token_and_returns_the_profile(me_api):
 
 
 @pytest.mark.anyio
-async def test_me_uses_the_agent_api_base(me_api, monkeypatch):
+async def test_me_uses_the_agent_api_base(issuer, me_api, monkeypatch):
     monkeypatch.setattr(linking, "AGENT_API_BASE", "http://agent-api.test:3000")
     await linking.me(TOKEN)
     assert str(me_api.requests[0].url) == "http://agent-api.test:3000/api/agent/v1/me"
 
 
 @pytest.mark.anyio
-async def test_me_caches_a_profile_until_it_expires(me_api, monkeypatch):
+async def test_me_caches_a_profile_until_it_expires(issuer, me_api, monkeypatch):
     now = [1000.0]
     monkeypatch.setattr(linking, "clock", lambda: now[0])
     assert isinstance(await linking.me(TOKEN), linking.Profile)
@@ -214,7 +226,7 @@ async def test_me_caches_a_profile_until_it_expires(me_api, monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_me_cache_is_bounded_least_recently_used_first(me_api, monkeypatch):
+async def test_me_cache_is_bounded_least_recently_used_first(issuer, me_api, monkeypatch):
     monkeypatch.setattr(linking, "CACHE_MAX", 2)
     for token in ("a", "b", "a", "c"):  # "a" used again before "c" arrives, so "b" goes
         await linking.me(token)
@@ -235,7 +247,6 @@ def _raise(exc):
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("reply, outcome", [
-    (lambda req: httpx.Response(401, json={"error": "invalid_token"}), linking.INVALID),
     (lambda req: httpx.Response(403, json={"error": "insufficient_scope"}), linking.INSUFFICIENT),
     (lambda req: httpx.Response(500, text="oops"), linking.UNAVAILABLE),
     (lambda req: httpx.Response(503, json={"error": "timeout"}), linking.UNAVAILABLE),
@@ -249,15 +260,84 @@ def _raise(exc):
     (_raise(httpx.ReadTimeout("slow")), linking.UNAVAILABLE),
     (_raise(httpx.ConnectError("down")), linking.UNAVAILABLE),
 ])
-async def test_me_failures_are_told_apart_and_never_cached(me_api, reply, outcome):
+async def test_me_failures_other_than_invalid_are_told_apart_and_never_cached(issuer, me_api, reply, outcome):
     me_api.reply = reply
     assert await linking.me(TOKEN) == outcome
     assert await linking.me(TOKEN) == outcome
-    assert len(me_api.requests) == 2 and not linking._cache
+    assert len(me_api.requests) == 2 and not linking._cache and not linking._invalid
 
 
 @pytest.mark.anyio
-async def test_me_follows_no_redirect_and_keeps_no_cookie(me_api):
+@pytest.mark.parametrize("reply", [
+    lambda req: httpx.Response(401, json={"error": "invalid_token"}),
+    lambda req: httpx.Response(200, json={**ME, "resource": "https://other.example/mcp"}),
+])
+async def test_me_remembers_an_invalid_token_for_30_seconds(issuer, me_api, monkeypatch, reply):
+    now = [1000.0]
+    monkeypatch.setattr(linking, "clock", lambda: now[0])
+    me_api.reply = reply
+    assert await linking.me(TOKEN) == linking.INVALID
+    now[0] += 29
+    assert await linking.me(TOKEN) == linking.INVALID
+    assert len(me_api.requests) == 1 and not linking._cache
+    assert TOKEN.encode() not in b"".join(linking._invalid)  # keyed by a hash, never the token
+    now[0] += 2  # past 30 s: asked again
+    me_api.reply = lambda req: httpx.Response(200, json=ME)
+    assert isinstance(await linking.me(TOKEN), linking.Profile)
+    assert len(me_api.requests) == 2
+
+
+@pytest.mark.anyio
+async def test_me_rejected_tokens_are_bounded_and_never_push_out_profiles(issuer, me_api, monkeypatch):
+    monkeypatch.setattr(linking, "CACHE_MAX", 2)
+    await linking.me("good")
+    me_api.reply = lambda req: httpx.Response(401)
+    for token in ("bad1", "bad2", "bad3"):
+        await linking.me(token)
+    assert list(linking._cache) == [linking._key("good")]
+    assert len(linking._invalid) == 2
+    n = len(me_api.requests)
+    assert isinstance(await linking.me("good"), linking.Profile)
+    assert await linking.me("bad3") == linking.INVALID
+    assert len(me_api.requests) == n
+    await linking.me("bad1")  # the least recently used, dropped
+    assert len(me_api.requests) == n + 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("value, outcome", [
+    ("https://matchawards.com/mcp", "profile"),
+    ("https://matchawards.com/mcp/", "profile"),
+    ("https://matchawards.com/", linking.INVALID),
+    ("https://matchawards.com/mcp/other", linking.INVALID),
+    ("https://staging.matchawards.com/mcp", linking.INVALID),
+    ("https://evil.example/mcp", linking.INVALID),
+    ("", linking.INVALID),
+    (None, linking.INVALID),
+    (["https://matchawards.com/mcp"], linking.INVALID),
+    ("missing", linking.INVALID),
+])
+async def test_me_takes_only_a_token_issued_for_this_resource(issuer, me_api, value, outcome):
+    body = {k: v for k, v in ME.items() if k != "resource"} if value == "missing" else {**ME, "resource": value}
+    me_api.reply = lambda req: httpx.Response(200, json=body)
+    got = await linking.me(TOKEN)
+    if outcome == "profile":
+        assert isinstance(got, linking.Profile) and linking._cache and not linking._invalid
+    else:
+        assert got == outcome and not linking._cache and linking._invalid
+
+
+@pytest.mark.anyio
+async def test_me_compares_with_the_configured_resource(issuer, me_api, monkeypatch):
+    monkeypatch.setattr(linking, "RESOURCE", "http://127.0.0.1:8765/mcp/")
+    assert await linking.me(TOKEN) == linking.INVALID  # issued for https://matchawards.com/mcp
+    forget()
+    me_api.reply = lambda req: httpx.Response(200, json={**ME, "resource": "http://127.0.0.1:8765/mcp"})
+    assert isinstance(await linking.me(TOKEN), linking.Profile)
+
+
+@pytest.mark.anyio
+async def test_me_follows_no_redirect_and_keeps_no_cookie(issuer, me_api):
     me_api.reply = lambda req: httpx.Response(200, json=ME, headers={"Set-Cookie": "_session=abc; Path=/"})
     await linking.me("a")
     await linking.me("b")
@@ -266,7 +346,7 @@ async def test_me_follows_no_redirect_and_keeps_no_cookie(me_api):
 
 
 @pytest.mark.anyio
-async def test_me_spends_the_server_wide_api_budget(me_api, monkeypatch):
+async def test_me_spends_the_server_wide_api_budget(issuer, me_api, monkeypatch):
     monkeypatch.setattr(ma_api, "api_budget", RateLimiter(1, 0))
     assert isinstance(await linking.me("a"), linking.Profile)
     assert await linking.me("b") == linking.UNAVAILABLE  # budget spent: no request made
@@ -275,13 +355,14 @@ async def test_me_spends_the_server_wide_api_budget(me_api, monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_me_never_logs_the_token(me_api, caplog):
+async def test_me_never_logs_the_token(issuer, me_api, caplog):
     caplog.set_level(logging.DEBUG)
     for reply in (lambda req: httpx.Response(200, json=ME), lambda req: httpx.Response(401),
                   lambda req: httpx.Response(500), _raise(httpx.ConnectError(f"refused Bearer {TOKEN}")),
-                  lambda req: httpx.Response(200, text="junk")):
+                  lambda req: httpx.Response(200, text="junk"),
+                  lambda req: httpx.Response(200, json={**ME, "resource": "https://other.example/mcp"})):
         me_api.reply = reply
-        linking._cache.clear()
+        forget()
         await linking.me(TOKEN)
     assert caplog.records  # the failures are logged
     for rec in caplog.records:
@@ -496,14 +577,14 @@ async def test_the_token_never_reaches_a_log_or_a_response(with_tool, me_api, ca
             for reply in (lambda req: httpx.Response(401), lambda req: httpx.Response(403),
                           lambda req: httpx.Response(500), lambda req: httpx.Response(200, json=ME)):
                 me_api.reply = reply
-                linking._cache.clear()
+                forget()
                 r = await call(hc, ua=ua, token=TOKEN)
                 seen.append(r.text + json.dumps(dict(r.headers)))
             seen.append((await call(hc, ua=ua)).text)
     text = "\n".join([r.getMessage() for r in caplog.records] + [str(r.args) for r in caplog.records] + seen)
     assert "POST /mcp 401" in text  # the access log was captured
     assert TOKEN not in text and TOKEN[:8] not in text
-    for key in linking._cache:  # nor its keyed hash
+    for key in [*linking._cache, *linking._invalid]:  # nor its keyed hash
         assert key.hex() not in text
 
 
