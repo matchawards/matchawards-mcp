@@ -51,7 +51,9 @@ jobs:
               async with Client(server) as client:
                   names = [t.name for t in (await client.list_tools()).tools]
                   assert client.protocol_version == "2026-07-28", client.protocol_version
-                  assert len(names) == 6, names
+                  assert sorted(names) == ["assess_opportunity", "find_teaming_partners", "get_company", "get_opportunity",
+                                           "lookup_naics", "search_awards", "search_contracts", "search_grants",
+                                           "search_jobs"], names
                   print("smoke ok:", client.server_info.version, names)
 
           anyio.run(main)
