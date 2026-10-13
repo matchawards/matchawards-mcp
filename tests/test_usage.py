@@ -574,11 +574,14 @@ async def test_challenges_are_counted_by_host_and_error_once(linked, me_api, api
         assert (await link_call(hc, ua=CLAUDE_UA)).status_code == 401
         assert (await link_call(hc, ua="curl/8.0")).status_code == 401
         assert (await link_call(hc, ua=OPENAI_UA)).json()["result"]["isError"]  # the tool answers it
-        me_api.reply = lambda req: httpx.Response(403)
+        me_api.reply = lambda req: httpx.Response(403, json={"error": "insufficient_scope"})
         assert (await link_call(hc, ua=CLAUDE_UA, token=TOKEN)).status_code == 403
         assert (await link_call(hc, ua=OPENAI_UA, token="other-token")).json()["result"]["isError"]
         me_api.reply = lambda req: httpx.Response(502)  # no answer: never a challenge
         await link_call(hc, ua=CLAUDE_UA, token="third-token")
+        me_api.reply = lambda req: httpx.Response(403, json={"error": "forbidden"})  # a refused account: neither
+        for ua in (CLAUDE_UA, OPENAI_UA):
+            assert (await link_call(hc, ua=ua, token="fourth-token")).json()["result"]["isError"]
     challenges = {dict(labels)["host"] + "/" + dict(labels)["error"]: n
                   for (name, labels), n in usage.metrics.counts.items() if name == "mcp_link_challenges_total"}
     assert challenges == {"claude/invalid_token": 1, "other/invalid_token": 1, "chatgpt/invalid_token": 1,
@@ -589,7 +592,8 @@ async def test_challenges_are_counted_by_host_and_error_once(linked, me_api, api
 @pytest.mark.anyio
 async def test_linked_calls_are_counted_and_flagged_without_the_account(linked, me_api, api, usage_db, monkeypatch):
     monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "100")
-    me_api.reply = lambda req: httpx.Response(200, json={**ME, "account": {"id": "acct-zebra-77"}})
+    sub = "feedfacecafebeef" * 2
+    me_api.reply = lambda req: httpx.Response(200, json={**ME, "sub": sub})
     async with http() as hc:
         for token in ("tok-a", "tok-b"):  # two tokens of one account: one distinct account
             assert not (await link_call(hc, token=token)).json()["result"].get("isError")
@@ -603,8 +607,8 @@ async def test_linked_calls_are_counted_and_flagged_without_the_account(linked, 
     assert got == [("my_matches", "link_required", 0), ("my_matches", "ok", 1), ("my_matches", "ok", 1),
                    ("search_contracts", "ok", 0)]
     raw = b"".join(p.read_bytes() for p in usage_db.parent.glob("usage.db*"))
-    assert b"acct-zebra-77" not in raw and b"tok-a" not in raw
-    assert all("acct-zebra-77" not in k for k in usage.distinct.seen["account"])  # a salted hash only
+    assert sub.encode() not in raw and b"tok-a" not in raw
+    assert all(sub not in k for k in usage.distinct.seen["account"])  # a salted hash only
 
 
 OLD_SCHEMA = """

@@ -31,12 +31,23 @@ METADATA = {
 }
 PATHS = ("/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp")
 TOKEN = "tok-AbC123._~+/xyz=="
-ME = {"account": {"id": "123", "username": "acme"}, "organization": "Acme LLC", "naics": ["541512", "541511"],
-      "set_aside": "SBA", "state": "va", "uei": "ABCDEF123456", "resource": "https://matchawards.com/mcp"}
+SUB = "0123456789abcdef0123456789abcdef"
+SETTINGS_URL = "https://matchawards.com/settings/match_settings"
 
 
-def profile(account_id="123", **kw):
-    return linking.parse_profile({**ME, "account": {"id": account_id, "username": "acme"}, **kw})
+def naics(*codes):
+    """/me's naics: objects with a code and a title."""
+    return [{"code": c, "title": f"Title of {c}"} for c in codes]
+
+
+ME = {"sub": SUB, "naics": naics("541512", "541511"), "naics_truncated": False,
+      "set_aside": {"code": "SBA", "name": "Total Small Business"}, "state": "va", "uei": "ABCDEF123456",
+      "organization_name": "Acme LLC", "match_settings_url": SETTINGS_URL, "scope": "profile:read",
+      "token_expires_at": "2099-04-11T12:00:00Z", "resource": "https://matchawards.com/mcp"}
+
+
+def profile(**kw):
+    return linking.parse_profile({**ME, **kw})
 
 
 @pytest.fixture
@@ -221,8 +232,9 @@ def test_bearer(headers, token):
 @pytest.mark.anyio
 async def test_me_asks_with_the_token_and_returns_the_profile(issuer, me_api):
     got = await linking.me(TOKEN)
-    assert got == linking.Profile(account_id="123", username="acme", organization="Acme LLC",
-                                  naics=("541512", "541511"), set_aside="SBA", state="VA", uei="ABCDEF123456")
+    assert got == linking.Profile(sub=SUB, organization="Acme LLC", naics=("541512", "541511"), naics_truncated=False,
+                                  set_aside="SBA", set_aside_name="Total Small Business", state="VA",
+                                  uei="ABCDEF123456", match_settings_url=SETTINGS_URL)
     [req] = me_api.requests
     assert str(req.url) == "https://matchawards.com/api/agent/v1/me"
     assert req.headers["authorization"] == f"Bearer {TOKEN}"
@@ -283,8 +295,9 @@ def _raise(exc):
     (lambda req: httpx.Response(302, headers={"Location": "https://evil.example/"}), linking.UNAVAILABLE),
     (lambda req: httpx.Response(200, text="<html>"), linking.UNAVAILABLE),
     (lambda req: httpx.Response(200, json=["not", "a", "profile"]), linking.UNAVAILABLE),
-    (lambda req: httpx.Response(200, json={"account": {}, "naics": []}), linking.UNAVAILABLE),
-    (lambda req: httpx.Response(200, json={"account": {"id": "1"}}), linking.UNAVAILABLE),  # naics missing
+    (lambda req: httpx.Response(200, json={"sub": "", "naics": []}), linking.UNAVAILABLE),
+    (lambda req: httpx.Response(200, json={"sub": SUB}), linking.UNAVAILABLE),  # naics missing
+    (lambda req: httpx.Response(200, json={**ME, "sub": None}), linking.UNAVAILABLE),
     (_raise(httpx.ReadTimeout("slow")), linking.UNAVAILABLE),
     (_raise(httpx.ConnectError("down")), linking.UNAVAILABLE),
 ])
@@ -390,7 +403,9 @@ async def test_a_refusal_landing_during_a_slow_check_keeps_its_profile_out_of_th
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("refusal", [lambda req: httpx.Response(401), lambda req: httpx.Response(403),
-                                     lambda req: httpx.Response(200, json={**ME, "resource": "https://x.test/mcp"})])
+                                     lambda req: httpx.Response(403, json={"error": "insufficient_scope"}),
+                                     lambda req: httpx.Response(200, json={**ME, "resource": "https://x.test/mcp"}),
+                                     lambda req: httpx.Response(200, json={**ME, "token_expires_at": "2020-01-01"})])
 async def test_a_refusal_drops_a_profile_cached_while_it_was_in_flight(issuer, me_api, refusal):
     """The other order: the 200 lands and is cached first, then the refusal of a check that was already in flight
     drops it."""
@@ -409,7 +424,7 @@ async def test_a_refusal_drops_a_profile_cached_while_it_was_in_flight(issuer, m
     assert isinstance(await linking.me(TOKEN), linking.Profile)
     assert linking._cache
     cached.set()
-    assert await slow in (linking.INVALID, linking.INSUFFICIENT)
+    assert await slow in (linking.INVALID, linking.INSUFFICIENT, linking.FORBIDDEN)
     assert not linking._cache
 
 
@@ -445,7 +460,7 @@ async def test_a_refusal_dropped_for_room_still_keeps_an_older_200_out_of_the_ca
 async def test_a_profile_after_a_refusal_clears_it(issuer, me_api, monkeypatch):
     now = [1000.0]
     monkeypatch.setattr(linking, "clock", lambda: now[0])
-    me_api.reply = lambda req: httpx.Response(403)
+    me_api.reply = lambda req: httpx.Response(403, json={"error": "insufficient_scope"})
     assert await linking.me(TOKEN) == linking.INSUFFICIENT
     me_api.reply = lambda req: httpx.Response(200, json=ME)  # the user granted the scope
     assert isinstance(await linking.me(TOKEN), linking.Profile) and linking._cache
@@ -501,24 +516,102 @@ async def test_me_never_logs_the_token(issuer, me_api, caplog):
 
 
 @pytest.mark.parametrize("body, expected", [
-    ({**ME, "account": {"id": 42}}, {"account_id": "42", "username": None}),
-    ({**ME, "naics": ["541512", " 23 ", "5415121", "abc", 541511, "541512"]}, {"naics": ("541512", "23")}),
-    ({**ME, "naics": []}, {"naics": ()}),
-    ({**ME, "set_aside": None, "state": None, "uei": None, "organization": None},
-     {"set_aside": None, "state": None, "uei": None, "organization": None}),
-    ({**ME, "set_aside": "SBA,WOSB", "state": "Virginia", "uei": "short", "organization": "Acme\nLLC\x00"},
-     {"set_aside": None, "state": None, "uei": None, "organization": "Acme LLC"}),
-    ({**ME, "organization": "  "}, {"organization": None}),
+    ({**ME, "naics": [{"code": "541512"}, {"code": " 541330 ", "title": None}, {"code": "23"}, {"code": "5415121"},
+                      {"code": "abc123"}, {"code": 541511}, {"code": "５４１５１１"}, {"title": "no code"}, "541519",
+                      None, ["541519"], {"code": "541512", "title": "again"}]},
+     {"naics": ("541512", "541330")}),
+    ({**ME, "naics": []}, {"naics": (), "naics_truncated": False}),
+    ({**ME, "naics_truncated": True}, {"naics_truncated": True}),
+    ({**ME, "naics_truncated": "true"}, {"naics_truncated": False}),
+    ({k: v for k, v in ME.items() if k != "naics_truncated"}, {"naics_truncated": False}),
+    ({**ME, "set_aside": None, "state": None, "uei": None, "organization_name": None, "match_settings_url": None},
+     {"set_aside": None, "set_aside_name": None, "state": None, "uei": None, "organization": None,
+      "match_settings_url": None}),
+    ({**ME, "set_aside": {"code": "SBA,WOSB", "name": "Two"}, "state": "Virginia", "uei": "short",
+      "organization_name": "Acme\nLLC\x00"},
+     {"set_aside": None, "set_aside_name": None, "state": None, "uei": None, "organization": "Acme LLC"}),
+    ({**ME, "set_aside": "SBA"}, {"set_aside": None, "set_aside_name": None}),  # a bare code is not the shape
+    ({**ME, "set_aside": {"code": " WOSB "}}, {"set_aside": "WOSB", "set_aside_name": None}),
+    ({**ME, "set_aside": {"code": "8A", "name": " 8(a)\nSet-Aside "}},
+     {"set_aside": "8A", "set_aside_name": "8(a) Set-Aside"}),
+    ({**ME, "organization_name": "  "}, {"organization": None}),
+    ({**ME, "organization": "Old field", "organization_name": None}, {"organization": None}),
 ])
 def test_parse_profile_keeps_only_clean_fields(body, expected):
     got = linking.parse_profile(body)
     assert {k: getattr(got, k) for k in expected} == expected
 
 
-@pytest.mark.parametrize("body", [None, [], {}, {"account": "1", "naics": []}, {"account": {"id": True}, "naics": []},
-                                  {"account": {"id": " "}, "naics": []}, {"account": {"id": "1"}, "naics": "541512"}])
+@pytest.mark.parametrize("body", [None, [], {}, {"sub": SUB}, {"naics": []}, {"sub": SUB, "naics": "541512"},
+                                  {**ME, "sub": SUB.upper()}, {**ME, "sub": SUB[:31]}, {**ME, "sub": SUB + "0"},
+                                  {**ME, "sub": f" {SUB}"}, {**ME, "sub": SUB[:31] + "g"}, {**ME, "sub": 123},
+                                  {**ME, "sub": None},
+                                  {**{k: v for k, v in ME.items() if k != "sub"}, "account": {"id": "123"}}])
 def test_parse_profile_rejects_a_body_that_is_not_a_profile(body):
     assert linking.parse_profile(body) is None
+
+
+@pytest.mark.parametrize("url, kept", [
+    (SETTINGS_URL, True),
+    ("https://staging.matchawards.com/settings/match_settings", True),
+    ("https://www.matchawards.com/settings/match_settings?tab=naics#codes", True),
+    ("https://matchawards.com:443/settings/match_settings", True),
+    ("http://matchawards.com/settings/match_settings", False),
+    ("https://matchawards.com.evil.example/settings", False),
+    ("https://evilmatchawards.com/settings", False),
+    ("https://user@matchawards.com/settings", False),
+    ("https://matchawards.com:8443/settings", False),
+    ("https://matchawards.com:x/settings", False),
+    ("javascript:alert(1)", False),
+    ("//matchawards.com/settings", False),
+    ("https://matchawards.com/a b", False),
+    ("https://matchawards.com/\n", False),
+    ("https://matchawards.com/" + "a" * 500, False),
+    ("", False), (None, False), (["https://matchawards.com/"], False),
+])
+def test_parse_profile_keeps_only_a_match_settings_url_on_the_site(url, kept):
+    assert profile(match_settings_url=url).match_settings_url == (url if kept else None)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("expires, outcome", [
+    ("2020-01-01T00:00:00Z", linking.INVALID),
+    ("2020-01-01T00:00:00+00:00", linking.INVALID),
+    ("2020-01-01T00:00:00", linking.INVALID),  # no zone: UTC
+    ("2020-01-01", linking.INVALID),
+    ("2099-01-01T00:00:00Z", "profile"),
+    ("2099-01-01T00:00:00.123456z", "profile"),
+    ("not a time", "profile"),  # unreadable: ignored, as when it is missing
+    ("", "profile"), (None, "profile"), (1700000000, "profile"), ("missing", "profile"),
+])
+async def test_me_refuses_a_token_past_its_expiry(issuer, me_api, expires, outcome):
+    body = {k: v for k, v in ME.items() if k != "token_expires_at"} if expires == "missing" \
+        else {**ME, "token_expires_at": expires}
+    me_api.reply = lambda req: httpx.Response(200, json=body)
+    got = await linking.me(TOKEN)
+    if outcome == "profile":
+        assert isinstance(got, linking.Profile) and linking._cache
+    else:
+        assert got == outcome and not linking._cache and linking._invalid
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("reply", [
+    lambda req: httpx.Response(403, json={"error": "forbidden"}),
+    lambda req: httpx.Response(403, json={"error": "account_suspended"}),  # an error /me does not name
+    lambda req: httpx.Response(403, json={"error": None}),
+    lambda req: httpx.Response(403, json=["insufficient_scope"]),
+    lambda req: httpx.Response(403, text="Forbidden"),
+    lambda req: httpx.Response(403),
+])
+async def test_me_tells_a_refused_account_from_a_missing_scope(issuer, me_api, reply):
+    """403 insufficient_scope is INSUFFICIENT (see above); any other 403 is FORBIDDEN, the safe side: never a
+    challenge, and never cached (asked again next time)."""
+    me_api.reply = reply
+    assert await linking.me(TOKEN) == linking.FORBIDDEN
+    assert await linking.me(TOKEN) == linking.FORBIDDEN
+    assert not linking._cache and not linking._invalid
+    assert len(me_api.requests) == 2
 
 
 # --- The challenge (HTTP 401/403, and ChatGPT's tool result) ------------------------------------------------------
@@ -541,9 +634,11 @@ async def my_matches() -> Annotated[CallToolResult, Seen]:
     await asyncio.sleep(0.01)  # concurrent calls interleave here
     if isinstance(got, linking.Profile):
         assert linking.auth.get() is got
-        return Seen(account=got.account_id)
+        return Seen(account=got.sub)
     if got == linking.UNAVAILABLE:
         raise ToolError("MatchAwards is busy right now. Retry in a minute.")
+    if got == linking.FORBIDDEN:
+        raise ToolError("This account can't use it.")
     return linking.challenge_result(got or linking.INVALID, LINK_TEXT)
 
 
@@ -592,7 +687,7 @@ async def test_a_valid_token_reaches_the_tool_with_its_profile(with_tool, me_api
             r = await call(hc, token=TOKEN, ua=ua)
             assert r.status_code == 200 and "www-authenticate" not in r.headers
             result = r.json()["result"]
-            assert not result.get("isError") and result["structuredContent"] == {"account": "123"}
+            assert not result.get("isError") and result["structuredContent"] == {"account": SUB}
     assert len(me_api.requests) == 1  # the second call used the cache
 
 
@@ -601,7 +696,7 @@ async def test_a_valid_token_reaches_the_tool_with_its_profile(with_tool, me_api
 @pytest.mark.parametrize("token, reply, error", [
     (None, None, "invalid_token"),
     (TOKEN, lambda req: httpx.Response(401), "invalid_token"),
-    (TOKEN, lambda req: httpx.Response(403), "insufficient_scope"),
+    (TOKEN, lambda req: httpx.Response(403, json={"error": "insufficient_scope"}), "insufficient_scope"),
 ])
 async def test_chatgpt_gets_the_challenge_as_a_tool_result(with_tool, me_api, ua, token, reply, error):
     me_api.reply = reply
@@ -626,6 +721,23 @@ async def test_matchawards_not_answering_the_check_is_never_a_challenge(with_too
     result = r.json()["result"]
     assert result["isError"] is True and "_meta" not in result
     assert "busy" in result["content"][0]["text"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("ua", [CLAUDE_UA, OPENAI_UA, "curl/8.0"])
+@pytest.mark.parametrize("error", ["forbidden", "something_new"])
+async def test_a_refused_account_is_never_a_challenge(with_tool, me_api, ua, error):
+    """A 403 other than insufficient_scope (a disabled or suspended user, a token of an app that is not an agent app)
+    goes on to the tool like a check without an answer: linking again would not help."""
+    me_api.reply = lambda req: httpx.Response(403, json={"error": error})
+    usage.metrics.counts.clear()
+    async with http() as hc:
+        r = await call(hc, ua=ua, token=TOKEN)
+    assert r.status_code == 200 and "www-authenticate" not in r.headers
+    result = r.json()["result"]
+    assert result["isError"] is True and "_meta" not in result
+    assert "can't use it" in result["content"][0]["text"]
+    assert not any(name == "mcp_link_challenges_total" for name, _ in usage.metrics.counts)
 
 
 @pytest.mark.anyio
@@ -689,14 +801,14 @@ async def test_concurrent_calls_with_different_tokens_never_share_a_profile(with
     async def reply(req):
         token = req.headers["authorization"].removeprefix("Bearer ")
         await asyncio.sleep(0.02 if token.endswith("1") else 0.001)  # the answers come back out of order
-        return httpx.Response(200, json={**ME, "account": {"id": f"acct-{token}"}})
+        return httpx.Response(200, json={**ME, "sub": token[-1] * 32})
 
     me_api.reply = reply
     tokens = [f"tok{i % 4}" for i in range(24)]
     async with http() as hc:
         responses = await asyncio.gather(*(call(hc, token=t) for t in tokens))
     for t, r in zip(tokens, responses):
-        assert r.json()["result"]["structuredContent"] == {"account": f"acct-{t}"}, t
+        assert r.json()["result"]["structuredContent"] == {"account": t[-1] * 32}, t
     assert len(me_api.requests) >= 4
 
 
@@ -707,6 +819,7 @@ async def test_the_token_never_reaches_a_log_or_a_response(with_tool, me_api, ca
     async with http() as hc:
         for ua in (CLAUDE_UA, OPENAI_UA):
             for reply in (lambda req: httpx.Response(401), lambda req: httpx.Response(403),
+                          lambda req: httpx.Response(403, json={"error": "insufficient_scope"}),
                           lambda req: httpx.Response(500), lambda req: httpx.Response(200, json=ME)):
                 me_api.reply = reply
                 forget()

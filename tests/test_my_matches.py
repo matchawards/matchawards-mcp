@@ -12,7 +12,7 @@ from matchawards_mcp import linking, server, tools, usage
 
 from test_http import LEGACY, http, no_api_budget_leak  # noqa: F401  (fixtures)
 from test_linking import (  # noqa: F401  (fixtures)
-    CLAUDE_UA, ME, OPENAI_UA, TOKEN, call, header, issuer, linked, me_api, profile,
+    CLAUDE_UA, ME, OPENAI_UA, TOKEN, call, header, issuer, linked, me_api, naics, profile,
 )
 from test_server import UTM, anyio_backend, api, ok, page, tagged  # noqa: F401  (fixtures)
 
@@ -49,9 +49,11 @@ async def test_the_search_carries_the_profiles_filters(api):
                                     "limit": "20"}  # no set_aside: a small business can bid on open competitions too
     assert out.model_dump(exclude_none=True) == {
         **tagged({k: v for k, v in page([1, 2]).items() if v is not None}),
-        "profile_used": {"naics": ["541512", "541511"], "set_aside": "SBA", "set_aside_applied": False, "state": "VA"},
+        "profile_used": {"naics": ["541512", "541511"], "set_aside": "SBA", "set_aside_name": "Total Small Business",
+                         "set_aside_applied": False, "state": "VA"},
         "note": f"{NOTE} {tools.STATE_NOTE} {tools._set_aside_note('SBA', False)} {tools.LINK_RULE}",
     }
+    assert tools.TRUNCATED_NOTE not in out.note
     assert "set-aside is SBA" in out.note and "only_my_set_aside=true" in out.note
 
 
@@ -110,29 +112,54 @@ async def test_pages_follow_the_cursor_with_the_same_filters(api):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("naics", [[], ["54", "5415"]])
-async def test_a_profile_without_naics_codes_gets_the_settings_link_and_no_search(api, naics):
-    out = await run(profile(naics=naics))
+@pytest.mark.parametrize("codes", [[], ["54", "5415"]])
+async def test_a_profile_without_naics_codes_gets_the_settings_link_and_no_search(api, codes):
+    out = await run(profile(naics=naics(*codes)))
     assert api.requests == []
     assert out.model_dump(exclude_none=True) == {
         "results": [], "has_more": False, "settings_url": SETTINGS, "note": tools.NO_NAICS_NOTE,
-        "profile_used": {"naics": [], "set_aside": "SBA", "set_aside_applied": False, "state": "VA"},
+        "profile_used": {"naics": [], "set_aside": "SBA", "set_aside_name": "Total Small Business",
+                         "set_aside_applied": False, "state": "VA"},
     }
 
 
 @pytest.mark.anyio
-async def test_only_ten_six_digit_codes_are_searched_and_the_note_says_so(api):
-    codes = [f"5415{i:02d}" for i in range(12)] + ["23"]
-    out = await run(profile(naics=codes))
+@pytest.mark.parametrize("url, expected", [
+    ("https://staging.matchawards.com/settings/match_settings",
+     f"https://staging.matchawards.com/settings/match_settings?{UTM}"),
+    ("https://matchawards.com/settings/match_settings?tab=naics", f"https://matchawards.com/settings/"
+     f"match_settings?tab=naics&{UTM}"),
+    (None, SETTINGS),  # none on the profile: the default
+    ("https://evil.example/settings", SETTINGS),  # not the site: dropped at parse, so the default
+])
+async def test_the_settings_link_is_the_profiles_own_when_it_has_one(api, url, expected):
+    out = await run(profile(naics=[], match_settings_url=url))
+    assert out.settings_url == expected
+
+
+@pytest.mark.anyio
+async def test_a_truncated_profile_says_only_the_first_ten_codes_were_searched(api):
+    codes = [f"5415{i:02d}" for i in range(10)]
+    out = await run(profile(naics=naics(*codes), naics_truncated=True))
+    assert api.requests[0].url.params["naics"] == ",".join(codes)
+    assert out.profile_used.naics == codes
+    assert tools.TRUNCATED_NOTE in out.note and "first 10 NAICS codes" in tools.TRUNCATED_NOTE
+
+
+@pytest.mark.anyio
+async def test_more_than_ten_codes_are_cut_to_ten_and_the_note_says_so(api):
+    """/me lists at most 10; should it send more, only the first 10 are searched."""
+    codes = [f"5415{i:02d}" for i in range(12)]
+    out = await run(profile(naics=naics(*codes)))
     assert api.requests[0].url.params["naics"] == ",".join(codes[:10])
     assert out.profile_used.naics == codes[:10]
-    assert "3 of the profile's NAICS codes were not searched" in out.note
+    assert tools.TRUNCATED_NOTE in out.note
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("outcome, error", [
     (None, "invalid_token"), (linking.INVALID, "invalid_token"), (linking.INSUFFICIENT, "insufficient_scope"),
-    ("something else", "invalid_token"), (object(), "invalid_token"), ({"account_id": "123"}, "invalid_token"),
+    ("something else", "invalid_token"), (object(), "invalid_token"), ({"sub": ME["sub"]}, "invalid_token"),
 ])
 async def test_without_a_profile_it_never_searches_and_answers_the_challenge(api, issuer, outcome, error):
     with authed(outcome):
@@ -140,6 +167,15 @@ async def test_without_a_profile_it_never_searches_and_answers_the_challenge(api
     assert api.requests == []
     assert result.is_error and result.content[0].text == tools.LINK_PROMPT
     assert result.meta == {"mcp/www_authenticate": [header(error)]}
+
+
+@pytest.mark.anyio
+async def test_a_refused_account_gets_a_plain_error_not_a_challenge(api):
+    with pytest.raises(ToolError, match="This MatchAwards account can't use my_matches. Check the account on "
+                       "matchawards.com.") as e:
+        await run(linking.FORBIDDEN)
+    assert e.value.outcome == "forbidden"
+    assert api.requests == []
 
 
 @pytest.mark.anyio
@@ -232,7 +268,7 @@ async def test_a_linked_user_gets_rows_that_validate_against_the_schema(linked, 
 
 @pytest.mark.anyio
 async def test_a_profile_without_naics_validates_against_the_schema(linked, me_api, api):
-    me_api.reply = lambda req: httpx.Response(200, json={**ME, "naics": []})
+    me_api.reply = lambda req: httpx.Response(200, json={**ME, "naics": [], "match_settings_url": None})
     async with http() as hc:
         schema = await _schema(hc)
         r = await call(hc, token=TOKEN, ua=OPENAI_UA)
@@ -273,6 +309,22 @@ async def test_matchawards_not_answering_the_check_is_a_busy_error_end_to_end(li
     assert result["isError"] is True and "_meta" not in result
     assert result["content"][0]["text"].endswith("MatchAwards is busy right now. Retry in a minute.")
     assert api.requests == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("ua", [CLAUDE_UA, OPENAI_UA])
+async def test_a_refused_account_is_a_plain_error_end_to_end(linked, me_api, api, ua):
+    me_api.reply = lambda req: httpx.Response(403, json={"error": "forbidden"})
+    usage.metrics.counts.clear()
+    async with http() as hc:
+        r = await call(hc, ua=ua, token=TOKEN)
+    assert r.status_code == 200 and "www-authenticate" not in r.headers
+    result = r.json()["result"]
+    assert result["isError"] is True and "_meta" not in result
+    assert result["content"][0]["text"].endswith(tools.FORBIDDEN_TEXT)
+    assert api.requests == []
+    assert usage.metrics.counts[("mcp_tool_calls_total", (("outcome", "forbidden"), ("tool", "my_matches")))] == 1
+    assert not any(name == "mcp_link_challenges_total" for name, _ in usage.metrics.counts)
 
 
 @pytest.mark.anyio

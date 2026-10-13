@@ -127,6 +127,7 @@ class ProfileUsed(BaseModel):
 
     naics: list[str] = Field(description="The profile's NAICS codes that were searched; [] when it has none.")
     set_aside: Text = Field(None, description="The profile's set-aside code, or null when it has none.")
+    set_aside_name: Text = Field(None, description="The set-aside's name (e.g. Total Small Business), or null.")
     set_aside_applied: bool = Field(description="true: only notices set aside for it were searched "
                                     "(only_my_set_aside); false: notices open to all firms are included.")
     state: Text = Field(None, description="The profile's state, or null when it has none or ignore_state was set.")

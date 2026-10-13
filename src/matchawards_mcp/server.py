@@ -535,7 +535,8 @@ class HttpGuard:
         the MCP layer), and a tools/call of a linked tool is checked (linking.check) and the outcome put in
         linking.auth for the tool. No or a bad token gets a 401, a token without the scope a 403, unless the caller
         is ChatGPT (openai-mcp): it links on a tool result, so its call goes on and the tool answers the challenge.
-        MatchAwards not answering the check is never a challenge: the call goes on and the tool reports it. The rate
+        An account MatchAwards refuses (403 forbidden) or MatchAwards not answering the check is never a challenge:
+        the call goes on and the tool reports it. The rate
         limits already counted the request, so a challenge costs what a call does."""
         headers = dict(scope["headers"])
         subject = chatgpt_subject(scope) if ip in self.egress else b""  # as reject() decided it
@@ -563,7 +564,8 @@ class HttpGuard:
                     outcome = await linking.check(scope)
                     linking.auth.set(outcome)
                     if isinstance(outcome, linking.Profile):
-                        usage.distinct.see("account", outcome.account_id)  # hashed with the gauges' own salt
+                        usage.distinct.see("account", outcome.sub)  # hashed with the gauges' own salt
+                    # FORBIDDEN and UNAVAILABLE go on: linking again would not help, and the tool says so.
                     elif outcome in (linking.INVALID, linking.INSUFFICIENT) and not linking.is_openai_host(raw_ua):
                         app = linking.challenge_response(outcome)
                         usage.metrics.inc("mcp_link_challenges_total", host=link_host(raw_ua), error=outcome)

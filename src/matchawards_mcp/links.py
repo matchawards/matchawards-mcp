@@ -37,7 +37,8 @@ def utm_source(family: str | None) -> str:
     return DEFAULT_SOURCE
 
 
-def _is_site(host: str | None) -> bool:
+def is_site(host: str | None) -> bool:
+    """Whether `host` is the site: matchawards.com or one of its subdomains."""
     return bool(host) and (host == SITE_DOMAIN or host.endswith("." + SITE_DOMAIN))
 
 
@@ -51,7 +52,7 @@ def tagged(url: str | None) -> str | None:
         host = parts.hostname
     except ValueError:  # e.g. a malformed IPv6 host
         return url
-    if parts.scheme not in ("http", "https") or not _is_site(host):
+    if parts.scheme not in ("http", "https") or not is_site(host):
         return url
     if any(k.lower().startswith("utm_") for k, _ in parse_qsl(parts.query, keep_blank_values=True)):
         return url

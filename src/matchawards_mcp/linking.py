@@ -11,7 +11,8 @@ Only a tools/call of a LINKED_TOOLS tool is checked; everything else (initialize
 is. A host links on one of two challenge shapes, both naming the same metadata: an HTTP 401 (403 for a missing
 scope) with WWW-Authenticate for Claude and other MCP clients (server.HttpGuard sends it before the MCP layer), and
 for ChatGPT, which reads a 401 as a failed call, a tool result with isError and _meta["mcp/www_authenticate"]
-(challenge_result, returned by the tool itself).
+(challenge_result, returned by the tool itself). An account /me refuses outright (403 forbidden) or /me not answering
+is never a challenge: the call goes on and the tool says so.
 
 Off, nothing here runs: no metadata route, no body read, no /me call, and the tool list is the one without linking.
 """
@@ -26,6 +27,7 @@ import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
@@ -34,7 +36,7 @@ import httpx
 from mcp.types import CallToolResult, TextContent
 from starlette.responses import JSONResponse
 
-from . import api
+from . import api, links
 
 ISSUER = os.environ.get("MATCHAWARDS_AUTH_ISSUER", "").strip().rstrip("/")  # "" = linking off
 RESOURCE = os.environ.get("MATCHAWARDS_RESOURCE", "").strip()  # "" = {ISSUER}/mcp
@@ -47,13 +49,15 @@ CACHE_TTL_S = 60
 INVALID_TTL_S = 30  # a token /me rejected, so a client repeating it is not checked on every call
 CACHE_MAX = 10_000  # per cache (profiles, rejected tokens)
 
-# The three ways a check can fail. invalid_token and insufficient_scope are the RFC 6750 error codes the challenge
-# carries; unavailable (MatchAwards down, slow or answering nonsense) is never a challenge: asking the user to link
-# again would not help, and a host that links on every challenge would loop.
+# The four ways a check can fail. invalid_token and insufficient_scope are the RFC 6750 error codes the challenge
+# carries; forbidden (an account that may not use linked tools: disabled, suspended, or the token's app is not an
+# agent app) and unavailable (MatchAwards down, slow or answering nonsense) are never a challenge: asking the user to
+# link again would not help, and a host that links on every challenge would loop.
 INVALID = "invalid_token"
 INSUFFICIENT = "insufficient_scope"
+FORBIDDEN = "forbidden"
 UNAVAILABLE = "unavailable"
-Refusal = Literal["invalid_token", "insufficient_scope", "unavailable"]
+Refusal = Literal["invalid_token", "insufficient_scope", "forbidden", "unavailable"]
 
 log = logging.getLogger("matchawards_mcp.linking")
 
@@ -77,13 +81,15 @@ client = httpx.AsyncClient(
 class Profile:
     """The linked account's matching profile, from /me. Every field is checked and cleaned before it is kept."""
 
-    account_id: str
-    username: str | None
+    sub: str  # the account's opaque, stable id (32 hex)
     organization: str | None
-    naics: tuple[str, ...]
-    set_aside: str | None
+    naics: tuple[str, ...]  # six-digit codes, in profile order
+    naics_truncated: bool  # the profile has more codes than /me lists
+    set_aside: str | None  # a code such as SBA
+    set_aside_name: str | None
     state: str | None
     uei: str | None
+    match_settings_url: str | None  # an https link to the match settings on the site
 
 
 def enabled() -> bool:
@@ -252,30 +258,61 @@ def _text(value, pattern: str) -> str | None:
     return value.strip() if isinstance(value, str) and re.fullmatch(pattern, value.strip()) else None
 
 
+def _site_url(value) -> str | None:
+    """An https link to the site (matchawards.com or a subdomain, as links.tagged knows it) with no user:password@,
+    no port other than 443 and no space or control character, at most 500 characters; else None."""
+    if not isinstance(value, str) or len(value) > 500 or any(c <= " " or c == "\x7f" for c in value):
+        return None
+    try:
+        parts = urlsplit(value)
+        ok = parts.scheme == "https" and links.is_site(parts.hostname) and parts.port in (None, 443) \
+            and "@" not in parts.netloc
+    except ValueError:  # e.g. a port that is not a number
+        return None
+    return value if ok else None
+
+
 def parse_profile(data) -> Profile | None:
-    """A Profile from a /me body, or None when it is not one (no account id, naics not a list); me() checks its
-    resource. Fields in the wrong shape are dropped (None), and only NAICS codes of 2 to 6 digits are kept, so nothing
-    from the body reaches a search filter or a result unchecked."""
-    if not isinstance(data, dict) or not isinstance(data.get("account"), dict):
+    """A Profile from a /me body, or None when it is not one (sub not 32 lowercase hex, naics not a list); me()
+    checks its resource and expiry. Fields in the wrong shape are dropped (None), and only six-digit NAICS codes are
+    kept, so nothing from the body reaches a search filter or a result unchecked."""
+    if not isinstance(data, dict):
         return None
-    account_id = data["account"].get("id")
-    if isinstance(account_id, int) and not isinstance(account_id, bool):
-        account_id = str(account_id)
-    if not isinstance(account_id, str) or not account_id.strip() or not isinstance(data.get("naics"), list):
+    sub = data.get("sub")
+    if not isinstance(sub, str) or not re.fullmatch(r"[0-9a-f]{32}", sub) or not isinstance(data.get("naics"), list):
         return None
-    codes = (c.strip() for c in data["naics"] if isinstance(c, str))
-    naics = dict.fromkeys(c for c in codes if re.fullmatch(r"\d{2,6}", c))
+    codes = (n.get("code") for n in data["naics"] if isinstance(n, dict))
+    naics = dict.fromkeys(c.strip() for c in codes if isinstance(c, str) and re.fullmatch(r"[0-9]{6}", c.strip()))
+    set_aside = data.get("set_aside") if isinstance(data.get("set_aside"), dict) else {}
+    code = _text(set_aside.get("code"), r"[A-Za-z0-9_-]{1,40}")
+    name = set_aside.get("name") if code else None
     state = _text(data.get("state"), r"[A-Za-z]{2}")
-    org, username = data.get("organization"), data["account"].get("username")
+    org = data.get("organization_name")
     return Profile(
-        account_id=account_id.strip()[:100],
-        username=(api.clean(username, 100) or None) if isinstance(username, str) else None,
+        sub=sub,
         organization=(api.clean(org, 200) or None) if isinstance(org, str) else None,
         naics=tuple(naics),
-        set_aside=_text(data.get("set_aside"), r"[A-Za-z0-9_-]{1,40}"),
+        naics_truncated=data.get("naics_truncated") is True,
+        set_aside=code,
+        set_aside_name=(api.clean(name, 100) or None) if isinstance(name, str) else None,
         state=state.upper() if state else None,
         uei=_text(data.get("uei"), r"[A-Za-z0-9]{12}"),
+        match_settings_url=_site_url(data.get("match_settings_url")),
     )
+
+
+def _expired(value) -> bool:
+    """Whether a /me token_expires_at is a time (ISO 8601; no zone is UTC) already past. Anything else is not."""
+    if not isinstance(value, str):
+        return False
+    value = value.strip()
+    if value.endswith(("Z", "z")):  # Python before 3.11 does not read the Z
+        value = value[:-1] + "+00:00"
+    try:
+        when = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return (when if when.tzinfo else when.replace(tzinfo=timezone.utc)) <= datetime.now(timezone.utc)
 
 
 # The check of the request being served: a Profile, a Refusal, or None when it was not checked (stdio, linking off,
@@ -307,9 +344,18 @@ def _same_resource(value) -> bool:
         return False
 
 
+def _error(r: httpx.Response) -> str | None:
+    """The `error` of a JSON error body, or None."""
+    try:
+        body = r.json()
+    except ValueError:
+        return None
+    return body.get("error") if isinstance(body, dict) else None
+
+
 def _refuse(key: bytes, answer: str) -> str:
     """Record that /me refused the token under `key`: its profile, if cached, is dropped, and INVALID is remembered
-    for INVALID_TTL_S."""
+    for INVALID_TTL_S (INSUFFICIENT and FORBIDDEN are not remembered)."""
     _cache.pop(key, None)
     _refused[key] = next(_checks)
     _refused.move_to_end(key)
@@ -323,17 +369,18 @@ def _refuse(key: bytes, answer: str) -> str:
 
 async def me(token: str) -> Profile | Refusal:
     """The profile `token` belongs to, from /me (cached CACHE_TTL_S), or why there is none: INVALID (401: unknown,
-    expired or revoked; or a profile for a token issued for another resource, or with no resource named),
-    INSUFFICIENT (403: the token lacks SCOPE) or UNAVAILABLE (no answer in time, a network error, any other status,
-    a body that is not a profile, or the server-wide API budget spent).
+    expired or revoked; or a profile for a token issued for another resource, with no resource named, or whose
+    token_expires_at is past), INSUFFICIENT (403 insufficient_scope: the token lacks SCOPE), FORBIDDEN (any other
+    403: forbidden, an error /me does not name, or none) or UNAVAILABLE (no answer in time, a network error, any
+    other status, a body that is not a profile, or the server-wide API budget spent).
 
     /me names the resource (RFC 8707) the token was issued for. Only a token issued for this server's resource()
     is taken: one a client got for another service is not a key to this one.
 
-    A profile is cached for CACHE_TTL_S and INVALID for INVALID_TTL_S; INSUFFICIENT and UNAVAILABLE are asked again
-    next time. A refusal drops the token's cached profile, and a profile is not cached when a check that started
-    later was refused first (two calls in flight with a token revoked between them). The log says which failure it
-    was, never the token, the header or the token's hash."""
+    A profile is cached for CACHE_TTL_S and INVALID for INVALID_TTL_S; INSUFFICIENT, FORBIDDEN and UNAVAILABLE are
+    asked again next time. A refusal drops the token's cached profile, and a profile is not cached when a check that
+    started later was refused first (two calls in flight with a token revoked between them). The log says which
+    failure it was, never the token, the header or the token's hash."""
     key = _key(token)
     hit = _cached(_cache, key) or _cached(_invalid, key)
     if hit is not None:
@@ -349,7 +396,7 @@ async def me(token: str) -> Profile | Refusal:
     if r.status_code == 401:
         return _refuse(key, INVALID)
     if r.status_code == 403:
-        return _refuse(key, INSUFFICIENT)
+        return _refuse(key, INSUFFICIENT if _error(r) == INSUFFICIENT else FORBIDDEN)
     if r.status_code != 200:
         log.warning("profile check failed: HTTP %d", r.status_code)
         return UNAVAILABLE
@@ -363,6 +410,9 @@ async def me(token: str) -> Profile | Refusal:
         return UNAVAILABLE
     if not _same_resource(data.get("resource")):
         log.warning("profile check refused: the token was not issued for this resource")
+        return _refuse(key, INVALID)
+    if _expired(data.get("token_expires_at")):
+        log.warning("profile check refused: the token has expired")
         return _refuse(key, INVALID)
     # Else a newer check was refused while this one waited (or a refusal that may have been one was dropped for
     # room): the 200 answers this call only.

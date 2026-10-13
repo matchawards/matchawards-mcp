@@ -654,6 +654,9 @@ LINK_PROMPT = ("This needs the user to link their MatchAwards account (sign in w
 NO_NAICS_NOTE = ("The user's MatchAwards profile has no NAICS codes yet, so there is nothing to match. Give them "
                  "settings_url as a markdown link to add their codes in their match settings, then call my_matches "
                  "again.")
+TRUNCATED_NOTE = (f"Only the first {MAX_NAICS} NAICS codes on the user's MatchAwards profile were searched: the "
+                  "profile has more.")
+FORBIDDEN_TEXT = "This MatchAwards account can't use my_matches. Check the account on matchawards.com."
 STATE_NOTE = ("The state filter skips federal notices that have no state: call again with ignore_state=true to "
               "include them and every other state.")
 
@@ -682,24 +685,25 @@ async def my_matches(
     if not isinstance(profile, linking.Profile):  # never searches without a profile
         if profile == linking.UNAVAILABLE:  # the check did not get an answer: linking again would not help
             raise api.fail("upstream_error", "MatchAwards is busy right now. Retry in a minute.")
+        if profile == linking.FORBIDDEN:  # the account itself is refused: neither would linking again
+            raise api.fail("forbidden", FORBIDDEN_TEXT)
         error = profile if profile in (linking.INVALID, linking.INSUFFICIENT) else linking.INVALID
         return linking.challenge_result(error, LINK_PROMPT)
-    codes = [c for c in profile.naics if len(c) == 6]  # the search takes six-digit codes only
-    naics, state = codes[:MAX_NAICS], None if ignore_state else profile.state
+    naics, state = list(profile.naics[:MAX_NAICS]), None if ignore_state else profile.state
     # The API takes set_aside with federal or mixed contracts only (a 400 with type=state).
     set_aside = profile.set_aside if only_my_set_aside and naics and type != "state" else None
-    used = {"naics": naics, "set_aside": profile.set_aside, "set_aside_applied": bool(set_aside), "state": state}
+    used = {"naics": naics, "set_aside": profile.set_aside, "set_aside_name": profile.set_aside_name,
+            "set_aside_applied": bool(set_aside), "state": state}
     if not naics:
-        return MyMatches(results=[], has_more=False, profile_used=used, settings_url=MATCH_SETTINGS_URL,
-                         note=NO_NAICS_NOTE)
+        return MyMatches(results=[], has_more=False, profile_used=used,
+                         settings_url=profile.match_settings_url or MATCH_SETTINGS_URL, note=NO_NAICS_NOTE)
     out = await search_contracts(naics=",".join(naics), state=state, set_aside=set_aside, type=type, open=True,
                                  limit=limit, cursor=cursor)
-    left_out = len(profile.naics) - len(naics)
+    more = profile.naics_truncated or len(profile.naics) > len(naics)
     return _parse(MyMatches, {**out.model_dump(), "profile_used": used, "note": _note(
         "Open contracts matching the user's MatchAwards profile (profile_used).",
-        left_out and f"{left_out} of the profile's NAICS codes were not searched: only up to {MAX_NAICS} six-digit "
-        "codes are.", state and STATE_NOTE, _set_aside_note(profile.set_aside, bool(set_aside), type == "state"),
-        out.note)})
+        more and TRUNCATED_NOTE, state and STATE_NOTE,
+        _set_aside_note(profile.set_aside, bool(set_aside), type == "state"), out.note)})
 
 
 def _set_aside_note(code: str | None, applied: bool, state_only: bool = False) -> str | None:
