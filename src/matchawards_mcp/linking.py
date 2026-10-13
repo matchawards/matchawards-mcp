@@ -118,18 +118,21 @@ def metadata() -> dict:
 
 
 def check_settings() -> None:
-    """Stop --http at startup on an issuer or resource that is not an http(s) URL with a host."""
+    """Stop --http at startup on a bad URL: the issuer and the resource are public URLs a host fetches, so https;
+    the agent API base is usually an internal address, so http or https. All need a host and no query."""
     if not enabled():
         return
-    for name, value in (("MATCHAWARDS_AUTH_ISSUER", ISSUER), ("MATCHAWARDS_RESOURCE", resource()),
-                        ("MATCHAWARDS_AGENT_API_BASE", AGENT_API_BASE)):
+    for name, value, schemes in (("MATCHAWARDS_AUTH_ISSUER", ISSUER, ("https",)),
+                                 ("MATCHAWARDS_RESOURCE", resource(), ("https",)),
+                                 ("MATCHAWARDS_AGENT_API_BASE", AGENT_API_BASE, ("http", "https"))):
         try:
             parts = urlsplit(value)
-            ok = parts.scheme in ("http", "https") and bool(parts.hostname) and not parts.query and not parts.fragment
+            ok = parts.scheme in schemes and bool(parts.hostname) and not parts.query and not parts.fragment
         except ValueError:
             ok = False
         if not ok:
-            raise SystemExit(f"{name} must be an http(s) URL with a host and no query, got {value!r}")
+            kind = "an https" if schemes == ("https",) else "an http(s)"
+            raise SystemExit(f"{name} must be {kind} URL with a host and no query, got {value!r}")
 
 
 # RFC 6750 b64token. Anything else in the header is not a token we would send on.

@@ -139,15 +139,25 @@ def test_resource_and_metadata_url(monkeypatch):
     assert linking.metadata_paths() == set(PATHS)
 
 
-@pytest.mark.parametrize("name, value", [
-    ("ISSUER", "matchawards.com"), ("ISSUER", "ftp://matchawards.com"), ("RESOURCE", "https://x.test/mcp?a=1"),
-    ("AGENT_API_BASE", "not a url"),
+@pytest.mark.parametrize("name, value, message", [
+    ("ISSUER", "matchawards.com", "must be an https URL"), ("ISSUER", "ftp://matchawards.com", "must be an https URL"),
+    ("ISSUER", "http://matchawards.com", "must be an https URL"),
+    ("RESOURCE", "https://x.test/mcp?a=1", "must be an https URL"),
+    ("RESOURCE", "http://127.0.0.1:8765/mcp", "must be an https URL"),
+    ("AGENT_API_BASE", "not a url", "must be an http\\(s\\) URL"),
+    ("AGENT_API_BASE", "ftp://api.test", "must be an http\\(s\\) URL"),
 ])
-def test_bad_settings_stop_startup(monkeypatch, name, value):
+def test_bad_settings_stop_startup(monkeypatch, name, value, message):
     monkeypatch.setattr(linking, "ISSUER", ISSUER)
     monkeypatch.setattr(linking, name, value)
-    with pytest.raises(SystemExit, match="must be an http"):
+    with pytest.raises(SystemExit, match=message):
         server.http_app()
+
+
+def test_the_agent_api_base_may_be_plain_http(monkeypatch):
+    monkeypatch.setattr(linking, "ISSUER", ISSUER)
+    monkeypatch.setattr(linking, "AGENT_API_BASE", "http://10.0.0.5:3000")
+    linking.check_settings()
 
 
 def test_off_has_no_settings_to_check(monkeypatch):

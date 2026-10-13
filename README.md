@@ -184,8 +184,8 @@ Do not trust a broad private range such as `172.16.0.0/12`: it may overlap your 
 | `MATCHAWARDS_METRICS_HOST` | `127.0.0.1` | `--http` only: address of the metrics listener. |
 | `MATCHAWARDS_METRICS_PORT` | `9765` | `--http` only: port of the metrics listener. |
 | `MATCHAWARDS_USAGE_RETENTION_DAYS` | `180` | `--http` only: days usage-stat rows are kept. |
-| `MATCHAWARDS_AUTH_ISSUER` | unset | `--http` only: the OAuth authorization server (e.g. `https://matchawards.com`). Set: account linking is on. Unset: no linking, and nothing else changes. |
-| `MATCHAWARDS_RESOURCE` | `<issuer>/mcp` | `--http` only, linking on: this server's public URL, the resource tokens are issued for. |
+| `MATCHAWARDS_AUTH_ISSUER` | unset | `--http` only: the OAuth authorization server, an https URL (e.g. `https://matchawards.com`). Set: account linking is on. Unset: no linking, and nothing else changes. |
+| `MATCHAWARDS_RESOURCE` | `<issuer>/mcp` | `--http` only, linking on: this server's public https URL, the resource tokens are issued for. |
 | `MATCHAWARDS_AGENT_API_BASE` | `MATCHAWARDS_API_BASE` | `--http` only, linking on: base URL of the account API that checks a linked user's token. |
 | `MATCHAWARDS_WIDGETS` | unset | `1`: serve the result card (see Cards). Unset: no card resource and no `show_results`. |
 
