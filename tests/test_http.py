@@ -661,3 +661,26 @@ def test_too_many_prefixes_are_rejected_whole(monkeypatch):
     v6 = [{"ipv6Prefix": f"2001:db8:{i}::/48"} for i in range(4)]
     assert server.parse_egress({"prefixes": v6[:3]}) is not None
     assert server.parse_egress({"prefixes": v6}) is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("ua, domain", [
+    ("Claude-User", None),  # Claude refuses a ui.domain that is not its own '<hash>.claudemcpcontent.com'
+    ("openai-mcp/1.0.0", "https://matchawards.com"),  # ChatGPT requires one to submit an app with UI
+    ("curl/8", "https://matchawards.com"),
+])
+async def test_card_domain_is_fitted_to_the_host(monkeypatch, ua, domain):
+    monkeypatch.setattr(server, "WIDGETS", True)
+    monkeypatch.setattr(server, "mcp", server.build_mcp())
+    async with http(headers={**LEGACY, "User-Agent": ua}) as hc:
+        listed = (await hc.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "resources/list"})).json()
+        read = (await hc.post("/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "resources/read",
+                                           "params": {"uri": server.CARD_URI}})).json()
+    [res] = listed["result"]["resources"]
+    [content] = read["result"]["contents"]
+    for meta in (res["_meta"], content["_meta"]):
+        assert meta["ui"].get("domain") == domain
+        assert meta["ui"]["csp"] == {"connectDomains": [], "resourceDomains": [], "frameDomains": []}
+        assert meta["ui"]["prefersBorder"] is True
+        assert meta["openai/widgetCSP"]["redirect_domains"] == ["https://matchawards.com"]
+    assert server.CARD_META["ui"]["domain"] == "https://matchawards.com"  # the shared dict is never changed

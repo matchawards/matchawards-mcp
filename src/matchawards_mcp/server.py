@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import contextlib
 import contextvars
+import dataclasses
 import functools
 import hashlib
 import hmac
@@ -97,6 +98,34 @@ CARD_META = {
 }
 
 
+def _claude_host() -> bool:
+    """The request being served comes from Claude (User-Agent family claude*)."""
+    req = _request.get()
+    return bool(req) and req["family"].startswith("claude")
+
+
+def card_meta(meta: dict | None) -> dict | None:
+    """The card's _meta for the host asking. ui.domain means a different thing to each host: ChatGPT takes an origin
+    (and requires one to submit an app with UI), while Claude takes only its own '<hash>.claudemcpcontent.com' and
+    refuses to render the card on anything else. The card needs no stable origin, so Claude gets it without one."""
+    if not meta or "ui" not in meta or not _claude_host():
+        return meta
+    return {**meta, "ui": {k: v for k, v in meta["ui"].items() if k != "domain"}}
+
+
+class Server(MCPServer):
+    """MCPServer with the card's _meta fitted to the host (card_meta) when it is listed or read."""
+
+    async def list_resources(self):
+        return [r.model_copy(update={"meta": card_meta(r.meta)}) for r in await super().list_resources()]
+
+    async def read_resource(self, uri, context=None):
+        out = await super().read_resource(uri, context)
+        if not isinstance(out, list):
+            return out
+        return [dataclasses.replace(c, meta=card_meta(c.meta)) for c in out]
+
+
 def _with_show_hint(fn):
     """A search that ends its note with SHOW_HINT when it found anything."""
 
@@ -160,7 +189,7 @@ def build_mcp() -> MCPServer:
     """The server: the data tools, plus show_results and the card when WIDGETS is on, and GET /healthz.
 
     The module builds it once as `mcp`; tests build another after changing WIDGETS."""
-    srv = MCPServer(
+    srv = Server(
         name="matchawards",
         title="MatchAwards",
         instructions=INSTRUCTIONS + (" " + CARD_INSTRUCTIONS if WIDGETS else ""),
