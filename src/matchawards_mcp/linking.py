@@ -18,6 +18,7 @@ Off, nothing here runs: no metadata route, no body read, no /me call, and the to
 
 import contextvars
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -117,22 +118,27 @@ def metadata() -> dict:
     }
 
 
+LOOPBACK = ("localhost", "127.0.0.1", "::1")
+
+
 def check_settings() -> None:
-    """Stop --http at startup on a bad URL: the issuer and the resource are public URLs a host fetches, so https;
-    the agent API base is usually an internal address, so http or https. All need a host and no query."""
+    """Stop --http at startup on a bad URL: the issuer and the resource are public URLs a host fetches, so https
+    (http only on a loopback host, for a local run); the agent API base is usually an internal address, so http or
+    https. All need a host and no query."""
     if not enabled():
         return
-    for name, value, schemes in (("MATCHAWARDS_AUTH_ISSUER", ISSUER, ("https",)),
-                                 ("MATCHAWARDS_RESOURCE", resource(), ("https",)),
-                                 ("MATCHAWARDS_AGENT_API_BASE", AGENT_API_BASE, ("http", "https"))):
+    for name, value, public in (("MATCHAWARDS_AUTH_ISSUER", ISSUER, True), ("MATCHAWARDS_RESOURCE", resource(), True),
+                                ("MATCHAWARDS_AGENT_API_BASE", AGENT_API_BASE, False)):
         try:
             parts = urlsplit(value)
-            ok = parts.scheme in schemes and bool(parts.hostname) and not parts.query and not parts.fragment
+            http_ok = not public or parts.hostname in LOOPBACK
+            ok = (parts.scheme == "https" or (parts.scheme == "http" and http_ok)) and bool(parts.hostname) \
+                and not parts.query and not parts.fragment
         except ValueError:
             ok = False
         if not ok:
-            kind = "an https" if schemes == ("https",) else "an http(s)"
-            raise SystemExit(f"{name} must be {kind} URL with a host and no query, got {value!r}")
+            kind = "an https URL (http only on localhost)" if public else "an http(s) URL"
+            raise SystemExit(f"{name} must be {kind} with a host and no query, got {value!r}")
 
 
 # RFC 6750 b64token. Anything else in the header is not a token we would send on.
@@ -211,6 +217,10 @@ clock = time.monotonic  # tests move it
 # out the good ones.
 _cache: OrderedDict[bytes, tuple[float, Profile]] = OrderedDict()
 _invalid: OrderedDict[bytes, tuple[float, str]] = OrderedDict()
+# keyed token hash -> when /me last refused it (a _checks number), so an answer to an older check never caches a
+# profile over a newer refusal. Bounded like the caches.
+_refused: OrderedDict[bytes, int] = OrderedDict()
+_checks = itertools.count()  # orders the /me checks and refusals of this process
 
 
 def _key(token: str) -> bytes:
@@ -278,9 +288,32 @@ async def check(scope) -> Profile | Refusal:
     return INVALID if token is None else await me(token)
 
 
+def _resource_key(url: str) -> tuple:
+    """A resource URL as compared: scheme and host case-insensitive, port, query and path as they are (a trailing
+    slash ignored)."""
+    parts = urlsplit(url.strip())
+    return parts.scheme.lower(), parts.hostname, parts.port, parts.path.rstrip("/"), parts.query, parts.fragment
+
+
 def _same_resource(value) -> bool:
-    """Whether a /me body's resource names this server (a trailing slash on either side ignored)."""
-    return isinstance(value, str) and value.strip().rstrip("/") == resource().rstrip("/")
+    """Whether a /me body's resource names this server."""
+    try:
+        return isinstance(value, str) and _resource_key(value) == _resource_key(resource())
+    except ValueError:  # e.g. a port that is not a number
+        return False
+
+
+def _refuse(key: bytes, answer: str) -> str:
+    """Record that /me refused the token under `key`: its profile, if cached, is dropped, and INVALID is remembered
+    for INVALID_TTL_S."""
+    _cache.pop(key, None)
+    _refused[key] = next(_checks)
+    _refused.move_to_end(key)
+    while len(_refused) > CACHE_MAX:
+        _refused.popitem(last=False)
+    if answer == INVALID:
+        _keep(_invalid, key, INVALID_TTL_S, INVALID)
+    return answer
 
 
 async def me(token: str) -> Profile | Refusal:
@@ -293,23 +326,25 @@ async def me(token: str) -> Profile | Refusal:
     is taken: one a client got for another service is not a key to this one.
 
     A profile is cached for CACHE_TTL_S and INVALID for INVALID_TTL_S; INSUFFICIENT and UNAVAILABLE are asked again
-    next time. The log says which failure it was, never the token, the header or the token's hash."""
+    next time. A refusal drops the token's cached profile, and a profile is not cached when a check that started
+    later was refused first (two calls in flight with a token revoked between them). The log says which failure it
+    was, never the token, the header or the token's hash."""
     key = _key(token)
     hit = _cached(_cache, key) or _cached(_invalid, key)
     if hit is not None:
         return hit
     if api.api_budget is not None and api.api_budget.check("api"):
         return UNAVAILABLE
+    started = next(_checks)
     try:
         r = await client.get(f"{AGENT_API_BASE}{ME_PATH}", headers={"Authorization": f"Bearer {token}"})
     except httpx.HTTPError as e:
         log.warning("profile check failed: %s", type(e).__name__)
         return UNAVAILABLE
     if r.status_code == 401:
-        _keep(_invalid, key, INVALID_TTL_S, INVALID)
-        return INVALID
+        return _refuse(key, INVALID)
     if r.status_code == 403:
-        return INSUFFICIENT
+        return _refuse(key, INSUFFICIENT)
     if r.status_code != 200:
         log.warning("profile check failed: HTTP %d", r.status_code)
         return UNAVAILABLE
@@ -323,7 +358,8 @@ async def me(token: str) -> Profile | Refusal:
         return UNAVAILABLE
     if not _same_resource(data.get("resource")):
         log.warning("profile check refused: the token was not issued for this resource")
-        _keep(_invalid, key, INVALID_TTL_S, INVALID)
-        return INVALID
-    _keep(_cache, key, CACHE_TTL_S, profile)
+        return _refuse(key, INVALID)
+    if _refused.get(key, -1) < started:  # else a newer check was refused while this one waited: keep that
+        _invalid.pop(key, None)
+        _keep(_cache, key, CACHE_TTL_S, profile)
     return profile

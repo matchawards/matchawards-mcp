@@ -24,6 +24,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from . import linking
+
 log = logging.getLogger("matchawards_mcp.usage")
 
 DEFAULT_DB = "/data/usage.db"
@@ -220,6 +222,8 @@ class Metrics:
         "mcp_linked_calls_total": "Tool calls that ran with a linked account, by tool.",
     }
     HISTOGRAM_HELP = {"mcp_tool_duration_seconds": "Tool call latency in seconds, by tool."}
+    # Rendered only with account linking on, like the distinct "account" kind: off, /metrics is what it was without.
+    LINK_ONLY = ("mcp_link_challenges_total", "mcp_linked_calls_total")
 
     def __init__(self):
         self.counts: Counter = Counter()
@@ -241,8 +245,10 @@ class Metrics:
         with self.lock:
             counts = dict(self.counts)
             histograms = {k: list(v) for k, v in self.histograms.items()}
-        lines = []
+        lines, linked = [], linking.enabled()
         for name, text in self.HELP.items():
+            if name in self.LINK_ONLY and not linked:
+                continue
             lines += [f"# HELP {name} {text}", f"# TYPE {name} counter"]
             series = sorted((labels, n) for (metric, labels), n in counts.items() if metric == name)
             if not series and name == "mcp_ledger_errors_total":
@@ -260,10 +266,10 @@ class Metrics:
                 lines += [f"{name}_sum{{{_labels(labels)}}} {round(h[-1], 6)}",
                           f"{name}_count{{{_labels(labels)}}} {total}"]
         lines += ["# HELP mcp_distinct_callers Distinct callers in the window: client = /24 or /48 without probers "
-                  "or own tests, chatgpt_subject = x-openai-subject from ChatGPT egress, account = linked accounts. "
-                  "Reset on restart.",
+                  "or own tests, chatgpt_subject = x-openai-subject from ChatGPT egress"
+                  + (", account = linked accounts" if linked else "") + ". Reset on restart.",
                   "# TYPE mcp_distinct_callers gauge"]
-        snapshot = {kind: distinct.counts(kind) for kind in Distinct.KINDS}
+        snapshot = {kind: distinct.counts(kind) for kind in Distinct.KINDS if linked or kind != "account"}
         for kind, (windows, _) in snapshot.items():
             lines += [f'mcp_distinct_callers{{kind="{kind}",window="{w}"}} {n}' for w, n in windows.items()]
         lines += ["# HELP mcp_distinct_evictions_total Distinct-caller keys dropped to stay under the cap, by kind.",

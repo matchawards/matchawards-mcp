@@ -56,6 +56,7 @@ def me_api(monkeypatch):
     ))
     monkeypatch.setattr(linking, "_cache", OrderedDict())
     monkeypatch.setattr(linking, "_invalid", OrderedDict())
+    monkeypatch.setattr(linking, "_refused", OrderedDict())
     return me_api
 
 
@@ -63,6 +64,7 @@ def forget():
     """Empty both token caches (profiles and rejected tokens)."""
     linking._cache.clear()
     linking._invalid.clear()
+    linking._refused.clear()
 
 
 @pytest.fixture
@@ -142,8 +144,10 @@ def test_resource_and_metadata_url(monkeypatch):
 @pytest.mark.parametrize("name, value, message", [
     ("ISSUER", "matchawards.com", "must be an https URL"), ("ISSUER", "ftp://matchawards.com", "must be an https URL"),
     ("ISSUER", "http://matchawards.com", "must be an https URL"),
+    ("ISSUER", "http://127.0.0.2", "must be an https URL"),
     ("RESOURCE", "https://x.test/mcp?a=1", "must be an https URL"),
-    ("RESOURCE", "http://127.0.0.1:8765/mcp", "must be an https URL"),
+    ("RESOURCE", "http://matchawards.com/mcp", "must be an https URL"),
+    ("RESOURCE", "http://localhost.example/mcp", "must be an https URL"),
     ("AGENT_API_BASE", "not a url", "must be an http\\(s\\) URL"),
     ("AGENT_API_BASE", "ftp://api.test", "must be an http\\(s\\) URL"),
 ])
@@ -157,6 +161,13 @@ def test_bad_settings_stop_startup(monkeypatch, name, value, message):
 def test_the_agent_api_base_may_be_plain_http(monkeypatch):
     monkeypatch.setattr(linking, "ISSUER", ISSUER)
     monkeypatch.setattr(linking, "AGENT_API_BASE", "http://10.0.0.5:3000")
+    linking.check_settings()
+
+
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "[::1]", "LOCALHOST"])
+def test_a_local_run_may_use_http_on_a_loopback_host(monkeypatch, host):
+    monkeypatch.setattr(linking, "ISSUER", f"http://{host}:3000")
+    monkeypatch.setattr(linking, "RESOURCE", f"http://{host}:8765/mcp")
     linking.check_settings()
 
 
@@ -318,6 +329,13 @@ async def test_me_rejected_tokens_are_bounded_and_never_push_out_profiles(issuer
 @pytest.mark.parametrize("value, outcome", [
     ("https://matchawards.com/mcp", "profile"),
     ("https://matchawards.com/mcp/", "profile"),
+    ("HTTPS://MatchAwards.COM/mcp", "profile"),
+    (" https://matchawards.com/mcp ", "profile"),
+    ("https://matchawards.com/MCP", linking.INVALID),
+    ("https://matchawards.com:8443/mcp", linking.INVALID),
+    ("http://matchawards.com/mcp", linking.INVALID),
+    ("https://matchawards.com/mcp?x=1", linking.INVALID),
+    ("https://matchawards.com:x/mcp", linking.INVALID),
     ("https://matchawards.com/", linking.INVALID),
     ("https://matchawards.com/mcp/other", linking.INVALID),
     ("https://staging.matchawards.com/mcp", linking.INVALID),
@@ -335,6 +353,72 @@ async def test_me_takes_only_a_token_issued_for_this_resource(issuer, me_api, va
         assert isinstance(got, linking.Profile) and linking._cache and not linking._invalid
     else:
         assert got == outcome and not linking._cache and linking._invalid
+
+
+@pytest.mark.anyio
+async def test_a_refusal_landing_during_a_slow_check_keeps_its_profile_out_of_the_cache(issuer, me_api):
+    """Two checks of one token in flight: the second is refused (401) while the first, started earlier, waits for
+    its 200. The 200 still answers its own call, but is not cached: the next call sees the refusal."""
+    first_sent, refused = asyncio.Event(), asyncio.Event()
+
+    async def reply(req):
+        if not first_sent.is_set():
+            first_sent.set()
+            await refused.wait()  # the 200 lands after the 401
+            return httpx.Response(200, json=ME)
+        return httpx.Response(401)
+
+    me_api.reply = reply
+    slow = asyncio.create_task(linking.me(TOKEN))
+    await first_sent.wait()
+    assert await linking.me(TOKEN) == linking.INVALID
+    refused.set()
+    assert isinstance(await slow, linking.Profile)
+    assert not linking._cache
+    assert await linking.me(TOKEN) == linking.INVALID  # from the negative cache, no new request
+    assert len(me_api.requests) == 2
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("refusal", [lambda req: httpx.Response(401), lambda req: httpx.Response(403),
+                                     lambda req: httpx.Response(200, json={**ME, "resource": "https://x.test/mcp"})])
+async def test_a_refusal_drops_a_profile_cached_while_it_was_in_flight(issuer, me_api, refusal):
+    """The other order: the 200 lands and is cached first, then the refusal of a check that was already in flight
+    drops it."""
+    first_sent, cached = asyncio.Event(), asyncio.Event()
+
+    async def reply(req):
+        if not first_sent.is_set():
+            first_sent.set()
+            await cached.wait()
+            return refusal(req)
+        return httpx.Response(200, json=ME)
+
+    me_api.reply = reply
+    slow = asyncio.create_task(linking.me(TOKEN))
+    await first_sent.wait()
+    assert isinstance(await linking.me(TOKEN), linking.Profile)
+    assert linking._cache
+    cached.set()
+    assert await slow in (linking.INVALID, linking.INSUFFICIENT)
+    assert not linking._cache
+
+
+@pytest.mark.anyio
+async def test_a_profile_after_a_refusal_clears_it(issuer, me_api, monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(linking, "clock", lambda: now[0])
+    me_api.reply = lambda req: httpx.Response(403)
+    assert await linking.me(TOKEN) == linking.INSUFFICIENT
+    me_api.reply = lambda req: httpx.Response(200, json=ME)  # the user granted the scope
+    assert isinstance(await linking.me(TOKEN), linking.Profile) and linking._cache
+    me_api.reply = lambda req: httpx.Response(401)
+    linking._cache.clear()
+    assert await linking.me(TOKEN) == linking.INVALID and linking._invalid
+    now[0] += 31  # the refusal expired; a profile now replaces it
+    me_api.reply = lambda req: httpx.Response(200, json=ME)
+    assert isinstance(await linking.me(TOKEN), linking.Profile)
+    assert linking._cache and not linking._invalid
 
 
 @pytest.mark.anyio

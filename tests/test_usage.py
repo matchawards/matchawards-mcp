@@ -516,7 +516,44 @@ def test_retention_days_defaults_to_180_and_rejects_bad_values():
 
 # --- Account linking: challenges, linked calls, distinct accounts, the ledger's linked flag ------------------------
 
-def test_link_metrics_render_with_help_and_type():
+# An empty /metrics as 1.0.2 rendered it: with account linking off it must stay exactly this.
+METRICS_1_0_2 = """\
+# HELP mcp_tool_calls_total Tool calls by tool and outcome.
+# TYPE mcp_tool_calls_total counter
+# HELP mcp_requests_total Requests served on /mcp by JSON-RPC method.
+# TYPE mcp_requests_total counter
+# HELP mcp_rejected_total Requests rejected before the MCP layer, by reason.
+# TYPE mcp_rejected_total counter
+# HELP mcp_agent_requests_total Requests served on /mcp by User-Agent family.
+# TYPE mcp_agent_requests_total counter
+# HELP mcp_clients_total initialize requests by client (clientInfo.name folded into a fixed set).
+# TYPE mcp_clients_total counter
+# HELP mcp_ledger_errors_total Usage ledger writes that failed (the request itself was served).
+# TYPE mcp_ledger_errors_total counter
+mcp_ledger_errors_total 0
+# HELP mcp_tool_duration_seconds Tool call latency in seconds, by tool.
+# TYPE mcp_tool_duration_seconds histogram
+# HELP mcp_distinct_callers Distinct callers in the window: client = /24 or /48 without probers or own tests, \
+chatgpt_subject = x-openai-subject from ChatGPT egress. Reset on restart.
+# TYPE mcp_distinct_callers gauge
+mcp_distinct_callers{kind="client",window="1h"} 0
+mcp_distinct_callers{kind="client",window="24h"} 0
+mcp_distinct_callers{kind="chatgpt_subject",window="1h"} 0
+mcp_distinct_callers{kind="chatgpt_subject",window="24h"} 0
+# HELP mcp_distinct_evictions_total Distinct-caller keys dropped to stay under the cap, by kind.
+# TYPE mcp_distinct_evictions_total counter
+mcp_distinct_evictions_total{kind="client"} 0
+mcp_distinct_evictions_total{kind="chatgpt_subject"} 0
+"""
+
+
+def test_off_metrics_are_the_same_as_without_linking():
+    assert usage.metrics.render() == METRICS_1_0_2
+    usage.distinct.see("account", "123")  # nothing feeds it while off; even then it stays out
+    assert "account" not in usage.metrics.render() and "link" not in usage.metrics.render()
+
+
+def test_link_metrics_render_with_help_and_type(issuer):
     usage.metrics.inc("mcp_link_challenges_total", host="claude", error="invalid_token")
     usage.metrics.inc("mcp_linked_calls_total", tool="my_matches")
     usage.distinct.see("account", "123")
