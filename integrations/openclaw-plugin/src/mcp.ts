@@ -158,7 +158,7 @@ const RETRYABLE_TEXT: RegExp[] = [
   /\btemporarily unavailable\b/i,
   /\bserver error \(HTTP \d{3}\)/i,
   /\bcould not reach MatchAwards\b/i,
-  /\bunexpected (API )?response\b.*\bretry later\b/i,
+  /\bunexpected (API )?response\b/i,
 ];
 
 /** The prefix the MCP SDK puts on every error a tool raises. */
@@ -230,6 +230,8 @@ export async function callTool(
   try {
     response = await fetch(endpoint, {
       method: "POST",
+      // A redirect could send the call off the allowed endpoint: refuse it instead of following.
+      redirect: "error",
       signal: combined,
       headers: {
         "Content-Type": "application/json",

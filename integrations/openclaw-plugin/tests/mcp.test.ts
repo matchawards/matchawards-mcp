@@ -67,6 +67,7 @@ describe("the request", () => {
     expect(url).toBe(DEFAULT_ENDPOINT);
     expect(url).toBe("https://matchawards.com/mcp");
     expect(init.method).toBe("POST");
+    expect(init.redirect).toBe("error"); // never follow a redirect off the allowed endpoint
     const body = JSON.parse(init.body as string) as Record<string, unknown>;
     expect(body).toEqual({
       jsonrpc: "2.0",
@@ -275,6 +276,7 @@ describe("failures throw with the server's words", () => {
         "Error executing tool search_contracts: MatchAwards returned an unexpected response (HTTP 200, not a JSON object). Retry later.",
         null,
       ],
+      ["Error executing tool get_opportunity: MatchAwards returned an unexpected API response (no result object).", null],
     ];
     for (const [text, retryAfter] of cases) {
       fetchMock.mockResolvedValueOnce(rpcResult({ content: [{ type: "text", text }], isError: true }));
