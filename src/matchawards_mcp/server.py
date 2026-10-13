@@ -34,7 +34,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
-from . import __version__, api, tools, usage
+from . import __version__, api, links, tools, usage
 
 # The essentials sit in the first 512 characters: which tool for which intent, links as markdown, where the data
 # comes from and that it may be incomplete, no "incumbent", and that AI text is labelled. test_server.py checks it.
@@ -459,9 +459,11 @@ class HttpGuard:
             return message
 
         token = _request.set(req)
+        source_token = links.source.set(links.utm_source(req["family"]))  # utm_source on matchawards.com links
         try:
             await self.app(scope, observing_receive, send)
         finally:
+            links.source.reset(source_token)
             _request.reset(token)
             method, name, version = usage.parse_body(bytes(seen))
             usage.metrics.inc("mcp_requests_total", method=method)

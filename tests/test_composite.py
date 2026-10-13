@@ -14,7 +14,7 @@ from matchawards_mcp import server, tools
 from matchawards_mcp.schemas import AwardRow
 
 from test_data_tools import AWARDS, award, awards_page, params
-from test_server import PATH, api, anyio_backend, ok  # noqa: F401  (fixtures)
+from test_server import PATH, UTM, api, anyio_backend, ok  # noqa: F401  (fixtures)
 
 AI = {"fit": "Suits machine shops.", "reasoning": "Repair work.", "subcontracting": "Plating and testing subs.",
       "large_prime": None, "summary": {"nft_title": "Heat exchangers", "nft_insight": None, "nft_advantage": None},
@@ -95,7 +95,7 @@ async def test_assess_reads_the_detail_then_same_naics_and_agency_awards(api):
     assert out["opportunity"] == {
         "id": OPP["id"], "type": "federal", "title": OPP["title"], "agency": OPP["agency"], "naics": OPP["naics"],
         "set_aside": "SBA", "state": "OK", "response_deadline": "2026-10-26", "days_left": 16, "open": True,
-        "url": OPP["url"], "sam_url": OPP["sam_url"]}
+        "url": f"{OPP['url']}?{UTM}", "sam_url": OPP["sam_url"]}
     assert (out["naics_match"], out["set_aside_match"]) == (True, True)
     assert out["ai"]["fit"] == "Suits machine shops." and "generated" not in out["ai"]
     assert out["basis"] == "same NAICS and agency"

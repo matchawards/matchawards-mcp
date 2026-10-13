@@ -19,6 +19,14 @@ PATH = "/api/public/v1/opportunities"
 TOOLS = ["search_contracts", "search_grants", "search_jobs", "get_opportunity", "lookup_naics", "search_awards",
          "get_company", "assess_opportunity", "find_teaming_partners"]
 NOTE = tools.LINK_RULE
+UTM = "utm_source=mcp&utm_medium=ai_agent&utm_campaign=matchawards_mcp"  # outside an HTTP request
+
+
+def tagged(body):
+    """An API row (or page of rows) as a tool returns it: its matchawards.com url carries the UTM parameters."""
+    if "results" in body:
+        return {**body, "results": [tagged(r) for r in body["results"]]}
+    return {**body, "url": f"{body['url']}?{UTM}"}
 
 
 def row(i):
@@ -97,7 +105,7 @@ async def test_query_building(api, call, path, params):
 async def test_search_returns_rows_cursor_and_link_note(api):
     api.replies = [ok(page([1, 2], has_more=True, cursor="c1"))]
     out = (await tools.search_contracts(limit=2)).model_dump(exclude_none=True)
-    assert out == {**page([1, 2], has_more=True, cursor="c1"), "note": NOTE}
+    assert out == {**tagged(page([1, 2], has_more=True, cursor="c1")), "note": NOTE}
 
 
 @pytest.mark.anyio
@@ -203,7 +211,7 @@ async def test_complete_search_has_no_warning(api):
 async def test_get_opportunity_returns_the_detail_with_link_note(api):
     api.replies = [ok({"as_of": "2026-10-07T12:00:00Z", "result": DETAIL})]
     out = (await tools.get_opportunity("7")).model_dump(exclude_none=True)
-    assert out == {**DETAIL, "as_of": "2026-10-07T12:00:00Z", "note": NOTE}
+    assert out == {**tagged(DETAIL), "as_of": "2026-10-07T12:00:00Z", "note": NOTE}
 
 
 @pytest.mark.anyio

@@ -8,9 +8,14 @@ published schema only changes on purpose.
 import re
 from typing import Annotated
 
-from pydantic import BaseModel, BeforeValidator, Field, PrivateAttr
+from pydantic import AfterValidator, BaseModel, BeforeValidator, Field, PrivateAttr
+
+from . import links
 
 Text = str | None
+# A link to a matchawards.com page: it carries UTM parameters naming the AI host (links.tagged). Third-party links
+# (sam_url, source_url) are plain Text.
+SiteUrl = Annotated[Text, AfterValidator(links.tagged)]
 # AI text from the API, cut to 1000 characters (the API cuts it too; a longer value is shortened, not rejected).
 AiText = Annotated[
     Annotated[str, Field(max_length=1000)] | None, BeforeValidator(lambda v: v[:1000] if isinstance(v, str) else v)
@@ -103,7 +108,7 @@ class OpportunityRow(BaseModel):
     posted_at: Text = Field(None, description="Date, YYYY-MM-DD.")
     response_deadline: Text = Field(None, description="Date, YYYY-MM-DD; null if none.")
     no_fixed_deadline: bool | None = Field(None, description="true: the deadline is a placeholder date.")
-    url: Text = Field(None, description="The posting on matchawards.com. Show it as a markdown link.")
+    url: SiteUrl = Field(None, description="The posting on matchawards.com. Show it as a markdown link.")
     sam_url: Text = Field(None, description="The SAM.gov notice (federal only). Show it as a markdown link.")
     solicitation_number: Text = None
 
@@ -168,8 +173,8 @@ class OpportunityDetail(OpportunityRow):
 class NaicsCode(BaseModel):
     code: str = Field(strict=True, description="Six-digit NAICS code; pass it as naics to the search tools.")
     title: Text = None
-    opportunities_url: Text = Field(None, description="The code's page on matchawards.com, or null. Show it as a "
-                                    "markdown link.")
+    opportunities_url: SiteUrl = Field(None, description="The code's page on matchawards.com, or null. Show it as a "
+                                       "markdown link.")
 
 
 class NaicsLookup(BaseModel):
@@ -212,7 +217,7 @@ class AwardRow(BaseModel):
     solicitation_number: Text = None
     contract_number: Text = None
     cfda_number: Text = None
-    url: Text = Field(None, description="The award on matchawards.com. Show it as a markdown link.")
+    url: SiteUrl = Field(None, description="The award on matchawards.com. Show it as a markdown link.")
     source_url: Text = Field(None, description="The award notice at SAM.gov or USAspending. Show it as a markdown "
                              "link.")
 
@@ -276,7 +281,7 @@ class OpportunitySummary(BaseModel):
     days_left: int | None = Field(None, description="Days from today (US Eastern) to response_deadline; negative "
                                   "once it has passed; null without a deadline or with a placeholder date.")
     open: bool = Field(description="true: the deadline is today or later, US Eastern (no deadline: false).")
-    url: Text = Field(None, description="The posting on matchawards.com. Show it as a markdown link.")
+    url: SiteUrl = Field(None, description="The posting on matchawards.com. Show it as a markdown link.")
     sam_url: Text = Field(None, description="The SAM.gov notice (federal only). Show it as a markdown link.")
 
 
