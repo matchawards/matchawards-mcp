@@ -1,6 +1,7 @@
 """UTM parameters on matchawards.com links: the utm_source label per User-Agent family, which URLs are tagged, and
 that every tool result carries them. No network."""
 
+import contextlib
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -49,6 +50,20 @@ def test_utm_source_is_a_fixed_label_whatever_the_user_agent(ua):
 
 def test_a_site_link_is_tagged_with_the_default_source_outside_a_request():
     assert links.tagged(SITE) == f"{SITE}?utm_source=mcp&utm_medium=ai_agent&utm_campaign=matchawards_mcp"
+
+
+@contextlib.contextmanager
+def as_source(label):
+    """links.source set for the block and reset after it, so it cannot leak into the next test."""
+    token = links.source.set(label)
+    try:
+        yield
+    finally:
+        links.source.reset(token)
+
+
+def test_the_www_host_is_tagged_too():
+    assert utm(links.tagged("https://www.matchawards.com/a/1")) == params()
 
 
 def test_the_request_source_is_used():
@@ -104,10 +119,10 @@ def test_tagging_twice_is_tagging_once():
 
 @pytest.mark.anyio
 async def test_search_contracts_rows_carry_utm_and_sam_url_is_untouched(api):
-    links.source.set("chatgpt")  # as HttpGuard does; an async test runs in its own context, so it ends with the test
     rows = [{**r, "sam_url": f"https://sam.gov/opp/{r['id']}/view"} for r in page([1, 2])["results"]]
     api.replies = [ok({**page([]), "results": rows})]
-    out = await tools.search_contracts(limit=2)
+    with as_source("chatgpt"):  # as HttpGuard does
+        out = await tools.search_contracts(limit=2)
     assert [utm(r.url) for r in out.results] == [params("chatgpt")] * 2
     assert [r.sam_url for r in out.results] == ["https://sam.gov/opp/1/view", "https://sam.gov/opp/2/view"]
 
@@ -152,9 +167,9 @@ async def test_composite_summary_and_similar_awards_carry_utm(api):
 
 @pytest.mark.anyio
 async def test_show_results_rows_carry_utm(api):
-    links.source.set("claude")
     api.replies = by_id(_1=httpx.Response(200, json=opp(1, "federal")), _2=httpx.Response(200, json=opp(2, "grant")))
-    out = await tools.show_results(["1", "2"])
+    with as_source("claude"):
+        out = await tools.show_results(["1", "2"])
     assert [utm(r.url) for r in out.results] == [params("claude")] * 2
 
 

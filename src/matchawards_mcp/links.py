@@ -15,10 +15,11 @@ MEDIUM = "ai_agent"
 CAMPAIGN = "matchawards_mcp"
 DEFAULT_SOURCE = "mcp"  # stdio, an unknown or test client, or no request at all
 
-# The site's own hosts: matchawards.com and the host of the API base (a staging API returns staging links). Read
-# from the same setting as api.API_BASE (api.py imports the output models, so it cannot be imported from here).
+# The site's own hosts: matchawards.com (with www) and the host of the API base (a staging API returns staging
+# links). Read from the same setting as api.API_BASE (api.py imports the output models, so it cannot be imported
+# from here).
 _API_HOST = urlsplit(os.environ.get("MATCHAWARDS_API_BASE", "https://matchawards.com")).hostname
-SITE_HOSTS = frozenset(h for h in ("matchawards.com", _API_HOST) if h)
+SITE_HOSTS = frozenset(h for h in ("matchawards.com", "www.matchawards.com", _API_HOST) if h)
 
 # utm_source for the request being served (HTTP mode sets it per request, see server.HttpGuard).
 source: contextvars.ContextVar[str] = contextvars.ContextVar("matchawards_utm_source", default=DEFAULT_SOURCE)
