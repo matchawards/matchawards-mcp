@@ -2,7 +2,8 @@
 Paragraphs are separated by a blank line; server.py joins the lines inside a paragraph, so no line break falls
 mid-sentence in the published description.
 
-server.py registers TOOLS with their titles, annotations and securitySchemes, and counts every call.
+server.py registers TOOLS with their titles, annotations and securitySchemes (LINKED_TOOL too when account linking
+is on), and counts every call.
 """
 
 import asyncio
@@ -14,11 +15,12 @@ from typing import Annotated, Literal, NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import CallToolResult
 from pydantic import BaseModel, Field, ValidationError
 
-from . import api
+from . import api, linking
 from .schemas import (
-    Assessment, AwardRow, AwardSearchResult, Company, NaicsLookup, OpportunityDetail, OpportunityRow,
+    Assessment, AwardRow, AwardSearchResult, Company, MyMatches, NaicsLookup, OpportunityDetail, OpportunityRow,
     OpportunitySummary, SearchResult, ShownResults, TeamingPartners,
 )
 
@@ -74,6 +76,10 @@ Open = Annotated[
     Field(description="true (the default): only items with a response deadline of today or later, US Eastern; "
           "an item with no deadline counts as closed. false: include closed ones."),
 ]
+ContractType = Annotated[
+    Literal["federal", "state"] | None,
+    Field(description="Narrow to federal or to state contracts. Leave empty for both."),
+]
 Limit = Annotated[int, Field(ge=1, le=50, description="Number of results to return, 1 to 50.")]
 Cursor = Annotated[
     str | None,
@@ -119,10 +125,7 @@ async def search_contracts(
     state: State = None,
     keyword: Keyword = None,
     set_aside: SetAside = None,
-    type: Annotated[
-        Literal["federal", "state"] | None,
-        Field(description="Narrow to federal or to state contracts. Leave empty for both."),
-    ] = None,
+    type: ContractType = None,
     posted_within_days: PostedWithin = None,
     open: Open = None,
     agency: AgencyName = None,
@@ -642,6 +645,57 @@ async def find_teaming_partners(
     return out
 
 
+# --- my_matches: the linked account's own matches (registered only when account linking is on) --------------
+
+MATCH_SETTINGS_URL = "https://matchawards.com/settings/match_settings"
+MAX_NAICS = 10  # codes per search, as search_contracts takes them
+LINK_PROMPT = ("This needs the user to link their MatchAwards account (sign in with Google or email). Once linked, it "
+               "shows open contracts matching the NAICS codes on their MatchAwards profile.")
+NO_NAICS_NOTE = ("The user's MatchAwards profile has no NAICS codes yet, so there is nothing to match. Give them "
+                 "settings_url as a markdown link to add their codes in their match settings, then call my_matches "
+                 "again.")
+STATE_NOTE = ("The state filter skips federal notices that have no state: call again with ignore_state=true to "
+              "include them and every other state.")
+
+
+async def my_matches(
+    type: ContractType = None,
+    ignore_state: Annotated[bool, Field(description="true: search every state, not only the profile's.")] = False,
+    limit: Limit = 20,
+    cursor: Cursor = None,
+) -> Annotated[CallToolResult, MyMatches]:
+    """Use this when the user asks for their own matches: open contracts for their business. It needs a linked
+    MatchAwards account and uses that account's NAICS codes, set-aside and state; without a linked account it asks
+    the user to link one.
+
+    Options: type (federal or state), ignore_state (true: every state), limit (1 to 50, default 20). If has_more is
+    true, call again with cursor=next_cursor and the same options.
+
+    Print each result's url, and sam_url for federal notices, as markdown links.
+
+    Do not use for searches with the user's own filters (search_contracts) or for grants (search_grants).
+    """
+    profile = linking.auth.get()
+    if not isinstance(profile, linking.Profile):  # never searches without a profile
+        if profile == linking.UNAVAILABLE:  # the check did not get an answer: linking again would not help
+            raise api.fail("upstream_error", "MatchAwards is busy right now. Retry in a minute.")
+        error = profile if profile in (linking.INVALID, linking.INSUFFICIENT) else linking.INVALID
+        return linking.challenge_result(error, LINK_PROMPT)
+    codes = [c for c in profile.naics if len(c) == 6]  # the search takes six-digit codes only
+    naics, state = codes[:MAX_NAICS], None if ignore_state else profile.state
+    used = {"naics": naics, "set_aside": profile.set_aside, "state": state}
+    if not naics:
+        return MyMatches(results=[], has_more=False, profile_used=used, settings_url=MATCH_SETTINGS_URL,
+                         note=NO_NAICS_NOTE)
+    out = await search_contracts(naics=",".join(naics), state=state, set_aside=profile.set_aside, type=type,
+                                 open=True, limit=limit, cursor=cursor)
+    left_out = len(profile.naics) - len(naics)
+    return _parse(MyMatches, {**out.model_dump(), "profile_used": used, "note": _note(
+        "Open contracts matching the user's MatchAwards profile (profile_used).",
+        left_out and f"{left_out} of the profile's NAICS codes were not searched: only up to {MAX_NAICS} six-digit "
+        "codes are.", state and STATE_NOTE, out.note)})
+
+
 SHOW_MAX = 10  # ids per show_results call, each one API request
 # API requests show_results has in flight at once. In stdio mode there is no server-wide API budget, so this keeps
 # one call, with the searches around it, under the API's per-IP burst limit (20 requests per 5 seconds).
@@ -712,5 +766,7 @@ TOOLS = (
     (assess_opportunity, "Assess an opportunity"),
     (find_teaming_partners, "Find teaming partners"),
 )
-# The card tool: registered only when the card is (MATCHAWARDS_WIDGETS=1), after TOOLS.
+# The linked tool: registered only when account linking is on (MATCHAWARDS_AUTH_ISSUER), after TOOLS.
+LINKED_TOOL = (my_matches, "My matches")
+# The card tool: registered only when the card is (MATCHAWARDS_WIDGETS=1), last.
 CARD_TOOL = (show_results, "Show results")

@@ -428,8 +428,9 @@ async def my_matches() -> Annotated[CallToolResult, Seen]:
 
 @pytest.fixture
 def with_tool(linked, monkeypatch):
-    """Linking on, and the server has a linked tool (my_matches, the stand-in above)."""
+    """Linking on, and the server's linked tool is the stand-in above instead of the real my_matches."""
     srv = server.build_mcp()
+    srv.remove_tool("my_matches")
     server._tool(srv, my_matches, "My matches")
     monkeypatch.setattr(server, "mcp", srv)
 

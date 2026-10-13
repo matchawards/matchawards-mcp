@@ -122,6 +122,20 @@ class SearchResult(BaseModel):
     warning: Text = Field(None, description="Set when paging stopped early; the results so far are still valid.")
 
 
+class ProfileUsed(BaseModel):
+    """The filters my_matches took from the linked account's MatchAwards profile."""
+
+    naics: list[str] = Field(description="The profile's NAICS codes that were searched; [] when it has none.")
+    set_aside: Text = Field(None, description="The profile's set-aside code, or null when it has none.")
+    state: Text = Field(None, description="The profile's state, or null when it has none or ignore_state was set.")
+
+
+class MyMatches(SearchResult):
+    profile_used: ProfileUsed
+    settings_url: SiteUrl = Field(None, description="Set when the profile has no NAICS codes: the match settings "
+                                  "page on matchawards.com where the user adds them. Show it as a markdown link.")
+
+
 class ShownResults(BaseModel):
     as_of: Text = Field(None, description="When the API generated the first row shown (ISO time).")
     results: list[OpportunityRow]

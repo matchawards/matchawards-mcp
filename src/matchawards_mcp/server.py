@@ -30,7 +30,7 @@ from mcp.server.caching import CacheHint
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, ToolAnnotations
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
@@ -50,13 +50,16 @@ INSTRUCTIONS = (
     "Put several NAICS codes in one search (naics='541511,541512'), not one call per code. A warning with a cursor "
     "means the scan stopped early: call again with that cursor before saying nothing exists."
 )
+# Added to INSTRUCTIONS only when my_matches exists (account linking on, MATCHAWARDS_AUTH_ISSUER).
+LINKED_INSTRUCTIONS = ("For the user's own matches (\"my matches\", contracts for my business): my_matches, which "
+                       "needs a linked MatchAwards account.")
 # Added to INSTRUCTIONS only when show_results exists (MATCHAWARDS_WIDGETS=1).
 CARD_INSTRUCTIONS = "To show the user a list, call show_results last with the ids you picked."
 # With the card on, the searches whose ids show_results takes say so in their description and in every non-empty
 # result's note: the model reads a result's note at the moment it decides what to show.
 SHOW_HINT = ("When you are done searching, call show_results once with the best ids; it shows them as a card the "
              "user can pick from.")
-SHOW_SOURCES = ("search_contracts", "search_grants")
+SHOW_SOURCES = ("search_contracts", "search_grants", "my_matches")
 
 # HTTP mode only: the usage ledger (None when disabled, and always in stdio mode) and the request being served.
 ledger: usage.Ledger | None = None
@@ -69,6 +72,9 @@ READ_ONLY = ToolAnnotations(
 # No account needed. Declared in _meta only: the SDK sends tools/list through the spec's Tool model, which drops
 # unknown top-level fields, so a top-level securitySchemes never reaches the wire.
 SECURITY_SCHEMES = [{"type": "noauth"}]
+# A linked tool (linking.LINKED_TOOLS) also takes an OAuth token with the scope: a host may call it either way, and
+# without a token it answers with the challenge that starts linking.
+LINKED_SECURITY_SCHEMES = [{"type": "noauth"}, {"type": "oauth2", "scopes": [linking.SCOPE]}]
 
 # The result card (MCP Apps): one self-contained HTML resource, no network, that hosts with UI support render from
 # show_results' structuredContent. The model calls show_results last, with the rows it picked, so a reply carries
@@ -133,7 +139,7 @@ def _with_show_hint(fn):
     @functools.wraps(fn)
     async def hinted(*args, **kwargs):
         result = await fn(*args, **kwargs)
-        if result.results:
+        if getattr(result, "results", None):  # not on a linked tool's challenge (a CallToolResult)
             result.note = f"{result.note} {SHOW_HINT}" if result.note else SHOW_HINT
         return result
 
@@ -160,7 +166,9 @@ def _tool(srv: MCPServer, fn, title: str):
         try:
             result = await fn(*args, **kwargs)
             # partial: a composite tool's budget or deadline cut it short (it still answers with what it has).
-            outcome = "partial" if getattr(result, "_partial", False) else "ok"
+            # link_required: a linked tool answered with the challenge (ChatGPT, or no check in this request).
+            outcome = ("link_required" if isinstance(result, CallToolResult) and result.is_error
+                       else "partial" if getattr(result, "_partial", False) else "ok")
             return result
         except ToolError as e:
             outcome = getattr(e, "outcome", "upstream_error")
@@ -176,7 +184,7 @@ def _tool(srv: MCPServer, fn, title: str):
     description = "\n\n".join(" ".join(p.split()) for p in inspect.cleandoc(fn.__doc__).split("\n\n"))
     if WIDGETS and fn.__name__ in SHOW_SOURCES:
         description += "\n\n" + SHOW_HINT
-    meta = {"securitySchemes": SECURITY_SCHEMES}
+    meta = {"securitySchemes": LINKED_SECURITY_SCHEMES if fn.__name__ in linking.LINKED_TOOLS else SECURITY_SCHEMES}
     if WIDGETS and fn.__name__ in CARD_TOOLS:
         meta["ui"] = {"resourceUri": CARD_URI}
     return srv.tool(title=title, annotations=READ_ONLY, meta=meta, description=description)(recorded)
@@ -191,14 +199,15 @@ async def protected_resource(request: Request) -> Response:
 
 
 def build_mcp() -> MCPServer:
-    """The server: the data tools, plus show_results and the card when WIDGETS is on, GET /healthz, and the
-    protected-resource metadata when linking is on (linking.enabled()).
+    """The server: the data tools, plus show_results and the card when WIDGETS is on, GET /healthz, and my_matches
+    and the protected-resource metadata when linking is on (linking.enabled()).
 
     The module builds it once as `mcp`; tests build another after changing WIDGETS."""
     srv = Server(
         name="matchawards",
         title="MatchAwards",
-        instructions=INSTRUCTIONS + (" " + CARD_INSTRUCTIONS if WIDGETS else ""),
+        instructions=INSTRUCTIONS + (" " + LINKED_INSTRUCTIONS if linking.enabled() else "")
+        + (" " + CARD_INSTRUCTIONS if WIDGETS else ""),
         website_url="https://matchawards.com",
         version=__version__,
         # The tool list is static: let clients cache it for a day, shared across users.
@@ -206,7 +215,8 @@ def build_mcp() -> MCPServer:
         # No server-initiated notifications, so do not serve subscriptions/listen.
         subscriptions=False,
     )
-    for fn, title in tools.TOOLS + ((tools.CARD_TOOL,) if WIDGETS else ()):
+    linked = (tools.LINKED_TOOL,) if linking.enabled() else ()
+    for fn, title in tools.TOOLS + linked + ((tools.CARD_TOOL,) if WIDGETS else ()):
         _tool(srv, fn, title)
     if WIDGETS:
         srv.resource(CARD_URI, name="matchawards-results", title="MatchAwards results", mime_type=CARD_MIME,
