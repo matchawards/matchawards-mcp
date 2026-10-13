@@ -146,6 +146,7 @@ How requests are handled, in order:
 - Only `POST /mcp` is served. `GET`, `DELETE` and `OPTIONS` get 405 (no SSE stream, no sessions, no CORS).
 - A POST needs `Content-Length` (411 without it), and bodies over 64 KB get 413.
 - Rate limit per client (per ChatGPT user from OpenAI's addresses), then the server-wide cap: 429 with `Retry-After`.
+- With account linking on, a `tools/call` of a tool that needs a linked account, without a usable token, gets 401 (403 when the token lacks the scope) with `WWW-Authenticate`; ChatGPT gets the same challenge as a tool result. Nothing else is checked.
 
 The client is the socket address, or the `X-Real-IP` header when the socket address is in `MATCHAWARDS_TRUSTED_PROXIES` (IPv6 is keyed per /64; all /64s inside one /48 also share `MATCHAWARDS_RATE_PER_PREFIX_MIN`). Run it behind a reverse proxy that sets `X-Real-IP`, and do not expose the port directly. The limits are kept in memory per process. A bad value in any of the variables below stops the server at startup. The log has one line per request (method, path, status, duration, a hashed client key), never headers or bodies.
 

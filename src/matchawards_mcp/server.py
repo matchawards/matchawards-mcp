@@ -1,7 +1,8 @@
 """MatchAwards MCP server: read-only search over the public matchawards.com API.
 
-No auth, no state. The tools live in tools.py, their output models in schemas.py and the API client in api.py;
-this module registers the tools and serves them: stdio by default, `--http` for stateless Streamable HTTP at /mcp.
+No state, and no auth unless account linking is on (linking.py, MATCHAWARDS_AUTH_ISSUER). The tools live in tools.py,
+their output models in schemas.py and the API client in api.py; this module registers the tools and serves them:
+stdio by default, `--http` for stateless Streamable HTTP at /mcp.
 """
 
 import argparse
@@ -411,9 +412,30 @@ def _host_name(host: str) -> str:
     return (name if sep and port.isdigit() else host).lower()
 
 
+async def read_body(receive, limit: int):
+    """(body, receive): the request body read up to `limit` bytes, and a receive that hands the app the same messages
+    again. Reading stops once past `limit`: the rest reaches the app straight from `receive` and the SDK's own cap
+    answers it, so about `limit` bytes (plus one chunk) are held here at most. A body cut at `limit` is returned cut."""
+    messages, body, more = [], bytearray(), True
+    while more and len(body) <= limit:
+        message = await receive()
+        messages.append(message)
+        if message["type"] != "http.request":
+            break
+        body.extend(message.get("body", b""))
+        more = message.get("more_body", False)
+    replay = iter(messages)
+
+    async def replaying_receive():
+        return next(replay, None) or await receive()
+
+    return bytes(body[:limit]), replaying_receive
+
+
 class HttpGuard:
     """Runs before the MCP layer, in this order: path (404), Host (421), method (405), body size (411/413),
-    rate limits (429). Writes one access line per request.
+    rate limits (429), then, with account linking on, the challenge to a call of a linked tool without a usable
+    token (401/403, see serve_mcp). Writes one access line per request.
 
     A rejection is counted in mcp_rejected_total{reason}. A request passed on to /mcp is counted by JSON-RPC method
     and User-Agent family (and initialize by client), counted in the distinct-caller gauges, added to the daily
@@ -482,11 +504,19 @@ class HttpGuard:
     async def serve_mcp(self, scope, receive, send, ip, key: str) -> None:
         """Pass a request on to /mcp, observing it for the usage stats on the way.
 
-        The first usage.OBSERVE_BYTES of the body are copied as they stream past (never buffered or replayed), and
-        only the JSON-RPC method and clientInfo are read from them, after the response is sent."""
+        The first usage.OBSERVE_BYTES of the body are copied as they stream past, and only the JSON-RPC method and
+        clientInfo are read from them, after the response is sent.
+
+        With account linking on, the body is read first instead (read_body: at most MAX_BODY_BYTES, then replayed to
+        the MCP layer), and a tools/call of a linked tool is checked (linking.check) and the outcome put in
+        linking.auth for the tool. No or a bad token gets a 401, a token without the scope a 403, unless the caller
+        is ChatGPT (openai-mcp): it links on a tool result, so its call goes on and the tool answers the challenge.
+        MatchAwards not answering the check is never a challenge: the call goes on and the tool reports it. The rate
+        limits already counted the request, so a challenge costs what a call does."""
         headers = dict(scope["headers"])
         subject = chatgpt_subject(scope) if ip in self.egress else b""  # as reject() decided it
-        ua = usage.clean(headers.get(b"user-agent", b"").decode("latin-1"), 200)
+        raw_ua = headers.get(b"user-agent", b"").decode("latin-1")
+        ua = usage.clean(raw_ua, 200)
         req = {"client": usage.truncate_key(key), "ua": ua, "family": usage.classify_ua(ua),
                "fp": usage.fingerprint(subject, self.usage_salt)}
         seen = bytearray()
@@ -499,9 +529,20 @@ class HttpGuard:
 
         token = _request.set(req)
         source_token = links.source.set(links.utm_source(req["family"]))  # utm_source on matchawards.com links
+        auth_token = linking.auth.set(None)
         try:
-            await self.app(scope, observing_receive, send)
+            app, app_receive = self.app, observing_receive
+            if linking.enabled():
+                body, app_receive = await read_body(receive, MAX_BODY_BYTES)
+                seen.extend(body[: usage.OBSERVE_BYTES])
+                if linking.linked_tool(body):
+                    outcome = await linking.check(scope)
+                    linking.auth.set(outcome)
+                    if outcome in (linking.INVALID, linking.INSUFFICIENT) and not linking.is_openai_host(raw_ua):
+                        app = linking.challenge_response(outcome)
+            await app(scope, app_receive, send)
         finally:
+            linking.auth.reset(auth_token)
             links.source.reset(source_token)
             _request.reset(token)
             method, name, version = usage.parse_body(bytes(seen))

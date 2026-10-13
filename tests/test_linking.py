@@ -1,14 +1,20 @@
 """Account linking: settings, the protected-resource metadata, the /me token check and its cache. No network."""
 
+import asyncio
+import inspect
 import json
 import logging
 from collections import OrderedDict
 from types import SimpleNamespace
+from typing import Annotated
 
 import httpx
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import CallToolResult
+from pydantic import BaseModel
 
-from matchawards_mcp import linking, server
+from matchawards_mcp import linking, server, usage
 from matchawards_mcp import api as ma_api
 from matchawards_mcp.server import RateLimiter
 
@@ -35,16 +41,18 @@ def profile(account_id="123", **kw):
 
 @pytest.fixture
 def me_api(monkeypatch):
-    """/me on a mock: me_api.reply(request) answers every call (a profile by default); me_api.requests logs them.
-    The profile cache starts empty."""
+    """/me on a mock: me_api.reply(request) answers every call (a profile by default; it may be async);
+    me_api.requests logs them. The profile cache starts empty."""
     me_api = SimpleNamespace(requests=[], reply=lambda req: httpx.Response(200, json=ME))
 
     async def handler(req):
         me_api.requests.append(req)
-        return me_api.reply(req)
+        reply = me_api.reply(req)
+        return await reply if inspect.isawaitable(reply) else reply
 
     monkeypatch.setattr(linking, "client", httpx.AsyncClient(
-        transport=httpx.MockTransport(handler), headers=dict(linking.client.headers), cookies=linking.client.cookies.jar,
+        transport=httpx.MockTransport(handler), headers=dict(linking.client.headers),
+        cookies=linking.client.cookies.jar,  # the same no-cookies policy
     ))
     monkeypatch.setattr(linking, "_cache", OrderedDict())
     return me_api
@@ -68,14 +76,16 @@ async def test_off_is_the_server_without_linking(me_api):
     golden = json.loads((ROOT / "tests" / "golden" / "linking_off.json").read_text())
     async with http() as hc:
         listed = await hc.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, headers=LEGACY)
-        init = await hc.post("/mcp", headers=LEGACY, json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        init = await hc.post("/mcp", headers=LEGACY, json={"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                                           "params": {
             "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}})
         for path in PATHS:
             for method in ("GET", "HEAD", "POST"):
                 r = await hc.request(method, path)
                 assert r.status_code == 404, (method, path)
         await hc.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
-            "name": "lookup_naics", "arguments": {"query": "roofing"}}}, headers={**LEGACY, "Authorization": f"Bearer {TOKEN}"})
+            "name": "lookup_naics", "arguments": {"query": "roofing"}}}, 
+            headers={**LEGACY, "Authorization": f"Bearer {TOKEN}"})
     assert listed.json()["result"] == golden["tools/list"]
     result = init.json()["result"]
     result["serverInfo"].pop("version")
@@ -297,3 +307,233 @@ def test_parse_profile_keeps_only_clean_fields(body, expected):
                                   {"account": {"id": " "}, "naics": []}, {"account": {"id": "1"}, "naics": "541512"}])
 def test_parse_profile_rejects_a_body_that_is_not_a_profile(body):
     assert linking.parse_profile(body) is None
+
+
+# --- The challenge (HTTP 401/403, and ChatGPT's tool result) ------------------------------------------------------
+
+CLAUDE_UA = "Claude-User/1.0"
+OPENAI_UA = "openai-mcp/1.0.0"
+LINK_TEXT = "Link your MatchAwards account to see contracts that match your profile."
+HEADER = ('Bearer realm="matchawards", '
+          'resource_metadata="https://matchawards.com/.well-known/oauth-protected-resource/mcp", '
+          'scope="profile:read", error="{error}", error_description="{description}"')
+
+
+class Seen(BaseModel):
+    account: str
+
+
+async def my_matches() -> Annotated[CallToolResult, Seen]:
+    """Test stand-in for a linked tool: the account it was called for."""
+    got = linking.auth.get()
+    await asyncio.sleep(0.01)  # concurrent calls interleave here
+    if isinstance(got, linking.Profile):
+        assert linking.auth.get() is got
+        return Seen(account=got.account_id)
+    if got == linking.UNAVAILABLE:
+        raise ToolError("MatchAwards is busy right now. Retry in a minute.")
+    return linking.challenge_result(got or linking.INVALID, LINK_TEXT)
+
+
+@pytest.fixture
+def with_tool(linked, monkeypatch):
+    """Linking on, and the server has a linked tool (my_matches, the stand-in above)."""
+    srv = server.build_mcp()
+    server._tool(srv, my_matches, "My matches")
+    monkeypatch.setattr(server, "mcp", srv)
+
+
+def call(hc, name="my_matches", ua=CLAUDE_UA, token=None, ip=None, arguments=None):
+    headers = {**LEGACY, "User-Agent": ua, **({"Authorization": f"Bearer {token}"} if token else {}),
+               **({"X-Real-IP": ip} if ip else {})}
+    return hc.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                                  "params": {"name": name, "arguments": arguments or {}}})
+
+
+def header(error):
+    return HEADER.format(error=error, description=linking.DESCRIPTIONS[error])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("token, reply, status, error", [
+    (None, None, 401, "invalid_token"),
+    ("not a token", None, 401, "invalid_token"),
+    (TOKEN, lambda req: httpx.Response(401), 401, "invalid_token"),
+    (TOKEN, lambda req: httpx.Response(403, json={"error": "insufficient_scope"}), 403, "insufficient_scope"),
+])
+async def test_a_client_without_a_usable_token_gets_the_http_challenge(with_tool, me_api, token, reply, status, error):
+    me_api.reply = reply
+    async with http() as hc:
+        r = await call(hc, token=token)
+    assert r.status_code == status
+    assert r.headers["www-authenticate"] == header(error)
+    assert r.headers["cache-control"] == "no-store"
+    assert r.json() == {"error": error, "error_description": linking.DESCRIPTIONS[error]}
+    assert len(me_api.requests) == (1 if reply else 0)  # no well-formed token: nothing to ask
+
+
+@pytest.mark.anyio
+async def test_a_valid_token_reaches_the_tool_with_its_profile(with_tool, me_api):
+    async with http() as hc:
+        for ua in (CLAUDE_UA, OPENAI_UA):
+            r = await call(hc, token=TOKEN, ua=ua)
+            assert r.status_code == 200 and "www-authenticate" not in r.headers
+            result = r.json()["result"]
+            assert not result.get("isError") and result["structuredContent"] == {"account": "123"}
+    assert len(me_api.requests) == 1  # the second call used the cache
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("ua", [OPENAI_UA, "OpenAI-MCP/2.0 (test)"])
+@pytest.mark.parametrize("token, reply, error", [
+    (None, None, "invalid_token"),
+    (TOKEN, lambda req: httpx.Response(401), "invalid_token"),
+    (TOKEN, lambda req: httpx.Response(403), "insufficient_scope"),
+])
+async def test_chatgpt_gets_the_challenge_as_a_tool_result(with_tool, me_api, ua, token, reply, error):
+    me_api.reply = reply
+    async with http() as hc:
+        r = await call(hc, ua=ua, token=token)
+    assert r.status_code == 200 and "www-authenticate" not in r.headers
+    result = r.json()["result"]
+    assert result["isError"] is True
+    assert result["content"] == [{"type": "text", "text": LINK_TEXT}]
+    assert result["_meta"] == {"mcp/www_authenticate": [header(error)]}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("ua", [CLAUDE_UA, OPENAI_UA])
+@pytest.mark.parametrize("reply", [lambda req: httpx.Response(502), _raise(httpx.ReadTimeout("slow")),
+                                   lambda req: httpx.Response(200, text="junk")])
+async def test_matchawards_not_answering_the_check_is_never_a_challenge(with_tool, me_api, ua, reply):
+    me_api.reply = reply
+    async with http() as hc:
+        r = await call(hc, ua=ua, token=TOKEN)
+    assert r.status_code == 200 and "www-authenticate" not in r.headers
+    result = r.json()["result"]
+    assert result["isError"] is True and "_meta" not in result
+    assert "busy" in result["content"][0]["text"]
+
+
+@pytest.mark.anyio
+async def test_other_requests_are_never_checked_or_challenged(with_tool, me_api, api, monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "100")
+    monkeypatch.setenv("MATCHAWARDS_RATE_PER_MIN", "100")
+    me_api.reply = lambda req: pytest.fail("/me called")
+    async with http() as hc:
+        for token in (None, TOKEN, "not a token"):
+            auth = {"Authorization": f"Bearer {token}"} if token else {}
+            init = await hc.post("/mcp", headers={**LEGACY, **auth}, json={
+                "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                    "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}})
+            listed = await hc.post("/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                                   headers={**LEGACY, **auth})
+            ping = await hc.post("/mcp", json={"jsonrpc": "2.0", "id": 3, "method": "ping"}, headers={**LEGACY, **auth})
+            searched = await call(hc, "search_contracts", token=token, arguments={"limit": 1})
+            unknown = await call(hc, "no_such_tool", token=token)
+            for r in (init, listed, ping, searched, unknown):
+                assert r.status_code == 200 and "www-authenticate" not in r.headers
+            assert not searched.json()["result"].get("isError")
+    assert me_api.requests == []
+
+
+@pytest.mark.anyio
+async def test_the_linked_tool_keeps_its_output_schema(with_tool):
+    async with http() as hc:
+        r = await hc.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, headers=LEGACY)
+    [tool] = [t for t in r.json()["result"]["tools"] if t["name"] == "my_matches"]
+    assert tool["outputSchema"]["properties"] == {"account": {"title": "Account", "type": "string"}}
+
+
+@pytest.mark.anyio
+async def test_a_challenge_is_rate_limited_like_a_call(with_tool, me_api, monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "3")
+    usage.metrics.counts.clear()
+    async with http() as hc:
+        codes = [(await call(hc, ip="198.51.100.9")).status_code for _ in range(4)]
+    assert codes == [401, 401, 401, 429]
+    assert usage.metrics.counts[("mcp_requests_total", (("method", "tools/call"),))] == 3
+
+
+@pytest.mark.anyio
+async def test_off_a_linked_tool_name_is_never_checked(me_api, monkeypatch):
+    """With linking off, a tool by that name (there is none in 1.x off) is called like any other: no body read
+    first, no check, no challenge, and the tool sees no outcome."""
+    srv = server.build_mcp()
+    server._tool(srv, my_matches, "My matches")
+    monkeypatch.setattr(server, "mcp", srv)
+    async with http() as hc:
+        r = await call(hc, token=TOKEN)
+    assert r.status_code == 200 and r.json()["result"]["isError"] is True
+    assert me_api.requests == []
+
+
+@pytest.mark.anyio
+async def test_concurrent_calls_with_different_tokens_never_share_a_profile(with_tool, me_api, monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "100")
+    monkeypatch.setenv("MATCHAWARDS_RATE_PER_MIN", "100")
+
+    async def reply(req):
+        token = req.headers["authorization"].removeprefix("Bearer ")
+        await asyncio.sleep(0.02 if token.endswith("1") else 0.001)  # the answers come back out of order
+        return httpx.Response(200, json={**ME, "account": {"id": f"acct-{token}"}})
+
+    me_api.reply = reply
+    tokens = [f"tok{i % 4}" for i in range(24)]
+    async with http() as hc:
+        responses = await asyncio.gather(*(call(hc, token=t) for t in tokens))
+    for t, r in zip(tokens, responses):
+        assert r.json()["result"]["structuredContent"] == {"account": f"acct-{t}"}, t
+    assert len(me_api.requests) >= 4
+
+
+@pytest.mark.anyio
+async def test_the_token_never_reaches_a_log_or_a_response(with_tool, me_api, caplog):
+    caplog.set_level(logging.DEBUG)
+    seen = []
+    async with http() as hc:
+        for ua in (CLAUDE_UA, OPENAI_UA):
+            for reply in (lambda req: httpx.Response(401), lambda req: httpx.Response(403),
+                          lambda req: httpx.Response(500), lambda req: httpx.Response(200, json=ME)):
+                me_api.reply = reply
+                linking._cache.clear()
+                r = await call(hc, ua=ua, token=TOKEN)
+                seen.append(r.text + json.dumps(dict(r.headers)))
+            seen.append((await call(hc, ua=ua)).text)
+    text = "\n".join([r.getMessage() for r in caplog.records] + [str(r.args) for r in caplog.records] + seen)
+    assert "POST /mcp 401" in text  # the access log was captured
+    assert TOKEN not in text and TOKEN[:8] not in text
+    for key in linking._cache:  # nor its keyed hash
+        assert key.hex() not in text
+
+
+@pytest.mark.anyio
+async def test_read_body_replays_what_it_read_then_hands_over():
+    messages = [{"type": "http.request", "body": b"ab", "more_body": True},
+                {"type": "http.request", "body": b"cd", "more_body": False},
+                {"type": "http.disconnect"}]
+    it = iter(messages)
+
+    async def receive():
+        return next(it)
+
+    body, replay = await server.read_body(receive, 10)
+    assert body == b"abcd"
+    assert [await replay() for _ in range(3)] == messages
+
+    it = iter([{"type": "http.request", "body": b"x" * 6, "more_body": True},
+               {"type": "http.request", "body": b"y" * 6, "more_body": True},
+               {"type": "http.request", "body": b"z", "more_body": False}])
+    body, replay = await server.read_body(receive, 10)
+    assert body == b"x" * 6 + b"y" * 4  # stopped past the cap: the rest is left for the app
+    assert [(await replay())["body"] for _ in range(3)] == [b"x" * 6, b"y" * 6, b"z"]
+
+
+@pytest.mark.anyio
+async def test_body_limits_hold_with_linking_on(with_tool):
+    async with http() as hc:
+        big = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": "my_matches", "arguments": {}, "pad": "x" * (64 * 1024)}}
+        assert (await hc.post("/mcp", json=big, headers=LEGACY)).status_code == 413
+        padded = {**big, "params": {**big["params"], "pad": "x" * (60 * 1024)}}
+        assert (await hc.post("/mcp", json=padded, headers={**LEGACY, "User-Agent": CLAUDE_UA})).status_code == 401

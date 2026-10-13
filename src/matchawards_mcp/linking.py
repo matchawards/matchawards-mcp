@@ -7,10 +7,18 @@ with it, and keeps a good answer in memory for CACHE_TTL_S under a keyed hash of
 process, so the hash means nothing outside it). The token, the Authorization header and that hash are never logged,
 stored or echoed.
 
+Only a tools/call of a LINKED_TOOLS tool is checked; everything else (initialize, tools/list, the other tools) never
+is. A host links on one of two challenge shapes, both naming the same metadata: an HTTP 401 (403 for a missing
+scope) with WWW-Authenticate for Claude and other MCP clients (server.HttpGuard sends it before the MCP layer), and
+for ChatGPT, which reads a 401 as a failed call, a tool result with isError and _meta["mcp/www_authenticate"]
+(challenge_result, returned by the tool itself).
+
 Off, nothing here runs: no metadata route, no body read, no /me call, and the tool list is the one without linking.
 """
 
+import contextvars
 import hashlib
+import json
 import logging
 import os
 import re
@@ -22,6 +30,8 @@ from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from mcp.types import CallToolResult, TextContent
+from starlette.responses import JSONResponse
 
 from . import api
 
@@ -44,6 +54,13 @@ UNAVAILABLE = "unavailable"
 Refusal = Literal["invalid_token", "insufficient_scope", "unavailable"]
 
 log = logging.getLogger("matchawards_mcp.linking")
+
+# The tools that need a linked account. A tools/call of one is checked (and challenged) before the MCP layer.
+LINKED_TOOLS = frozenset({"my_matches"})
+DESCRIPTIONS = {
+    INVALID: "This tool needs a linked MatchAwards account.",
+    INSUFFICIENT: f"The linked MatchAwards account has not granted {SCOPE}.",
+}
 
 # Its own client: same User-Agent and timeout as api.client, but it keeps no cookies, so nothing one user's /me
 # answer sets can ride along on another user's request. Tests swap it for one on a MockTransport.
@@ -130,6 +147,23 @@ def bearer(scope) -> str | None:
     return token
 
 
+def is_openai_host(user_agent: str | None) -> bool:
+    """ChatGPT and Codex (User-Agent openai-mcp/...): they link on the tool-result challenge, not on a 401."""
+    return (user_agent or "").lower().startswith("openai-mcp")
+
+
+def linked_tool(body: bytes) -> str | None:
+    """The tool name when a JSON-RPC body is a tools/call of a LINKED_TOOLS tool, else None (any other method or
+    tool, a batch, or a body that is not JSON)."""
+    try:
+        msg = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    params = msg.get("params") if isinstance(msg, dict) and msg.get("method") == "tools/call" else None
+    name = params.get("name") if isinstance(params, dict) else None
+    return name if isinstance(name, str) and name in LINKED_TOOLS else None
+
+
 def _quote(value: str) -> str:
     """An auth-param value as an RFC 9110 quoted-string: backslash and double quote escaped."""
     return value.replace("\\", "\\\\").replace('"', '\\"')
@@ -140,6 +174,29 @@ def challenge_header(error: str, description: str) -> str:
     metadata and the scope a host links for; it never carries anything from the request."""
     return (f'Bearer realm="matchawards", resource_metadata="{_quote(metadata_url())}", scope="{_quote(SCOPE)}", '
             f'error="{_quote(error)}", error_description="{_quote(description)}"')
+
+
+def challenge_response(error: str) -> JSONResponse:
+    """The HTTP challenge: 401 for no or a bad token (INVALID), 403 for a token without SCOPE (INSUFFICIENT)."""
+    return JSONResponse(
+        {"error": error, "error_description": DESCRIPTIONS[error]},
+        status_code=403 if error == INSUFFICIENT else 401,
+        headers={"WWW-Authenticate": challenge_header(error, DESCRIPTIONS[error]), "Cache-Control": "no-store"},
+    )
+
+
+def challenge_result(error: str, text: str) -> CallToolResult:
+    """The challenge as a tool result, for ChatGPT: isError, `text` for the model (say what linking gives the
+    user), and the WWW-Authenticate value in _meta["mcp/www_authenticate"].
+
+    A linked tool returns it when auth.get() is INVALID or INSUFFICIENT. To keep its outputSchema, the tool's return
+    annotation is Annotated[CallToolResult, <its output model>]: the SDK takes the schema from the model, validates a
+    returned model as before, and passes an error result through unvalidated."""
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        is_error=True,
+        _meta={"mcp/www_authenticate": [challenge_header(error, DESCRIPTIONS[error])]},
+    )
 
 
 # --- The token check ------------------------------------------------------------------------------------------
@@ -169,7 +226,8 @@ def parse_profile(data) -> Profile | None:
         account_id = str(account_id)
     if not isinstance(account_id, str) or not account_id.strip() or not isinstance(data.get("naics"), list):
         return None
-    naics = dict.fromkeys(c.strip() for c in data["naics"] if isinstance(c, str) and re.fullmatch(r"\d{2,6}", c.strip()))
+    codes = (c.strip() for c in data["naics"] if isinstance(c, str))
+    naics = dict.fromkeys(c for c in codes if re.fullmatch(r"\d{2,6}", c))
     state = _text(data.get("state"), r"[A-Za-z]{2}")
     org, username = data.get("organization"), data["account"].get("username")
     return Profile(
@@ -181,6 +239,18 @@ def parse_profile(data) -> Profile | None:
         state=state.upper() if state else None,
         uei=_text(data.get("uei"), r"[A-Za-z0-9]{12}"),
     )
+
+
+# The check of the request being served: a Profile, a Refusal, or None when it was not checked (stdio, linking off,
+# or not a call of a LINKED_TOOLS tool). server.HttpGuard sets it per request, so concurrent requests never see each
+# other's; a linked tool reads it.
+auth: contextvars.ContextVar[Profile | Refusal | None] = contextvars.ContextVar("matchawards_auth", default=None)
+
+
+async def check(scope) -> Profile | Refusal:
+    """The check of an ASGI request: INVALID without a well-formed bearer token (no call made), else me(token)."""
+    token = bearer(scope)
+    return INVALID if token is None else await me(token)
 
 
 async def me(token: str) -> Profile | Refusal:
