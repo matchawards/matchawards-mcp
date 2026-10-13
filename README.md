@@ -26,6 +26,10 @@ Award records may be incomplete (federal awards especially), so every award resu
 
 Every tool is read-only and needs no account: each declares `readOnlyHint`, `idempotentHint`, a title and `securitySchemes: [{"type": "noauth"}]` (in `_meta`). Results are structured: each tool publishes an `outputSchema` and returns `structuredContent`, with the same JSON as text for clients that read only text. Every result carries a `url` on matchawards.com (and a `sam_url` for federal notices), and the server asks the model to show them as markdown links. Links to matchawards.com carry `utm_source`, `utm_medium` and `utm_campaign` parameters naming the AI host the request came from (for example `utm_source=chatgpt`); links to other sites are left unchanged.
 
+### Changes in 1.0.3
+
+- Hosted server: usage-stat rows are kept 180 days by default (was 365), set by `MATCHAWARDS_USAGE_RETENTION_DAYS`.
+
 ### Changes in 1.0.2
 
 - Cards come from a new tool, `show_results`, which the model calls once with the ids it picked; the search tools return data only. The card (`results-v2.html`) expands a row in place and has an "Ask about this" button.
