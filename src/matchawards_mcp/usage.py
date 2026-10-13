@@ -25,7 +25,18 @@ from pathlib import Path
 log = logging.getLogger("matchawards_mcp.usage")
 
 DEFAULT_DB = "/data/usage.db"
-RETENTION_DAYS = 365
+
+
+def retention_days(raw: str | None) -> int:
+    """Days ledger rows are kept: MATCHAWARDS_USAGE_RETENTION_DAYS, default 180. A bad value stops the server at
+    startup with a clear message."""
+    raw = "180" if raw is None else raw
+    if not raw.strip().isdigit() or int(raw) < 1:
+        raise SystemExit(f"MATCHAWARDS_USAGE_RETENTION_DAYS must be a whole number >= 1, got {raw!r}")
+    return int(raw)
+
+
+RETENTION_DAYS = retention_days(os.environ.get("MATCHAWARDS_USAGE_RETENTION_DAYS"))
 MAX_BUCKETS_PER_CLIENT_DAY = 50
 OBSERVE_BYTES = 8192  # an initialize body is well under 2 KiB
 OTHER = "_other"

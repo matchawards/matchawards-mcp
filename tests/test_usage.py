@@ -502,3 +502,11 @@ def test_stats_command_on_an_empty_or_missing_db(usage_db, capsys):
     assert "last 7 day(s)" in out and "(none)" in out and "fingerprints): 0" in out
     with pytest.raises(SystemExit, match="no usage database"):
         server.main(["stats", "--db", str(usage_db.parent / "nope.db")])
+
+
+def test_retention_days_defaults_to_180_and_rejects_bad_values():
+    assert usage.retention_days(None) == 180
+    assert usage.retention_days("30") == 30
+    for bad in ("0", "-1", "x", ""):
+        with pytest.raises(SystemExit, match="MATCHAWARDS_USAGE_RETENTION_DAYS"):
+            usage.retention_days(bad)
