@@ -7,9 +7,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   DEFAULT_ENDPOINT,
+  ENDPOINT_SETTING,
   McpError,
   TIMEOUT_MS,
   callTool,
+  classifyToolError,
   packageVersion,
   resolveEndpoint,
   userAgent,
@@ -108,6 +110,49 @@ describe("the request", () => {
   });
 });
 
+describe("the endpoint setting", () => {
+  it("accepts https on matchawards.com and its subdomains, and http(s) on the loopback hosts", () => {
+    for (const endpoint of [
+      "https://matchawards.com/mcp",
+      "https://staging.matchawards.com/mcp",
+      "https://WWW.MatchAwards.com:443/mcp",
+      "http://localhost:8765/mcp",
+      "https://localhost/mcp",
+      "http://127.0.0.1:8765/mcp",
+      "http://[::1]:8765/mcp",
+    ]) {
+      expect(resolveEndpoint({ endpoint })).toBe(endpoint);
+    }
+  });
+
+  it("refuses any other URL, naming the setting, before anything is sent", async () => {
+    for (const endpoint of [
+      "http://matchawards.com/mcp", // https only off the loopback hosts
+      "https://evil.example/mcp",
+      "https://matchawards.com.evil.example/mcp",
+      "https://evilmatchawards.com/mcp",
+      "https://user:pass@matchawards.com/mcp", // userinfo
+      "https://evil.example@matchawards.com/mcp",
+      "https://matchawards.com@evil.example/mcp",
+      "https://evil.example\\@matchawards.com/mcp", // backslash
+      "https://matchawards.com\\.evil.example/mcp",
+      "http://10.0.0.5:8765/mcp", // a private address is not a loopback host
+      "http://192.168.1.10/mcp",
+      "http://127.0.0.2/mcp",
+      "https://matchawards%2Ecom/mcp",
+      "ftp://matchawards.com/mcp",
+      "matchawards.com/mcp",
+      "https://match awards.com/mcp",
+    ]) {
+      const error = await failureOf(callTool({ endpoint }, "search_contracts", {}));
+      expect(error.message).toContain(ENDPOINT_SETTING);
+      expect(error.retryable).toBe(false);
+      expect(error.message).not.toContain(endpoint);
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("a successful result", () => {
   it("relays the text content and puts structuredContent in details", async () => {
     const structured = { results: [{ id: "1", url: "https://matchawards.com/x/posts/1" }], has_more: false };
@@ -131,17 +176,34 @@ describe("a successful result", () => {
     expect(result.details).toEqual(structured);
   });
 
-  it("reads a result sent as an event stream", async () => {
-    const structured = { results: [] };
-    const message = { jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "{}" }], structuredContent: structured } };
+  it("picks the stream event that answers this request, skipping notifications and other ids", async () => {
+    const mine = { results: ["mine"] };
+    fetchMock.mockImplementation(async (_url: string, init: RequestInit) => {
+      const { id } = JSON.parse(init.body as string) as { id: number };
+      const events = [
+        { jsonrpc: "2.0", method: "notifications/progress", params: { progress: 1 } },
+        { jsonrpc: "2.0", id: id + 1000, result: { content: [], structuredContent: { results: ["other"] } } },
+        { jsonrpc: "2.0", id, result: { content: [], structuredContent: mine } },
+        { jsonrpc: "2.0", method: "notifications/message", params: {} },
+      ];
+      const body = ["event: message\ndata: not json", ...events.map((e) => `event: message\ndata: ${JSON.stringify(e)}`)]
+        .join("\n\n");
+      return new Response(`${body}\n\n`, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    });
+    const result = await callTool({}, "search_awards", {});
+    expect(result.details).toEqual(mine);
+  });
+
+  it("fails when no stream event answers this request", async () => {
+    const other = { jsonrpc: "2.0", id: -1, result: { content: [], structuredContent: {} } };
     fetchMock.mockResolvedValue(
-      new Response(`event: message\ndata: ${JSON.stringify(message)}\n\n`, {
+      new Response(`data: ${JSON.stringify(other)}\n\n`, {
         status: 200,
         headers: { "Content-Type": "text/event-stream" },
       }),
     );
-    const result = await callTool({}, "search_awards", {});
-    expect(result.details).toEqual(structured);
+    const error = await failureOf(callTool({}, "search_awards", {}));
+    expect(error.message).toContain("unreadable");
   });
 });
 
@@ -181,6 +243,58 @@ describe("failures throw with the server's words", () => {
     const error = await failureOf(callTool({}, "get_company", { uei: "ABCDEFGHIJKL" }));
     expect(error.message).toBe(text);
     expect(error.retryable).toBe(false);
+  });
+
+  it("marks the server's transient isError results retryable, with the wait they name", async () => {
+    const cases: [string, number | null][] = [
+      [
+        "Error executing tool search_contracts: MatchAwards rate limit reached (per IP: 60 requests per minute, 20 per 5 seconds). Wait 17 seconds, then retry.",
+        17,
+      ],
+      ["Error executing tool search_awards: MatchAwards is busy right now. Retry in 4 seconds.", 4],
+      [
+        "Error executing tool search_awards: MatchAwards took too long on this request. Retry in 60 seconds; if it happens again, narrow the search (fewer NAICS codes, a shorter time window).",
+        60,
+      ],
+      [
+        "Error executing tool search_jobs: MatchAwards did not answer within 10 seconds. Retry once; if it fails again, narrow the search (fewer NAICS codes, a shorter posted_within_days) or try later.",
+        null,
+      ],
+      ["Error executing tool assess_opportunity: MatchAwards did not answer within this tool's time limit.", null],
+      [
+        "Error executing tool assess_opportunity: MatchAwards did not return the opportunity within 6 seconds. Retry in a minute.",
+        60,
+      ],
+      ["Error executing tool search_grants: Grant search is temporarily unavailable on MatchAwards. Try again later; contracts and jobs still work.", null],
+      ["Error executing tool get_company: MatchAwards server error (HTTP 502). It is temporary; retry in a minute.", 60],
+      [
+        "Error executing tool search_contracts: Could not reach MatchAwards at https://matchawards.com/api/public/v1 (ConnectError). Check the network and retry later.",
+        null,
+      ],
+      [
+        "Error executing tool search_contracts: MatchAwards returned an unexpected response (HTTP 200, not a JSON object). Retry later.",
+        null,
+      ],
+    ];
+    for (const [text, retryAfter] of cases) {
+      fetchMock.mockResolvedValueOnce(rpcResult({ content: [{ type: "text", text }], isError: true }));
+      const error = await failureOf(callTool({}, "search_contracts", {}));
+      expect(error.message).toBe(text);
+      expect(error.retryable, text).toBe(true);
+      expect(error.retryAfter, text).toBe(retryAfter);
+    }
+  });
+
+  it("keeps input errors and unknown failures non-retryable", () => {
+    for (const text of [
+      "Error executing tool get_company: 1 validation error for get_companyArguments",
+      "Error executing tool search_awards: MatchAwards rejected the parameter 'agency': the query took too long to parse. Fix it and call again.",
+      "Error executing tool get_opportunity: Not found on MatchAwards (not_found). Use an id from a search result.",
+      "Unknown tool: nope",
+      "Something else went wrong.",
+    ]) {
+      expect(classifyToolError(text), text).toEqual({ retryable: false, retryAfter: null });
+    }
   });
 
   it("marks a 5xx retryable", async () => {

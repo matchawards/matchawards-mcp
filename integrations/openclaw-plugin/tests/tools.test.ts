@@ -118,21 +118,21 @@ describe("the gateway seam", () => {
   });
 
   it("overrides the endpoint from getRuntimeConfig, runtimeConfig or config", async () => {
-    expect(await urlVia({ getRuntimeConfig: () => configWith("http://a.invalid/mcp") })).toBe("http://a.invalid/mcp");
-    expect(await urlVia({ runtimeConfig: configWith("http://b.invalid/mcp") })).toBe("http://b.invalid/mcp");
-    expect(await urlVia({ config: configWith("http://c.invalid/mcp") })).toBe("http://c.invalid/mcp");
+    expect(await urlVia({ getRuntimeConfig: () => configWith("https://a.matchawards.com/mcp") })).toBe("https://a.matchawards.com/mcp");
+    expect(await urlVia({ runtimeConfig: configWith("https://b.matchawards.com/mcp") })).toBe("https://b.matchawards.com/mcp");
+    expect(await urlVia({ config: configWith("https://c.matchawards.com/mcp") })).toBe("https://c.matchawards.com/mcp");
   });
 
   it("prefers the freshest source and falls through one without this plugin's entry", async () => {
     expect(
       await urlVia({
-        getRuntimeConfig: () => configWith("http://fresh.invalid/mcp"),
-        runtimeConfig: configWith("http://stale.invalid/mcp"),
+        getRuntimeConfig: () => configWith("https://fresh.matchawards.com/mcp"),
+        runtimeConfig: configWith("https://stale.matchawards.com/mcp"),
       }),
-    ).toBe("http://fresh.invalid/mcp");
+    ).toBe("https://fresh.matchawards.com/mcp");
     const foreign = { plugins: { entries: { "some-other-plugin": { config: {} } } } };
-    expect(await urlVia({ getRuntimeConfig: () => foreign, config: configWith("http://c.invalid/mcp") })).toBe(
-      "http://c.invalid/mcp",
+    expect(await urlVia({ getRuntimeConfig: () => foreign, config: configWith("https://c.matchawards.com/mcp") })).toBe(
+      "https://c.matchawards.com/mcp",
     );
   });
 
@@ -155,5 +155,13 @@ describe("the gateway seam", () => {
     expect(entry.id).toBe(MANIFEST.id);
     expect(entry.name).toBe(MANIFEST.name);
     expect(entry.description).toBe(MANIFEST.description);
+  });
+});
+
+describe("a refused endpoint", () => {
+  it("fails the call with an error naming the setting and sends nothing", async () => {
+    const tool = toolFactory({ config: configWith("https://user@evil.example/mcp") } as never)[0]!;
+    await expect(tool.execute("call", {})).rejects.toThrow("plugins.entries.matchawards.config.endpoint");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

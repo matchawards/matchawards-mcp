@@ -66,32 +66,117 @@ export function userAgent(): string {
   return `matchawards-openclaw-plugin/${packageVersion()}`;
 }
 
-/** The configured endpoint, or the hosted server when none is set. */
+/** The setting `resolveEndpoint` checks, named in its error. */
+export const ENDPOINT_SETTING = "plugins.entries.matchawards.config.endpoint";
+
+const SITE_DOMAIN = "matchawards.com";
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/**
+ * The URL's authority exactly as written, checked before WHATWG parsing can
+ * normalize it: plain host characters and an optional port only, so userinfo
+ * (`user@host`), backslashes, percent-escapes and the like are refused rather
+ * than reinterpreted.
+ */
+function plainAuthority(raw: string): string | null {
+  const match = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/([^/?#]*)/.exec(raw);
+  const authority = match?.[1];
+  if (authority === undefined) return null;
+  return /^([A-Za-z0-9.-]+|\[::1\])(:\d{1,5})?$/.test(authority) ? authority : null;
+}
+
+/**
+ * The endpoint the tools call: the hosted server when none is set; otherwise
+ * an https URL on matchawards.com or one of its subdomains, or http(s) on
+ * localhost, 127.0.0.1 or [::1] for local development. Anything else is
+ * refused, so a mistyped or hostile config cannot send the agent's queries to
+ * another host.
+ */
 export function resolveEndpoint(settings: PluginSettings = {}): string {
   const configured = typeof settings.endpoint === "string" ? settings.endpoint.trim() : "";
-  return configured === "" ? DEFAULT_ENDPOINT : configured;
+  if (configured === "") return DEFAULT_ENDPOINT;
+  const refuse = (): McpError =>
+    new McpError(
+      `The ${ENDPOINT_SETTING} setting must be an https URL on matchawards.com (or a subdomain), or an http(s) ` +
+        "URL on localhost, 127.0.0.1 or [::1] for local development. Fix or remove the setting.",
+      null,
+      false,
+    );
+  if (/[\\\s]/.test(configured) || plainAuthority(configured) === null) throw refuse();
+  let url: URL;
+  try {
+    url = new URL(configured);
+  } catch {
+    throw refuse();
+  }
+  const host = url.hostname.toLowerCase();
+  if (url.username !== "" || url.password !== "") throw refuse();
+  const site = url.protocol === "https:" && (host === SITE_DOMAIN || host.endsWith(`.${SITE_DOMAIN}`));
+  const local = (url.protocol === "https:" || url.protocol === "http:") && LOCAL_HOSTS.has(host);
+  if (!site && !local) throw refuse();
+  return configured;
 }
 
 let nextId = 0;
 
-/** A JSON-RPC message from a JSON body, or from the `data:` lines of an event stream. */
-function parseMessage(text: string, contentType: string): unknown {
-  if (contentType.includes("text/event-stream")) {
-    const messages = text
-      .split(/\r?\n\r?\n/)
-      .map((event) =>
-        event
-          .split(/\r?\n/)
-          .filter((line) => line.startsWith("data:"))
-          .map((line) => line.slice(5).trimStart())
-          .join("\n"),
-      )
-      .filter((data) => data !== "");
-    const last = messages.at(-1);
-    if (last === undefined) throw new SyntaxError("empty event stream");
-    return JSON.parse(last);
+/**
+ * The JSON-RPC message from a JSON body or, for an event stream, the `data:`
+ * event that answers request `id` (notifications and other ids are skipped).
+ */
+function parseMessage(text: string, contentType: string, id: number): unknown {
+  if (!contentType.includes("text/event-stream")) return JSON.parse(text);
+  for (const event of text.split(/\r?\n\r?\n/)) {
+    const data = event
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n");
+    if (data === "") continue;
+    let message: unknown;
+    try {
+      message = JSON.parse(data);
+    } catch {
+      continue;
+    }
+    if (typeof message === "object" && message !== null && (message as { id?: unknown }).id === id) {
+      return message;
+    }
   }
-  return JSON.parse(text);
+  throw new SyntaxError("no event in the stream answers this request");
+}
+
+/**
+ * The server's own wording for failures that may pass on their own: rate
+ * limits, its busy guard, timeouts, upstream 5xx and unreadable upstream
+ * replies. It reports these as `isError` results, not HTTP errors.
+ */
+const RETRYABLE_TEXT: RegExp[] = [
+  /rate limit reached/i,
+  /\bis busy right now\b/i,
+  /\btook too long\b/i,
+  /\bdid not (answer|return the opportunity) within\b/i,
+  /\btemporarily unavailable\b/i,
+  /\bserver error \(HTTP \d{3}\)/i,
+  /\bcould not reach MatchAwards\b/i,
+  /\bunexpected (API )?response\b.*\bretry later\b/i,
+];
+
+/** The prefix the MCP SDK puts on every error a tool raises. */
+const TOOL_ERROR_PREFIX = /^Error executing tool [A-Za-z0-9_]+: /;
+
+/** Rejections of the caller's input: never retryable, whatever upstream text they quote. */
+const INPUT_ERROR_TEXT = /^(MatchAwards rejected |Not found on MatchAwards)/;
+
+/** Whether an `isError` text is worth retrying, and the wait it names, in seconds. */
+export function classifyToolError(raw: string): { retryable: boolean; retryAfter: number | null } {
+  const text = raw.replace(TOOL_ERROR_PREFIX, "");
+  if (INPUT_ERROR_TEXT.test(text) || !RETRYABLE_TEXT.some((pattern) => pattern.test(text))) {
+    return { retryable: false, retryAfter: null };
+  }
+  const seconds = /\b(?:wait|retry in) (\d+) seconds?\b/i.exec(text);
+  if (seconds?.[1] !== undefined) return { retryable: true, retryAfter: Number(seconds[1]) };
+  if (/\bretry in a minute\b/i.test(text)) return { retryable: true, retryAfter: 60 };
+  return { retryable: true, retryAfter: null };
 }
 
 function retryAfterSeconds(response: Response): number | null {
@@ -130,6 +215,7 @@ export async function callTool(
   args: Record<string, unknown> = {},
   signal?: AbortSignal,
 ): Promise<ToolResult> {
+  const endpoint = resolveEndpoint(settings);
   // A timer rather than AbortSignal.timeout(), so it is cleared as soon as the body is read.
   const timeout = new AbortController();
   const timer = setTimeout(() => timeout.abort(new DOMException("timed out", "TimeoutError")), TIMEOUT_MS);
@@ -138,10 +224,11 @@ export async function callTool(
     new McpError(`MatchAwards did not answer within ${TIMEOUT_MS / 1000} seconds; retry later.`, null, true);
 
   nextId += 1;
+  const id = nextId;
   let response: Response;
   let text: string;
   try {
-    response = await fetch(resolveEndpoint(settings), {
+    response = await fetch(endpoint, {
       method: "POST",
       signal: combined,
       headers: {
@@ -151,7 +238,7 @@ export async function callTool(
       },
       body: JSON.stringify({
         jsonrpc: "2.0",
-        id: nextId,
+        id,
         method: "tools/call",
         params: { name, arguments: args },
       }),
@@ -169,7 +256,7 @@ export async function callTool(
 
   let message: unknown = null;
   try {
-    message = parseMessage(text, response.headers.get("Content-Type") ?? "");
+    message = parseMessage(text, response.headers.get("Content-Type") ?? "", id);
   } catch {
     message = null;
   }
@@ -199,7 +286,9 @@ export async function callTool(
     throw new McpError("MatchAwards returned no result; retry later.", response.status, true);
   }
   if (result.isError === true) {
-    throw new McpError(textOf(result.content) || `MatchAwards could not run ${name}.`, response.status, false);
+    const errorText = textOf(result.content) || `MatchAwards could not run ${name}.`;
+    const { retryable, retryAfter } = classifyToolError(errorText);
+    throw new McpError(errorText, response.status, retryable, retryAfter);
   }
 
   const structured = result.structuredContent;
