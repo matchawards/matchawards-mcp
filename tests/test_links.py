@@ -62,10 +62,6 @@ def as_source(label):
         links.source.reset(token)
 
 
-def test_the_www_host_is_tagged_too():
-    assert utm(links.tagged("https://www.matchawards.com/a/1")) == params()
-
-
 def test_the_request_source_is_used():
     token = links.source.set("claude")
     try:
@@ -76,7 +72,8 @@ def test_the_request_source_is_used():
 
 @pytest.mark.parametrize("url", [
     "https://sam.gov/opp/1/view", "https://www.usaspending.gov/award/X", "https://www.usajobs.gov/job/1",
-    "https://matchawards.com.example.net/a", "https://evil.example/?u=https://matchawards.com/a",
+    "https://matchawards.com.example.net/a", "https://evilmatchawards.com/a",
+    "https://evil.example/?u=https://matchawards.com/a",
     "https://matchawards.com@evil.example/a", "mailto:x@matchawards.com", "javascript:alert(1)//matchawards.com",
     "/a/posts/1", "not a url", "http://[::1/a",
 ])
@@ -84,9 +81,9 @@ def test_other_links_are_unchanged(url):
     assert links.tagged(url) == url
 
 
-def test_the_api_host_is_tagged_too(monkeypatch):
-    monkeypatch.setattr(links, "SITE_HOSTS", frozenset({"matchawards.com", "staging.example.org"}))
-    assert utm(links.tagged("https://staging.example.org/a/posts/1")) == params()
+def test_subdomains_are_tagged_too():  # staging links come back while the API base is an internal address
+    assert utm(links.tagged("https://staging.matchawards.com/a/posts/1")) == params()
+    assert utm(links.tagged("https://www.matchawards.com/a/1")) == params()
     assert utm(links.tagged("HTTPS://MatchAwards.com/a")) == params()  # host compared case-insensitively
 
 
