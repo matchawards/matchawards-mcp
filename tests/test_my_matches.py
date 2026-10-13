@@ -72,6 +72,24 @@ async def test_options_type_limit_and_ignore_state(api):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("only", [True, False])
+async def test_state_notices_never_get_the_set_aside_filter(api, only):
+    """The API takes set_aside with federal or mixed contracts only (a 400 for type=state)."""
+    out = await run(type="state", only_my_set_aside=only)
+    assert "set_aside" not in api.requests[0].url.params
+    assert (out.profile_used.set_aside, out.profile_used.set_aside_applied) == ("SBA", False)
+    assert "The set-aside filter applies to federal notices only" in out.note
+    assert "only_my_set_aside=true" not in out.note
+
+
+@pytest.mark.anyio
+async def test_mixed_and_federal_searches_take_the_set_aside(api):
+    for type_ in (None, "federal"):
+        out = await run(type=type_, only_my_set_aside=True)
+        assert api.requests[-1].url.params["set_aside"] == "SBA" and out.profile_used.set_aside_applied
+
+
+@pytest.mark.anyio
 async def test_a_profile_without_set_aside_or_state_sends_neither(api):
     out = await run(profile(set_aside=None, state=None), only_my_set_aside=True)
     assert dict(api.requests[0].url.params) == {"type": "contract", "naics": "541512,541511", "open": "true",

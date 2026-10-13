@@ -124,7 +124,7 @@ LOOPBACK = ("localhost", "127.0.0.1", "::1")
 def check_settings() -> None:
     """Stop --http at startup on a bad URL: the issuer and the resource are public URLs a host fetches, so https
     (http only on a loopback host, for a local run); the agent API base is usually an internal address, so http or
-    https. All need a host and no query."""
+    https. All need a host and a valid port, and no query or user:password@."""
     if not enabled():
         return
     for name, value, public in (("MATCHAWARDS_AUTH_ISSUER", ISSUER, True), ("MATCHAWARDS_RESOURCE", resource(), True),
@@ -132,13 +132,14 @@ def check_settings() -> None:
         try:
             parts = urlsplit(value)
             http_ok = not public or parts.hostname in LOOPBACK
+            parts.port  # raises ValueError when not a number from 0 to 65535
             ok = (parts.scheme == "https" or (parts.scheme == "http" and http_ok)) and bool(parts.hostname) \
-                and not parts.query and not parts.fragment
+                and not parts.query and not parts.fragment and "@" not in parts.netloc
         except ValueError:
             ok = False
         if not ok:
             kind = "an https URL (http only on localhost)" if public else "an http(s) URL"
-            raise SystemExit(f"{name} must be {kind} with a host and no query, got {value!r}")
+            raise SystemExit(f"{name} must be {kind} with a host and no query or user, got {value!r}")
 
 
 # RFC 6750 b64token. Anything else in the header is not a token we would send on.
@@ -221,6 +222,7 @@ _invalid: OrderedDict[bytes, tuple[float, str]] = OrderedDict()
 # profile over a newer refusal. Bounded like the caches.
 _refused: OrderedDict[bytes, int] = OrderedDict()
 _checks = itertools.count()  # orders the /me checks and refusals of this process
+_refused_floor = -1  # the newest refusal _refused dropped for room: a check started before it is not cached
 
 
 def _key(token: str) -> bytes:
@@ -292,6 +294,8 @@ def _resource_key(url: str) -> tuple:
     """A resource URL as compared: scheme and host case-insensitive, port, query and path as they are (a trailing
     slash ignored)."""
     parts = urlsplit(url.strip())
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("userinfo")  # a resource never names a user: no match
     return parts.scheme.lower(), parts.hostname, parts.port, parts.path.rstrip("/"), parts.query, parts.fragment
 
 
@@ -299,7 +303,7 @@ def _same_resource(value) -> bool:
     """Whether a /me body's resource names this server."""
     try:
         return isinstance(value, str) and _resource_key(value) == _resource_key(resource())
-    except ValueError:  # e.g. a port that is not a number
+    except ValueError:  # e.g. a port that is not a number, or user:pass@ in it
         return False
 
 
@@ -309,8 +313,9 @@ def _refuse(key: bytes, answer: str) -> str:
     _cache.pop(key, None)
     _refused[key] = next(_checks)
     _refused.move_to_end(key)
+    global _refused_floor
     while len(_refused) > CACHE_MAX:
-        _refused.popitem(last=False)
+        _refused_floor = max(_refused_floor, _refused.popitem(last=False)[1])
     if answer == INVALID:
         _keep(_invalid, key, INVALID_TTL_S, INVALID)
     return answer
@@ -359,7 +364,9 @@ async def me(token: str) -> Profile | Refusal:
     if not _same_resource(data.get("resource")):
         log.warning("profile check refused: the token was not issued for this resource")
         return _refuse(key, INVALID)
-    if _refused.get(key, -1) < started:  # else a newer check was refused while this one waited: keep that
+    # Else a newer check was refused while this one waited (or a refusal that may have been one was dropped for
+    # room): the 200 answers this call only.
+    if max(_refused.get(key, -1), _refused_floor) < started:
         _invalid.pop(key, None)
         _keep(_cache, key, CACHE_TTL_S, profile)
     return profile

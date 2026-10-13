@@ -686,7 +686,8 @@ async def my_matches(
         return linking.challenge_result(error, LINK_PROMPT)
     codes = [c for c in profile.naics if len(c) == 6]  # the search takes six-digit codes only
     naics, state = codes[:MAX_NAICS], None if ignore_state else profile.state
-    set_aside = profile.set_aside if only_my_set_aside and naics else None
+    # The API takes set_aside with federal or mixed contracts only (a 400 with type=state).
+    set_aside = profile.set_aside if only_my_set_aside and naics and type != "state" else None
     used = {"naics": naics, "set_aside": profile.set_aside, "set_aside_applied": bool(set_aside), "state": state}
     if not naics:
         return MyMatches(results=[], has_more=False, profile_used=used, settings_url=MATCH_SETTINGS_URL,
@@ -697,13 +698,17 @@ async def my_matches(
     return _parse(MyMatches, {**out.model_dump(), "profile_used": used, "note": _note(
         "Open contracts matching the user's MatchAwards profile (profile_used).",
         left_out and f"{left_out} of the profile's NAICS codes were not searched: only up to {MAX_NAICS} six-digit "
-        "codes are.", state and STATE_NOTE, _set_aside_note(profile.set_aside, bool(set_aside)), out.note)})
+        "codes are.", state and STATE_NOTE, _set_aside_note(profile.set_aside, bool(set_aside), type == "state"),
+        out.note)})
 
 
-def _set_aside_note(code: str | None, applied: bool) -> str | None:
+def _set_aside_note(code: str | None, applied: bool, state_only: bool = False) -> str | None:
     """What the model should know about the profile's set-aside (a checked code: letters, digits, _ and -)."""
     if not code:
         return None
+    if state_only:
+        return (f"The set-aside filter applies to federal notices only, so the profile's set-aside ({code}) was not "
+                "applied to these state notices.")
     if applied:
         return f"Only notices set aside for the user's set-aside ({code}) are listed."
     return (f"The user's profile set-aside is {code}, and the results also include notices open to all firms: say "

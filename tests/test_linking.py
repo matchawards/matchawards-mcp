@@ -57,6 +57,7 @@ def me_api(monkeypatch):
     monkeypatch.setattr(linking, "_cache", OrderedDict())
     monkeypatch.setattr(linking, "_invalid", OrderedDict())
     monkeypatch.setattr(linking, "_refused", OrderedDict())
+    monkeypatch.setattr(linking, "_refused_floor", -1)
     return me_api
 
 
@@ -150,6 +151,12 @@ def test_resource_and_metadata_url(monkeypatch):
     ("RESOURCE", "http://localhost.example/mcp", "must be an https URL"),
     ("AGENT_API_BASE", "not a url", "must be an http\\(s\\) URL"),
     ("AGENT_API_BASE", "ftp://api.test", "must be an http\\(s\\) URL"),
+    ("ISSUER", "https://user:pass@matchawards.com", "must be an https URL"),
+    ("RESOURCE", "https://user@matchawards.com/mcp", "must be an https URL"),
+    ("AGENT_API_BASE", "http://user:pass@10.0.0.5:3000", "must be an http\\(s\\) URL"),
+    ("ISSUER", "https://matchawards.com:99999", "must be an https URL"),
+    ("RESOURCE", "https://matchawards.com:x/mcp", "must be an https URL"),
+    ("AGENT_API_BASE", "http://10.0.0.5:-1", "must be an http\\(s\\) URL"),
 ])
 def test_bad_settings_stop_startup(monkeypatch, name, value, message):
     monkeypatch.setattr(linking, "ISSUER", ISSUER)
@@ -336,6 +343,8 @@ async def test_me_rejected_tokens_are_bounded_and_never_push_out_profiles(issuer
     ("http://matchawards.com/mcp", linking.INVALID),
     ("https://matchawards.com/mcp?x=1", linking.INVALID),
     ("https://matchawards.com:x/mcp", linking.INVALID),
+    ("https://user@matchawards.com/mcp", linking.INVALID),
+    ("https://user:pass@matchawards.com/mcp", linking.INVALID),
     ("https://matchawards.com/", linking.INVALID),
     ("https://matchawards.com/mcp/other", linking.INVALID),
     ("https://staging.matchawards.com/mcp", linking.INVALID),
@@ -402,6 +411,34 @@ async def test_a_refusal_drops_a_profile_cached_while_it_was_in_flight(issuer, m
     cached.set()
     assert await slow in (linking.INVALID, linking.INSUFFICIENT)
     assert not linking._cache
+
+
+@pytest.mark.anyio
+async def test_a_refusal_dropped_for_room_still_keeps_an_older_200_out_of_the_cache(issuer, me_api, monkeypatch):
+    """The refusal of a token in flight is pushed out of _refused by others before its 200 lands: the floor (the
+    newest refusal dropped) still keeps the 200 out of the cache. A check started after it caches as usual."""
+    monkeypatch.setattr(linking, "CACHE_MAX", 2)
+    first_sent, refused = asyncio.Event(), asyncio.Event()
+
+    async def reply(req):
+        token = req.headers["authorization"].removeprefix("Bearer ")
+        if token == TOKEN and not first_sent.is_set():
+            first_sent.set()
+            await refused.wait()
+            return httpx.Response(200, json=ME)
+        return httpx.Response(401) if token.startswith("bad") or token == TOKEN else httpx.Response(200, json=ME)
+
+    me_api.reply = reply
+    slow = asyncio.create_task(linking.me(TOKEN))
+    await first_sent.wait()
+    assert await linking.me(TOKEN) == linking.INVALID
+    for token in ("bad1", "bad2"):  # push TOKEN's refusal out of _refused
+        await linking.me(token)
+    assert linking._key(TOKEN) not in linking._refused
+    refused.set()
+    assert isinstance(await slow, linking.Profile)  # it answers its own call
+    assert linking._key(TOKEN) not in linking._cache
+    assert isinstance(await linking.me("good"), linking.Profile) and linking._key("good") in linking._cache
 
 
 @pytest.mark.anyio
