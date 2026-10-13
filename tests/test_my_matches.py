@@ -45,28 +45,38 @@ async def test_the_search_carries_the_profiles_filters(api):
     out = await run()
     [req] = api.requests
     assert req.url.path == PATH
-    assert dict(req.url.params) == {"type": "contract", "naics": "541512,541511", "state": "VA", "set_aside": "SBA",
-                                    "open": "true", "limit": "20"}
+    assert dict(req.url.params) == {"type": "contract", "naics": "541512,541511", "state": "VA", "open": "true",
+                                    "limit": "20"}  # no set_aside: a small business can bid on open competitions too
     assert out.model_dump(exclude_none=True) == {
         **tagged({k: v for k, v in page([1, 2]).items() if v is not None}),
-        "profile_used": {"naics": ["541512", "541511"], "set_aside": "SBA", "state": "VA"},
-        "note": f"{NOTE} {tools.STATE_NOTE} {tools.LINK_RULE}",
+        "profile_used": {"naics": ["541512", "541511"], "set_aside": "SBA", "set_aside_applied": False, "state": "VA"},
+        "note": f"{NOTE} {tools.STATE_NOTE} {tools._set_aside_note('SBA', False)} {tools.LINK_RULE}",
     }
+    assert "set-aside is SBA" in out.note and "only_my_set_aside=true" in out.note
+
+
+@pytest.mark.anyio
+async def test_only_my_set_aside_filters_by_the_profiles_set_aside(api):
+    out = await run(only_my_set_aside=True)
+    assert api.requests[0].url.params["set_aside"] == "SBA"
+    assert (out.profile_used.set_aside, out.profile_used.set_aside_applied) == ("SBA", True)
+    assert "Only notices set aside for the user's set-aside (SBA) are listed." in out.note
 
 
 @pytest.mark.anyio
 async def test_options_type_limit_and_ignore_state(api):
     out = await run(type="federal", limit=5, ignore_state=True)
-    assert dict(api.requests[0].url.params) == {"type": "federal", "naics": "541512,541511", "set_aside": "SBA",
-                                                "open": "true", "limit": "5"}
+    assert dict(api.requests[0].url.params) == {"type": "federal", "naics": "541512,541511", "open": "true",
+                                                "limit": "5"}
     assert out.profile_used.state is None and tools.STATE_NOTE not in out.note
 
 
 @pytest.mark.anyio
 async def test_a_profile_without_set_aside_or_state_sends_neither(api):
-    await run(profile(set_aside=None, state=None))
+    out = await run(profile(set_aside=None, state=None), only_my_set_aside=True)
     assert dict(api.requests[0].url.params) == {"type": "contract", "naics": "541512,541511", "open": "true",
                                                 "limit": "20"}
+    assert not out.profile_used.set_aside_applied and "set-aside" not in out.note
 
 
 @pytest.mark.anyio
@@ -88,7 +98,7 @@ async def test_a_profile_without_naics_codes_gets_the_settings_link_and_no_searc
     assert api.requests == []
     assert out.model_dump(exclude_none=True) == {
         "results": [], "has_more": False, "settings_url": SETTINGS, "note": tools.NO_NAICS_NOTE,
-        "profile_used": {"naics": [], "set_aside": "SBA", "state": "VA"},
+        "profile_used": {"naics": [], "set_aside": "SBA", "set_aside_applied": False, "state": "VA"},
     }
 
 
@@ -142,7 +152,7 @@ async def test_tools_list_with_linking_on(linked):
     assert mine["_meta"]["securitySchemes"] == [{"type": "noauth"}, {"type": "oauth2", "scopes": ["profile:read"]}]
     assert set(mine["outputSchema"]["properties"]) == {"as_of", "results", "has_more", "next_cursor", "note",
                                                        "warning", "profile_used", "settings_url"}
-    assert set(mine["inputSchema"]["properties"]) == {"type", "ignore_state", "limit", "cursor"}
+    assert set(mine["inputSchema"]["properties"]) == {"type", "ignore_state", "only_my_set_aside", "limit", "cursor"}
     for name, t in listed.items():
         assert t["_meta"]["securitySchemes"] == [{"type": "noauth"}], name
 
@@ -197,8 +207,8 @@ async def test_a_linked_user_gets_rows_that_validate_against_the_schema(linked, 
     assert [row["id"] for row in out["results"]] == ["1", "2"]
     assert out["results"][0]["url"].endswith("utm_source=claude&utm_medium=ai_agent&utm_campaign=matchawards_mcp")
     [req] = api.requests
-    assert (req.url.params["naics"], req.url.params["state"], req.url.params["set_aside"]) == ("541512,541511", "VA",
-                                                                                            "SBA")
+    assert (req.url.params["naics"], req.url.params["state"]) == ("541512,541511", "VA")
+    assert "set_aside" not in req.url.params
     assert "authorization" not in req.headers  # the token goes to /me only, never to the public API
 
 

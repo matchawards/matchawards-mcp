@@ -661,15 +661,18 @@ STATE_NOTE = ("The state filter skips federal notices that have no state: call a
 async def my_matches(
     type: ContractType = None,
     ignore_state: Annotated[bool, Field(description="true: search every state, not only the profile's.")] = False,
+    only_my_set_aside: Annotated[bool, Field(description="true: only notices set aside for the profile's "
+                                             "set-aside.")] = False,
     limit: Limit = 20,
     cursor: Cursor = None,
 ) -> Annotated[CallToolResult, MyMatches]:
     """Use this when the user asks for their own matches: open contracts for their business. It needs a linked
-    MatchAwards account and uses that account's NAICS codes, set-aside and state; without a linked account it asks
-    the user to link one.
+    MatchAwards account and uses that account's NAICS codes and state; without a linked account it asks the user to
+    link one.
 
-    Options: type (federal or state), ignore_state (true: every state), limit (1 to 50, default 20). If has_more is
-    true, call again with cursor=next_cursor and the same options.
+    Options: type (federal or state), ignore_state (true: every state), only_my_set_aside (true: only notices set
+    aside for the account's set-aside; by default open competitions are included too), limit (1 to 50, default
+    20). If has_more is true, call again with cursor=next_cursor and the same options.
 
     Print each result's url, and sam_url for federal notices, as markdown links.
 
@@ -683,17 +686,28 @@ async def my_matches(
         return linking.challenge_result(error, LINK_PROMPT)
     codes = [c for c in profile.naics if len(c) == 6]  # the search takes six-digit codes only
     naics, state = codes[:MAX_NAICS], None if ignore_state else profile.state
-    used = {"naics": naics, "set_aside": profile.set_aside, "state": state}
+    set_aside = profile.set_aside if only_my_set_aside and naics else None
+    used = {"naics": naics, "set_aside": profile.set_aside, "set_aside_applied": bool(set_aside), "state": state}
     if not naics:
         return MyMatches(results=[], has_more=False, profile_used=used, settings_url=MATCH_SETTINGS_URL,
                          note=NO_NAICS_NOTE)
-    out = await search_contracts(naics=",".join(naics), state=state, set_aside=profile.set_aside, type=type,
-                                 open=True, limit=limit, cursor=cursor)
+    out = await search_contracts(naics=",".join(naics), state=state, set_aside=set_aside, type=type, open=True,
+                                 limit=limit, cursor=cursor)
     left_out = len(profile.naics) - len(naics)
     return _parse(MyMatches, {**out.model_dump(), "profile_used": used, "note": _note(
         "Open contracts matching the user's MatchAwards profile (profile_used).",
         left_out and f"{left_out} of the profile's NAICS codes were not searched: only up to {MAX_NAICS} six-digit "
-        "codes are.", state and STATE_NOTE, out.note)})
+        "codes are.", state and STATE_NOTE, _set_aside_note(profile.set_aside, bool(set_aside)), out.note)})
+
+
+def _set_aside_note(code: str | None, applied: bool) -> str | None:
+    """What the model should know about the profile's set-aside (a checked code: letters, digits, _ and -)."""
+    if not code:
+        return None
+    if applied:
+        return f"Only notices set aside for the user's set-aside ({code}) are listed."
+    return (f"The user's profile set-aside is {code}, and the results also include notices open to all firms: say "
+            f"which ones are set aside for {code} (their set_aside field). only_my_set_aside=true lists only those.")
 
 
 SHOW_MAX = 10  # ids per show_results call, each one API request
