@@ -211,14 +211,23 @@ async def test_complete_search_has_no_warning(api):
 async def test_get_opportunity_returns_the_detail_with_link_note(api):
     api.replies = [ok({"as_of": "2026-10-07T12:00:00Z", "result": DETAIL})]
     out = (await tools.get_opportunity("7")).model_dump(exclude_none=True)
-    assert out == {**tagged(DETAIL), "as_of": "2026-10-07T12:00:00Z", "note": NOTE}
+    assert out == {**tagged(DETAIL), "as_of": "2026-10-07T12:00:00Z", "note": f"{NOTE} {tools.ASSESS_HINT}"}
+
+
+@pytest.mark.anyio
+async def test_get_opportunity_points_contracts_and_grants_to_assess_opportunity_not_jobs(api):
+    for type_, hinted in (("federal", True), ("state", True), ("grant", True), ("job", False)):
+        api.replies = [ok({"as_of": "x", "result": {**row(7), "type": type_}})]
+        note = (await tools.get_opportunity("7")).note
+        assert note.startswith(NOTE) and note.endswith(tools.ASSESS_HINT) is hinted, type_
+    assert "call assess_opportunity with this id" in tools.ASSESS_HINT
 
 
 @pytest.mark.anyio
 async def test_get_opportunity_contacts_and_reserved_fields(api):
     api.replies = [ok({"as_of": "x", "result": {**row(8), "contacts": None}})]
     out = await run(tools.get_opportunity, "8")
-    assert (out["contacts"], out["ai"], out["note"]) == ([], None, NOTE)  # no ai from the API: null, no AI label
+    assert (out["contacts"], out["ai"], out["note"]) == ([], None, f"{NOTE} {tools.ASSESS_HINT}")  # null, no AI label
     assert "teaming" not in out
     # ai is typed: its declared fields pass, cut to 1000 characters; anything else (and teaming) is dropped.
     api.replies = [ok({"as_of": "x", "result": {**row(8), "teaming": {"angle": "x"}, "ai": {
@@ -227,7 +236,7 @@ async def test_get_opportunity_contacts_and_reserved_fields(api):
     out = await run(tools.get_opportunity, "8")
     assert out["ai"] == {"fit": "Good fit.", "reasoning": "r" * 1000, "subcontracting": None, "large_prime": None,
                          "summary": {"nft_title": "T", "nft_insight": "I", "nft_advantage": None}}
-    assert "teaming" not in out and out["note"] == f"{NOTE} {tools.AI_NOTE}"
+    assert "teaming" not in out and out["note"] == f"{NOTE} {tools.AI_NOTE} {tools.ASSESS_HINT}"
     api.replies = [ok({"as_of": "x", "result": {**row(8), "ai": "not an object"}})]
     assert (await run(tools.get_opportunity, "8"))["ai"] is None
     api.replies = [ok(row(9))]  # old top-level shape: not accepted
@@ -353,6 +362,11 @@ async def test_every_tool_has_title_annotations_noauth_output_schema_and_descrip
         assert "naics (up to 10 codes)" in flat(listed[name].description), name
     assert "sam_url" in listed["search_contracts"].description and "sam_url" in listed["get_opportunity"].description
     assert "Open status may lag for grants that closed recently" in flat(listed["search_grants"].description)
+    # Fit and bid/no-bid questions go to assess_opportunity, not get_opportunity.
+    assert listed["assess_opportunity"].description.startswith(
+        "Use this when the user asks if one opportunity is a good fit for them, whether to bid, or wants a bid brief: ")
+    assert "for fit or bid/no-bid questions (assess_opportunity)" in listed["get_opportunity"].description
+    assert "notes on fit" not in listed["get_opportunity"].description
 
 
 SKIP_CASE = [ok({**page([]), "results": [row(1), {"id": ["bad"]}]})]  # one row skipped

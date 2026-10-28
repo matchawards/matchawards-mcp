@@ -36,6 +36,8 @@ AWARD_LINK_RULE = (
 )
 AWARD_COVERAGE = "Award records may be incomplete."
 AI_NOTE = "The ai fields are AI-generated: label them as AI-generated whenever you show or quote them."
+# get_opportunity's note, for a contract or grant (assess_opportunity refuses jobs).
+ASSESS_HINT = "For a fit or bid/no-bid brief with similar past awards, call assess_opportunity with this id."
 
 # Sent as `source=` on job searches when set (e.g. one job board only). None: the API's default mix.
 JOB_SOURCE: str | None = None
@@ -215,19 +217,20 @@ async def get_opportunity(id: OppId) -> OpportunityDetail:
     """Use this when the user wants the details of one search result, or who to contact about it.
 
     Pass the id from a search result. Returns the result's row plus its description (up to 2000 characters),
-    published points of contact (name and title only) and, when MatchAwards has them, ai: AI-generated notes on
-    fit, subcontracting and large-prime angles and a summary. AI text is AI-generated: label it as such whenever
-    you quote it. Example: id="117402307943537453".
+    published points of contact (name and title only) and, when MatchAwards has them, ai: AI-generated notes
+    (subcontracting and large-prime angles) and a summary. AI text is AI-generated: label it as such whenever you
+    quote it. Example: id="117402307943537453".
 
     Print url, and sam_url for federal notices, as markdown links.
 
-    Do not use for searching (search_contracts, search_grants, search_jobs) or for contact details beyond the
-    published names and titles.
+    Do not use for searching (search_contracts, search_grants, search_jobs), for fit or bid/no-bid questions
+    (assess_opportunity) or for contact details beyond the published names and titles.
     """
     data = await api.get_one(id)
     ai = _ai(data)
     return _parse(OpportunityDetail, {
-        **data, "contacts": data.get("contacts") or [], "ai": ai, "note": _note(LINK_RULE, ai and AI_NOTE),
+        **data, "contacts": data.get("contacts") or [], "ai": ai,
+        "note": _note(LINK_RULE, ai and AI_NOTE, data.get("type") != "job" and ASSESS_HINT),
     })
 
 
@@ -485,9 +488,9 @@ async def assess_opportunity(
     my_set_aside: Annotated[str | None, Field(max_length=40, description="The user's set-aside code, e.g. 'SBA' or "
                                               "'SDVOSBC', to compare with the opportunity's.")] = None,
 ) -> Assessment:
-    """Use this when the user asks whether to bid on one opportunity, or wants a qualification brief on it: days
-    left, set-aside, AI fit notes, similar past awards, the firms that typically win such work and the usual award
-    value.
+    """Use this when the user asks if one opportunity is a good fit for them, whether to bid, or wants a bid brief:
+    days left, set-aside match, similar past awards at the same agency, the firms that usually win such work and the
+    usual award value.
 
     Pass the id from a search result, and optionally my_naics (up to 10 codes) and my_set_aside to check the fit.
     Similar awards come from MatchAwards' award records for the same NAICS at the same agency, or at all agencies

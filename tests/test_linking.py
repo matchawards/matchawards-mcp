@@ -98,7 +98,8 @@ def linked(issuer, monkeypatch):
 @pytest.mark.anyio
 async def test_off_is_the_server_without_linking(me_api):
     """Off (the default), initialize and tools/list are byte for byte what 1.0.2 served (snapshot taken before
-    linking existed; serverInfo.version left out), the metadata paths are 404, and a bearer is never checked."""
+    linking existed, then regenerated for the 1.1 get_opportunity and assess_opportunity wording; serverInfo.version
+    left out), the metadata paths are 404, and a bearer is never checked."""
     assert not linking.enabled()
     golden = json.loads((ROOT / "tests" / "golden" / "linking_off.json").read_text())
     async with http() as hc:
