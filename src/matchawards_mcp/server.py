@@ -50,6 +50,10 @@ INSTRUCTIONS = (
     "Put several NAICS codes in one search (naics='541511,541512'), not one call per code. A warning with a cursor "
     "means the scan stopped early: call again with that cursor before saying nothing exists."
 )
+# Added to INSTRUCTIONS only without my_matches: a search for the user's own business with no codes given. With
+# linking on, my_matches answers that ask, and its result note asks the same question when the profile has no codes.
+BUSINESS_INSTRUCTIONS = ("For the user's own business with no NAICS given: ask what it does (or its codes), then "
+                         "find codes with lookup_naics.")
 # Added to INSTRUCTIONS only when my_matches exists (account linking on, MATCHAWARDS_AUTH_ISSUER).
 LINKED_INSTRUCTIONS = ("For the user's own matches (\"my matches\", contracts for my business): my_matches, which "
                        "needs a linked MatchAwards account.")
@@ -235,7 +239,7 @@ def build_mcp() -> MCPServer:
     srv = Server(
         name="matchawards",
         title="MatchAwards",
-        instructions=INSTRUCTIONS + (" " + LINKED_INSTRUCTIONS if linking.enabled() else "")
+        instructions=INSTRUCTIONS + " " + (LINKED_INSTRUCTIONS if linking.enabled() else BUSINESS_INSTRUCTIONS)
         + (" " + CARD_INSTRUCTIONS if WIDGETS else ""),
         website_url="https://matchawards.com",
         version=__version__,

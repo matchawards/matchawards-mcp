@@ -111,6 +111,12 @@ async def test_pages_follow_the_cursor_with_the_same_filters(api):
     assert [r.id for r in second.results] == ["3"] and not second.has_more
 
 
+def test_no_naics_note_has_the_model_ask_map_search_and_offer_saving():
+    note = tools.NO_NAICS_NOTE
+    assert "Ask what their business does" in note and "lookup_naics" in note and "search_contracts" in note
+    assert "settings_url" in note
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize("codes", [[], ["54", "5415"]])
 async def test_a_profile_without_naics_codes_gets_the_settings_link_and_no_search(api, codes):
@@ -222,6 +228,8 @@ def test_instructions_point_at_my_matches_only_with_linking_on(issuer, monkeypat
     assert server.build_mcp().instructions == " ".join(
         [server.INSTRUCTIONS, server.LINKED_INSTRUCTIONS, server.CARD_INSTRUCTIONS])
     assert "my_matches" in server.LINKED_INSTRUCTIONS and "my matches" in server.LINKED_INSTRUCTIONS
+    assert len(server.build_mcp().instructions) <= 1024
+    assert server.BUSINESS_INSTRUCTIONS not in server.build_mcp().instructions  # my_matches' note asks instead
     monkeypatch.setattr(linking, "ISSUER", "")
     assert "my_matches" not in server.build_mcp().instructions
 

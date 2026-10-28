@@ -671,9 +671,10 @@ MATCH_SETTINGS_URL = "https://matchawards.com/settings/match_settings"
 MAX_NAICS = 10  # codes per search, as search_contracts takes them
 LINK_PROMPT = ("This needs the user to link their MatchAwards account (sign in with Google or email). Once linked, it "
                "shows open contracts matching the NAICS codes on their MatchAwards profile.")
-NO_NAICS_NOTE = ("The user's MatchAwards profile has no NAICS codes yet, so there is nothing to match. Give them "
-                 "settings_url as a markdown link to add their codes in their match settings, then call my_matches "
-                 "again.")
+NO_NAICS_NOTE = ("The user's MatchAwards profile has no NAICS codes yet, so there is nothing to match. Ask what their "
+                 "business does (or its NAICS codes if they know them), find the codes with lookup_naics and call "
+                 "search_contracts with naics set to them. Also give them settings_url as a markdown link to save the "
+                 "codes in their match settings, so my_matches finds their contracts next time.")
 TRUNCATED_NOTE = (f"Only the first {MAX_NAICS} NAICS codes on the user's MatchAwards profile were searched: the "
                   "profile has more.")
 FORBIDDEN_TEXT = "This MatchAwards account can't use my_matches. Check the account on matchawards.com."

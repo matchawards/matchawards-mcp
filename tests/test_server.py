@@ -320,7 +320,7 @@ async def test_stdio_handshake(mode):
     )
     async with Client(params, mode=mode) as client:
         assert (client.server_info.name, client.server_info.version) == ("matchawards", __version__)
-        assert client.instructions == server.INSTRUCTIONS
+        assert client.instructions == server.INSTRUCTIONS + " " + server.BUSINESS_INSTRUCTIONS
         if mode == "auto":
             assert client.protocol_version == "2026-07-28"
         listed = await client.list_tools()
@@ -424,6 +424,13 @@ def test_instructions_carry_the_essentials_in_the_first_512_characters():
         assert needle in head, needle
 
 
+def test_instructions_without_linking_ask_for_the_business_and_map_it_with_lookup_naics():
+    """Without account linking, "contracts for my business" with no codes: the model asks what the business does
+    (or its codes) and finds the codes with lookup_naics, instead of guessing or searching by keyword."""
+    text = server.BUSINESS_INSTRUCTIONS
+    assert "ask what it does" in text and "lookup_naics" in text and "my_matches" not in text
+
+
 def test_instructions_steer_to_one_multi_naics_search_and_the_cursor():
     assert "naics='541511,541512'" in server.INSTRUCTIONS and "not one call per code" in server.INSTRUCTIONS
     assert "call again with that cursor before saying nothing exists" in server.INSTRUCTIONS
@@ -436,10 +443,10 @@ def test_instructions_steer_to_one_multi_naics_search_and_the_cursor():
 
 @pytest.mark.anyio
 async def test_card_instructions_only_with_widgets(monkeypatch):
-    assert server.mcp.instructions == server.INSTRUCTIONS
+    assert server.mcp.instructions == server.INSTRUCTIONS + " " + server.BUSINESS_INSTRUCTIONS
     monkeypatch.setattr(server, "WIDGETS", True)
     srv = server.build_mcp()
-    assert srv.instructions == server.INSTRUCTIONS + " " + server.CARD_INSTRUCTIONS
+    assert srv.instructions == " ".join([server.INSTRUCTIONS, server.BUSINESS_INSTRUCTIONS, server.CARD_INSTRUCTIONS])
     assert "call show_results last with the ids you picked" in server.CARD_INSTRUCTIONS
     assert len(srv.instructions) <= 1024
 
