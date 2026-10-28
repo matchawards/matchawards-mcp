@@ -381,8 +381,10 @@ class Ledger:
             conn = sqlite3.connect(self.path, timeout=5)
             try:
                 with conn:
-                    fn(conn, *args)
+                    after_commit = fn(conn, *args)
                     self._prune(conn)
+                if after_commit is not None:  # committed: a rolled-back write runs nothing
+                    after_commit()
             finally:
                 conn.close()
         except Exception as e:
@@ -402,13 +404,15 @@ class Ledger:
 
     @staticmethod
     def write_call(conn, tool, outcome, client_key, ua, family, caller_fp, latency_ms, linked=False,
-                   rows=None) -> None:
+                   rows=None):
         """One tool call. linked: it ran with a linked account (which one is never stored). rows: the rows a
         list-returning tool answered with (None for other tools and for calls that failed).
 
-        A ChatGPT fingerprint with no earlier row (within the retention window) counts in
-        mcp_chatgpt_subjects_new_total. Checked after the insert, in its transaction: writers are serialised, so two
-        first calls of one user on the two writer threads count once."""
+        A ChatGPT fingerprint with no earlier row (within the retention window) is a new subject: checked after the
+        insert, in its transaction (writers are serialised, so two first calls of one user on the two writer threads
+        find one new subject). Returns the step that counts it in mcp_chatgpt_subjects_new_total, which the caller
+        runs only once the transaction has committed (a rolled-back write counts nobody, so the user's next call
+        still can), or None."""
         conn.execute("INSERT INTO tool_calls (ts, tool, outcome, client_key, ua, family, caller_fp, latency_ms, "
                      "linked, rows) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                      (_now().isoformat(timespec="seconds"), tool, outcome, client_key, ua, family, caller_fp,
@@ -416,7 +420,8 @@ class Ledger:
         if caller_fp is not None and conn.execute(
                 "SELECT 1 FROM tool_calls WHERE caller_fp = ? AND rowid != last_insert_rowid() LIMIT 1",
                 (caller_fp,)).fetchone() is None:
-            metrics.inc("mcp_chatgpt_subjects_new_total")
+            return lambda: metrics.inc("mcp_chatgpt_subjects_new_total")
+        return None
 
     @staticmethod
     def write_transport(conn, client_key, method, name, version, ua) -> None:

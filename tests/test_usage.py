@@ -510,7 +510,10 @@ def test_a_subject_with_no_earlier_row_counts_as_new_once(usage_db):
     new = lambda: usage.metrics.counts[("mcp_chatgpt_subjects_new_total", ())]  # noqa: E731
     for fp, expect in [("a" * 16, 1), ("a" * 16, 1), (None, 1), ("b" * 16, 2), ("a" * 16, 2)]:
         with conn:
-            usage.Ledger.write_call(conn, "search_contracts", "ok", "192.0.2.0/24", "openai-mcp/1", "openai-mcp", fp, 5)
+            after_commit = usage.Ledger.write_call(conn, "search_contracts", "ok", "192.0.2.0/24", "openai-mcp/1",
+                                                   "openai-mcp", fp, 5)
+        if after_commit is not None:
+            after_commit()
         assert new() == expect, fp
     conn.close()
     assert "mcp_chatgpt_subjects_new_total 2" in usage.metrics.render()
@@ -519,6 +522,26 @@ def test_a_subject_with_no_earlier_row_counts_as_new_once(usage_db):
         ledger.submit(usage.Ledger.write_call, "search_jobs", "ok", "192.0.2.0/24", "x", "openai-mcp", "c" * 16, 5)
     ledger.flush()
     assert new() == 3 and usage.metrics.counts[("mcp_ledger_errors_total", ())] == 0
+
+
+def test_a_rolled_back_write_counts_no_new_subject_and_the_next_call_still_can(usage_db):
+    ledger = usage.Ledger.open(str(usage_db))
+    new = lambda: usage.metrics.counts[("mcp_chatgpt_subjects_new_total", ())]  # noqa: E731
+
+    def failing_prune(conn):  # fails after the insert and the new-subject check, before the commit
+        raise sqlite3.OperationalError("disk I/O error")
+
+    ledger._prune = failing_prune
+    ledger.submit(usage.Ledger.write_call, "search_jobs", "ok", "192.0.2.0/24", "x", "openai-mcp", "d" * 16, 5)
+    ledger.flush()
+    assert new() == 0 and usage.metrics.counts[("mcp_ledger_errors_total", ())] == 1
+    del ledger._prune  # writes work again
+    ledger.submit(usage.Ledger.write_call, "search_jobs", "ok", "192.0.2.0/24", "x", "openai-mcp", "d" * 16, 5)
+    ledger.flush()
+    assert new() == 1
+    conn = sqlite3.connect(usage_db)
+    assert conn.execute("SELECT COUNT(*) FROM tool_calls").fetchone() == (1,)  # the first write left no row
+    conn.close()
 
 
 @pytest.mark.anyio
