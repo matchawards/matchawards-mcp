@@ -644,3 +644,31 @@ def test_opportunity_naics_says_state_codes_are_ai_assigned():
     from matchawards_mcp import schemas
     assert "On state notices (type state) the naics code itself is AI-assigned." in (
         schemas.OpportunityRow.model_fields["naics"].description)
+
+
+# --- Keyword hint: a thin keyword search without naics points to lookup_naics --------------------------------------
+
+SEARCHES = [(tools.search_contracts, page), (tools.search_grants, page), (tools.search_awards, awards_page)]
+
+
+@pytest.mark.parametrize("tool, make", SEARCHES)
+@pytest.mark.parametrize("n", [0, 1, 4])
+@pytest.mark.anyio
+async def test_keyword_hint_on_a_thin_keyword_search_without_naics(api, tool, make, n):
+    api.replies = [ok(make(list(range(1, n + 1))))]
+    out = await tool(keyword="roof")
+    assert out.note.endswith(tools.KEYWORD_HINT) and out.note.count(tools.KEYWORD_HINT) == 1
+    assert len(api.requests) == 1  # the hint makes no request of its own
+
+
+@pytest.mark.parametrize("tool, make", SEARCHES)
+@pytest.mark.parametrize("kwargs, n", [
+    ({"keyword": "roof", "naics": "238160"}, 0),  # with naics
+    ({"keyword": "roof"}, 5),  # 5 rows or more
+    ({}, 0),  # no keyword
+    ({"naics": "238160"}, 2),
+])
+@pytest.mark.anyio
+async def test_no_keyword_hint_with_naics_enough_rows_or_no_keyword(api, tool, make, kwargs, n):
+    api.replies = [ok(make(list(range(1, n + 1))))]
+    assert tools.KEYWORD_HINT not in (await tool(**kwargs)).note

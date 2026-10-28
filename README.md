@@ -253,6 +253,7 @@ The data is US federal and state contract opportunities, grants, jobs, federal c
 - Contract and grant searches return open items by default: a response deadline of today or later, US Eastern. An item with no deadline counts as closed.
 - Job search covers the last 30 days.
 - Results come newest first. When `has_more` is true, the model can ask for the next page with `cursor`.
+- A keyword search (contracts, grants or awards) without `naics` that returns fewer than 5 rows says in its `note` that the keyword matches titles only, and that `lookup_naics` gives the codes for a line of work.
 - A narrow filter (an agency, a rare name) can scan the newest records without a match while more exist further back; the result's `warning` then says so and gives the `cursor` to continue with.
 - If the first request of a search fails, the tool returns an error. If a later page fails, the tool returns the rows it already has, with a `warning` that says why it stopped.
 - A result row in an unexpected format is left out and counted in `warning`; the rest of the search is returned.
