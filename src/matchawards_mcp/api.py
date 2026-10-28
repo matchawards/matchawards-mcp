@@ -7,6 +7,7 @@ the cursor for up to MAX_PAGES requests), `opportunities/{id}`, `companies/{uei}
 
 import asyncio
 import contextvars
+import math
 import os
 import re
 import time
@@ -43,6 +44,7 @@ api_budget = None
 # server.http_app() sets it.
 api_slots: asyncio.Semaphore | None = None
 SLOT_WAIT_S = 5.0
+SLOT_DEADLINE_MARGIN_S = 0.05
 
 # HTTP mode only: called after every upstream request with (endpoint, outcome, seconds) for mcp_api_duration_seconds;
 # server.http_app() sets it. None in stdio mode, which records nothing.
@@ -167,18 +169,34 @@ async def send(http: httpx.AsyncClient, label: str, url: str, deadline: float | 
 
 
 async def _send_in_slot(path: str, deadline: float | None, query: dict[str, Any]) -> tuple[httpx.Response, str]:
-    """send() the GET for get(), holding one of api_slots for its duration when there are slots (HTTP mode).
-    No free slot within SLOT_WAIT_S is busy, before anything is sent."""
+    """send() the GET for get(), holding one of api_slots for its duration when there are slots (HTTP mode), and
+    spending api_budget once a slot is held, so a request that never gets a slot spends nothing. No free slot within
+    SLOT_WAIT_S is busy, before anything is sent; with a `deadline` the wait ends SLOT_DEADLINE_MARGIN_S before it,
+    so a saturated server answers busy rather than the caller's wait_for cutting the wait off as a timeout."""
     if api_slots is None:
+        _spend_budget()
         return await send(client, endpoint(path), path, deadline, params=query)
+    wait = SLOT_WAIT_S
+    if deadline is not None:
+        wait = min(wait, deadline - asyncio.get_running_loop().time() - SLOT_DEADLINE_MARGIN_S)
     try:
-        await asyncio.wait_for(api_slots.acquire(), SLOT_WAIT_S)
+        if wait <= 0:
+            raise asyncio.TimeoutError
+        await asyncio.wait_for(api_slots.acquire(), wait)
     except asyncio.TimeoutError:
-        raise fail("busy", f"MatchAwards is busy right now. Retry in {SLOT_WAIT_S:.0f} seconds.") from None
+        retry = max(1, math.ceil(SLOT_WAIT_S))
+        raise fail("busy", f"MatchAwards is busy right now. Retry in {retry} seconds.") from None
     try:
+        _spend_budget()
         return await send(client, endpoint(path), path, deadline, params=query)
     finally:
         api_slots.release()
+
+
+def _spend_budget() -> None:
+    """One call from api_budget (HTTP mode); busy when it is spent."""
+    if api_budget is not None and (wait := api_budget.check("api")):
+        raise fail("busy", f"MatchAwards is busy right now. Retry in {wait} seconds.")
 
 
 async def get(path: str, params: dict[str, Any] | None = None, not_found: str | None = None,
@@ -186,8 +204,6 @@ async def get(path: str, params: dict[str, Any] | None = None, not_found: str | 
     """GET one API path; turn every failure into a ToolError the model can act on. `not_found` replaces the
     wording of a 404. `deadline`: the event-loop time a caller's asyncio.wait_for cuts it off at (timing only)."""
     query = {k: v for k, v in (params or {}).items() if v is not None and v != ""}  # "" = unset, e.g. cursor=""
-    if api_budget is not None and (wait := api_budget.check("api")):
-        raise fail("busy", f"MatchAwards is busy right now. Retry in {wait} seconds.")
     try:
         r, outcome = await _send_in_slot(path, deadline, query)
     except httpx.TimeoutException:

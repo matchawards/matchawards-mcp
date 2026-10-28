@@ -357,7 +357,8 @@ async def test_one_client_hammering_leaves_the_global_budget_open(monkeypatch):
     ("MATCHAWARDS_RATE_PER_MIN", "0"), ("MATCHAWARDS_RATE_BURST", "ten"), ("MATCHAWARDS_GLOBAL_PER_MIN", "-5"),
     ("MATCHAWARDS_RATE_PER_MIN", ""), ("MATCHAWARDS_TRUSTED_PROXIES", "10.0.0.0/33"), ("MATCHAWARDS_RATE_PER_PREFIX_MIN", "0"),
     ("MATCHAWARDS_GLOBAL_API_PER_MIN", "x"), ("MATCHAWARDS_RATE_PER_SUBJECT_MIN", "0"),
-    ("MATCHAWARDS_RATE_SUBJECT_BURST", "x"), ("MATCHAWARDS_EGRESS_PER_MIN", "-1"), ("MATCHAWARDS_API_MAX_IN_FLIGHT", "0"),
+    ("MATCHAWARDS_RATE_SUBJECT_BURST", "x"), ("MATCHAWARDS_EGRESS_PER_MIN", "-1"),
+    ("MATCHAWARDS_API_MAX_IN_FLIGHT", "0"),
 ])
 def test_bad_env_stops_startup_with_a_clear_message(monkeypatch, name, value):
     monkeypatch.setenv(name, value)
@@ -436,8 +437,12 @@ async def test_api_in_flight_cap_in_http_mode(monkeypatch):
                                                             base_url="https://api.test"))
     monkeypatch.setattr(ma_api, "SLOT_WAIT_S", 0.2)
     held = [asyncio.create_task(tools.get_opportunity(str(i))) for i in (1, 2)]
-    while len(started) < 2:
-        await asyncio.sleep(0)
+
+    async def both_sent():
+        while len(started) < 2:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(both_sent(), 2)
     with pytest.raises(ToolError, match="MatchAwards is busy right now. Retry in") as busy:
         await tools.get_opportunity("3")  # both slots held: waits SLOT_WAIT_S, then busy, and sends nothing
     assert busy.value.outcome == "busy" and len(started) == 2
@@ -447,6 +452,21 @@ async def test_api_in_flight_cap_in_http_mode(monkeypatch):
     release.set()
     await asyncio.gather(*held, waiting)
     assert len(started) == 3  # got the slot a finished request gave back
+
+
+@pytest.mark.anyio
+async def test_api_slot_wait_ends_before_the_callers_deadline(monkeypatch, api):
+    monkeypatch.setenv("MATCHAWARDS_API_MAX_IN_FLIGHT", "1")
+    monkeypatch.setenv("MATCHAWARDS_GLOBAL_API_PER_MIN", "1")
+    server.http_app()
+    await ma_api.api_slots.acquire()  # the only slot is held
+    deadline = asyncio.get_running_loop().time() + 0.3
+    with pytest.raises(ToolError, match="busy") as busy:  # busy before the caller's wait_for would cut it off
+        await asyncio.wait_for(ma_api.get("/x", deadline=deadline), 0.3)
+    assert busy.value.outcome == "busy" and api.requests == []
+    ma_api.api_slots.release()
+    await ma_api.get("/x")  # the budget's one call was not spent by the busy request
+    assert len(api.requests) == 1
 
 
 @pytest.mark.anyio
