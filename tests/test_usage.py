@@ -315,7 +315,7 @@ async def test_direct_calls_outside_http_record_nothing(api, usage_db, tmp_path)
     server.ledger = usage.Ledger.open(str(usage_db))
     await server.mcp.call_tool("get_opportunity", {"id": "7"})  # through the usage wrapper, outside a request
     assert rows(usage_db) == [] and usage.metrics.counts == {} and usage.metrics.histograms == {}
-    assert usage.distinct.seen == {"client": {}, "chatgpt_subject": {}, "account": {}}
+    assert usage.distinct.seen == {"client": {}, "chatgpt_subject": {}, "chatgpt_session": {}, "account": {}}
 
 
 @pytest.mark.anyio
@@ -384,7 +384,7 @@ def test_a_quiet_day_leaves_no_dead_keys(monkeypatch):
     now[0] += 86400 + 1  # no see() since: render alone prunes
     text = usage.metrics.render()
     assert 'mcp_distinct_callers{kind="client",window="24h"} 0' in text
-    assert usage.distinct.seen == {"client": {}, "chatgpt_subject": {}, "account": {}}
+    assert usage.distinct.seen == {"client": {}, "chatgpt_subject": {}, "chatgpt_session": {}, "account": {}}
 
 
 def test_counts_newest_first_stop_at_the_window(monkeypatch):
@@ -468,6 +468,39 @@ async def test_a_subject_counts_only_from_chatgpt_egress(api, egress):
     text = usage.metrics.render()
     assert 'mcp_distinct_callers{kind="chatgpt_subject",window="24h"} 0' in text
     assert 'mcp_distinct_callers{kind="client",window="24h"} 2' in text
+
+
+@pytest.mark.anyio
+async def test_chatgpt_sessions_count_like_subjects_in_memory_only(api, usage_db, egress, monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_USAGE_SALT", "s3cret")
+    async with http() as hc:
+        for session in ("conv-1", "conv-1", "conv-2", " ", "x" * (server.SUBJECT_MAX_LEN + 1)):  # blank, overlong
+            await post(hc, call("get_opportunity", {"id": "7"}), ip="192.0.2.10",
+                       **{"x-openai-subject": "sub-1", "x-openai-session": session})
+        await post(hc, call("get_opportunity", {"id": "7"}), **{"x-openai-session": "conv-3"})  # not from egress
+    text = usage.metrics.render()
+    assert 'mcp_distinct_callers{kind="chatgpt_session",window="1h"} 2' in text
+    assert 'mcp_distinct_callers{kind="chatgpt_session",window="24h"} 2' in text
+    assert 'mcp_distinct_callers{kind="chatgpt_subject",window="24h"} 1' in text
+    assert 'mcp_distinct_evictions_total{kind="chatgpt_session"} 0' in text
+    assert "conv-" not in text and all("conv-" not in k for k in usage.distinct.seen["chatgpt_session"])
+    [h, _] = usage.distinct.seen["chatgpt_session"]  # hashed with the gauges' per-process salt
+    assert h == usage.hashlib.blake2s(b"conv-1", key=usage.distinct.salt, digest_size=8).hexdigest()
+    server.ledger.flush()
+    raw = b"".join(p.read_bytes() for p in usage_db.parent.glob("usage.db*"))
+    assert b"conv-" not in raw  # never in the ledger
+    fp = usage.fingerprint(b"sub-1", b"s3cret")
+    assert {r["caller_fp"] for r in rows(usage_db)} == {fp, None}  # the subject only, as before
+
+
+def test_chatgpt_sessions_are_capped_and_evictions_counted(monkeypatch):
+    monkeypatch.setattr(usage.Distinct, "MAX_KEYS", 2)
+    usage.distinct = usage.Distinct()  # the autouse fixture restores the module's own after the test
+    for i in range(5):
+        usage.distinct.see("chatgpt_session", f"conv-{i}".encode())
+    text = usage.metrics.render()
+    assert 'mcp_distinct_callers{kind="chatgpt_session",window="24h"} 2' in text
+    assert 'mcp_distinct_evictions_total{kind="chatgpt_session"} 3' in text
 
 
 @pytest.mark.anyio
@@ -620,16 +653,20 @@ mcp_ledger_errors_total 0
 # HELP mcp_tool_result_rows Rows a successful call of a list-returning tool answered with, by tool.
 # TYPE mcp_tool_result_rows histogram
 # HELP mcp_distinct_callers Distinct callers in the window: client = /24 or /48 without probers or own tests, \
-chatgpt_subject = x-openai-subject from ChatGPT egress. Reset on restart.
+chatgpt_subject = x-openai-subject from ChatGPT egress, chatgpt_session = x-openai-session (conversations) from \
+ChatGPT egress. Reset on restart.
 # TYPE mcp_distinct_callers gauge
 mcp_distinct_callers{kind="client",window="1h"} 0
 mcp_distinct_callers{kind="client",window="24h"} 0
 mcp_distinct_callers{kind="chatgpt_subject",window="1h"} 0
 mcp_distinct_callers{kind="chatgpt_subject",window="24h"} 0
+mcp_distinct_callers{kind="chatgpt_session",window="1h"} 0
+mcp_distinct_callers{kind="chatgpt_session",window="24h"} 0
 # HELP mcp_distinct_evictions_total Distinct-caller keys dropped to stay under the cap, by kind.
 # TYPE mcp_distinct_evictions_total counter
 mcp_distinct_evictions_total{kind="client"} 0
 mcp_distinct_evictions_total{kind="chatgpt_subject"} 0
+mcp_distinct_evictions_total{kind="chatgpt_session"} 0
 """
 
 

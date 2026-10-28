@@ -432,11 +432,17 @@ class EgressRanges:
             self.nets, self.due = nets, self.clock() + EGRESS_REFRESH_S
 
 
-def chatgpt_subject(scope) -> bytes:
+def chatgpt_subject(scope, name: bytes = b"x-openai-subject") -> bytes:
     """The x-openai-subject header: the first if there are several, b"" when blank or longer than SUBJECT_MAX_LEN.
     Means a ChatGPT user only on a request from an egress address (anyone else can send any value)."""
-    subject = next((v for k, v in scope["headers"] if k == b"x-openai-subject"), b"").strip()
+    subject = next((v for k, v in scope["headers"] if k == name), b"").strip()
     return subject if len(subject) <= SUBJECT_MAX_LEN else b""
+
+
+def chatgpt_session(scope) -> bytes:
+    """The x-openai-session header (one ChatGPT conversation), read and trusted exactly as chatgpt_subject. Counted
+    in memory only (the chatgpt_session distinct-caller gauge), never written to the ledger."""
+    return chatgpt_subject(scope, b"x-openai-session")
 
 
 def _host_name(host: str) -> str:
@@ -549,6 +555,7 @@ class HttpGuard:
         limits already counted the request, so a challenge costs what a call does."""
         headers = dict(scope["headers"])
         subject = chatgpt_subject(scope) if ip in self.egress else b""  # as reject() decided it
+        session = chatgpt_session(scope) if ip in self.egress else b""
         raw_ua = headers.get(b"user-agent", b"").decode("latin-1")
         ua = usage.clean(raw_ua, 200)
         req = {"client": usage.truncate_key(key), "ua": ua, "family": usage.classify_ua(ua),
@@ -592,6 +599,8 @@ class HttpGuard:
                 usage.distinct.see("client", req["client"])
             if subject:
                 usage.distinct.see("chatgpt_subject", subject)
+            if session:
+                usage.distinct.see("chatgpt_session", session)
             if ledger is not None:
                 ledger.submit(usage.Ledger.write_transport, req["client"], method, name, version, ua)
 

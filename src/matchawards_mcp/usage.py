@@ -121,7 +121,8 @@ def fingerprint(subject: bytes, salt: bytes | None) -> str | None:
     """16-hex HMAC of an x-openai-subject (from ChatGPT egress only), to count distinct ChatGPT callers. None without
     salt or subject.
 
-    Not x-openai-session: it changes per conversation, so it would count conversations, not callers."""
+    Not x-openai-session: it changes per conversation, so it would count conversations, not callers (the in-memory
+    chatgpt_session gauge counts those)."""
     if not salt or not subject:
         return None
     return hmac.new(salt, subject, hashlib.sha256).hexdigest()[:16]
@@ -152,7 +153,8 @@ class Distinct:
     networks can push others out."""
 
     MAX_KEYS = 100_000
-    KINDS = ("client", "chatgpt_subject", "account")  # account: a linked account's id (account linking on)
+    # chatgpt_session: x-openai-session (a ChatGPT conversation); account: a linked account's id (linking on)
+    KINDS = ("client", "chatgpt_subject", "chatgpt_session", "account")
 
     def __init__(self):
         self.salt = os.urandom(16)  # per process: the hashes cannot be matched across restarts or to the ledger
@@ -272,7 +274,8 @@ class Metrics:
                 lines += [f"{name}_sum{{{_labels(labels)}}} {round(h[-1], 6)}",
                           f"{name}_count{{{_labels(labels)}}} {total}"]
         lines += ["# HELP mcp_distinct_callers Distinct callers in the window: client = /24 or /48 without probers "
-                  "or own tests, chatgpt_subject = x-openai-subject from ChatGPT egress"
+                  "or own tests, chatgpt_subject = x-openai-subject from ChatGPT egress, chatgpt_session = "
+                  "x-openai-session (conversations) from ChatGPT egress"
                   + (", account = linked accounts" if linked else "") + ". Reset on restart.",
                   "# TYPE mcp_distinct_callers gauge"]
         snapshot = {kind: distinct.counts(kind) for kind in Distinct.KINDS if linked or kind != "account"}
