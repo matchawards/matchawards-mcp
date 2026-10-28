@@ -35,7 +35,7 @@ AWARD_LINK_RULE = (
     "not its title."
 )
 AWARD_COVERAGE = "Award records may be incomplete."
-# Added to a keyword search's note when it found few rows and had no naics filter (keyword_hint).
+# Added to a keyword search's note when it found few rows and had no naics filter (_keyword_hint).
 KEYWORD_HINT = ("Keyword search matches titles only. For a line of work, lookup_naics gives the codes; a naics search "
                 "covers more records and is faster.")
 KEYWORD_HINT_BELOW = 5  # rows
@@ -106,11 +106,14 @@ def _note(*parts: str | None) -> str:
     return " ".join(p for p in parts if p)
 
 
-def _keyword_hint(keyword: str | None, naics: str | None, out: dict) -> str | None:
-    """KEYWORD_HINT for a keyword search without naics that returned fewer than KEYWORD_HINT_BELOW rows."""
+def _keyword_hint(keyword: str | None, naics: str | None, limit: int, cursor: str | None, out: dict) -> str | None:
+    """KEYWORD_HINT for a keyword search without naics whose whole answer is thin: a first page (no cursor) with
+    nothing more to read (no has_more, no next_cursor), no warning (a scan stopped early has its own advice), and
+    fewer rows than KEYWORD_HINT_BELOW and than the limit asked for."""
+    if not keyword or naics or cursor or out.get("has_more") or out.get("next_cursor") or out.get("warning"):
+        return None
     rows = out.get("results")
-    few = isinstance(rows, list) and len(rows) < KEYWORD_HINT_BELOW
-    return KEYWORD_HINT if keyword and not naics and few else None
+    return KEYWORD_HINT if isinstance(rows, list) and len(rows) < min(KEYWORD_HINT_BELOW, limit) else None
 
 
 async def _agency(name: str | None) -> tuple[str | None, str | None]:
@@ -162,7 +165,8 @@ async def search_contracts(
         type or "contract", naics=naics, state=state, keyword=keyword, set_aside=set_aside,
         posted_within_days=posted_within_days, open=open, agency=agency_id, limit=limit, cursor=cursor,
     )
-    return _parse(SearchResult, {**out, "note": _note(agency_note, LINK_RULE, _keyword_hint(keyword, naics, out))})
+    hint = _keyword_hint(keyword, naics, limit, cursor, out)
+    return _parse(SearchResult, {**out, "note": _note(agency_note, LINK_RULE, hint)})
 
 
 async def search_grants(
@@ -190,7 +194,8 @@ async def search_grants(
         "grant", naics=naics, keyword=keyword, posted_within_days=posted_within_days, open=open, limit=limit,
         cursor=cursor,
     )
-    return _parse(SearchResult, {**out, "note": _note(GRANT_NOTE, _keyword_hint(keyword, naics, out))})
+    hint = _keyword_hint(keyword, naics, limit, cursor, out)
+    return _parse(SearchResult, {**out, "note": _note(GRANT_NOTE, hint)})
 
 
 async def search_jobs(
@@ -314,8 +319,8 @@ async def search_awards(
         type, path=api.AWARDS_PATH, model=AwardRow, naics=naics, agency=agency_id, state=state, awardee=awardee,
         uei=uei and uei.upper(), keyword=keyword, awarded_within_days=awarded_within_days, limit=limit, cursor=cursor,
     )
-    return _parse(AwardSearchResult, {**out, "note": _note(AWARD_COVERAGE, agency_note, AWARD_LINK_RULE,
-                                                           _keyword_hint(keyword, naics, out))})
+    hint = _keyword_hint(keyword, naics, limit, cursor, out)
+    return _parse(AwardSearchResult, {**out, "note": _note(AWARD_COVERAGE, agency_note, AWARD_LINK_RULE, hint)})
 
 
 async def get_company(uei: Uei) -> Company:

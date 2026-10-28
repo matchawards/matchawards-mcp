@@ -672,3 +672,30 @@ async def test_keyword_hint_on_a_thin_keyword_search_without_naics(api, tool, ma
 async def test_no_keyword_hint_with_naics_enough_rows_or_no_keyword(api, tool, make, kwargs, n):
     api.replies = [ok(make(list(range(1, n + 1))))]
     assert tools.KEYWORD_HINT not in (await tool(**kwargs)).note
+
+
+@pytest.mark.parametrize("tool, make", SEARCHES)
+@pytest.mark.anyio
+async def test_keyword_hint_counts_rows_against_a_smaller_limit(api, tool, make):
+    api.replies = [ok(make([1, 2, 3]))]
+    assert tools.KEYWORD_HINT not in (await tool(keyword="roof", limit=3)).note  # got all it asked for
+    api.replies = [ok(make([1, 2]))]
+    assert (await tool(keyword="roof", limit=3)).note.endswith(tools.KEYWORD_HINT)
+
+
+@pytest.mark.parametrize("tool, make", SEARCHES)
+@pytest.mark.parametrize("case", ["cursor", "has_more", "warning"])
+@pytest.mark.anyio
+async def test_no_keyword_hint_on_a_later_page_more_to_read_or_a_warning(api, tool, make, case):
+    kwargs = {"keyword": "roof"}
+    body = make([1])
+    if case == "cursor":  # a later page
+        kwargs["cursor"] = "c1"
+    elif case == "has_more":  # more left to read (every page has more: the page cap stops the scan)
+        body = make([1], has_more=True, cursor="c2")
+    else:  # a skipped row: the result carries a warning
+        body = {**body, "results": body["results"] + [{"id": ["bad"]}]}
+    api.replies = [ok(body)]
+    out = await tool(**kwargs)
+    assert len(out.results) == 1 and (out.warning is not None) is (case == "warning")
+    assert tools.KEYWORD_HINT not in out.note
