@@ -228,7 +228,7 @@ It prints tool calls per tool and outcome, calls per family, real calls vs probe
 
 When `MATCHAWARDS_METRICS_TOKEN` is set, a second listener in the same process (`MATCHAWARDS_METRICS_HOST:MATCHAWARDS_METRICS_PORT`, default `127.0.0.1:9765`) serves `GET /metrics` in the Prometheus text format, with `Authorization: Bearer <token>` (401 without it). The `/mcp` port never serves `/metrics` (404): it trusts `X-Real-IP` from the proxy, so publish only the metrics port to the network Prometheus scrapes from. All metrics are in memory and reset on restart; every label value comes from a fixed set, never a client address, subject or argument.
 
-- `mcp_tool_calls_total{tool,outcome}` (counter): tool calls (the ledger writes one row for each).
+- `mcp_tool_calls_total{tool,outcome,family}` (counter): tool calls (the ledger writes one row for each), by User-Agent `family` (the ledger's fixed set: `openai-mcp`, `claude-user`, `claude`, `cursor`, ..., `prober` or `other`; never the raw User-Agent).
 - `mcp_tool_duration_seconds{tool}` (histogram, buckets 0.1 0.25 0.5 1 2.5 5 10 20 30 s): tool call latency, for the same calls.
 - `mcp_requests_total{method}` (counter): requests served on `/mcp` by JSON-RPC method.
 - `mcp_rejected_total{reason}` (counter): `rate_limit_client`, `rate_limit_prefix`, `rate_limit_subject`, `rate_limit_egress`, `rate_limit_global`, `size`, `host`, `path`, `method`.

@@ -176,7 +176,7 @@ def _tool(srv: MCPServer, fn, title: str):
             outcome = getattr(e, "outcome", "upstream_error")
             raise
         finally:
-            usage.metrics.inc("mcp_tool_calls_total", tool=fn.__name__, outcome=outcome)
+            usage.metrics.inc("mcp_tool_calls_total", tool=fn.__name__, outcome=outcome, family=req["family"])
             usage.metrics.observe("mcp_tool_duration_seconds", time.monotonic() - start, tool=fn.__name__)
             if linked:
                 usage.metrics.inc("mcp_linked_calls_total", tool=fn.__name__)

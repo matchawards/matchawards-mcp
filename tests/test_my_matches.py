@@ -323,7 +323,9 @@ async def test_a_refused_account_is_a_plain_error_end_to_end(linked, me_api, api
     assert result["isError"] is True and "_meta" not in result
     assert result["content"][0]["text"].endswith(tools.FORBIDDEN_TEXT)
     assert api.requests == []
-    assert usage.metrics.counts[("mcp_tool_calls_total", (("outcome", "forbidden"), ("tool", "my_matches")))] == 1
+    family = usage.classify_ua(ua)
+    assert usage.metrics.counts[("mcp_tool_calls_total", (("family", family), ("outcome", "forbidden"),
+                                                           ("tool", "my_matches")))] == 1
     assert not any(name == "mcp_link_challenges_total" for name, _ in usage.metrics.counts)
 
 
@@ -334,5 +336,6 @@ async def test_calls_are_counted_by_outcome(linked, me_api, api):
         await call(hc, ua=OPENAI_UA)
         await call(hc, token=TOKEN)
     counts = usage.metrics.counts
-    assert counts[("mcp_tool_calls_total", (("outcome", "link_required"), ("tool", "my_matches")))] == 1
-    assert counts[("mcp_tool_calls_total", (("outcome", "ok"), ("tool", "my_matches")))] == 1
+    assert counts[("mcp_tool_calls_total", (("family", "openai-mcp"), ("outcome", "link_required"),
+                                            ("tool", "my_matches")))] == 1
+    assert counts[("mcp_tool_calls_total", (("family", "claude-user"), ("outcome", "ok"), ("tool", "my_matches")))] == 1

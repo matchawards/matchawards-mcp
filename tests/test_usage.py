@@ -80,7 +80,8 @@ async def test_ledger_rows_for_ok_and_error_outcomes_without_arguments(api, usag
     raw = b"".join(p.read_bytes() for p in usage_db.parent.glob("usage.db*"))
     assert SECRET.encode() not in raw and b"203.0.113.7" not in raw
     text = usage.metrics.render()
-    assert 'mcp_tool_calls_total{outcome="ok",tool="search_contracts"} 1' in text
+    assert 'mcp_tool_calls_total{family="openai-mcp",outcome="ok",tool="search_contracts"} 1' in text
+    assert 'mcp_tool_calls_total{family="openai-mcp",outcome="invalid_input",tool="get_opportunity"} 1' in text
     assert 'mcp_agent_requests_total{family="openai-mcp"}' in text
     assert 'mcp_requests_total{method="tools/call"} 4' in text
 
@@ -465,6 +466,18 @@ async def test_probers_are_not_distinct_clients(api):
     assert 'mcp_tool_duration_seconds_count{tool="search_contracts"} 2' in text  # still timed
 
 
+@pytest.mark.anyio
+async def test_tool_calls_by_family_never_carry_the_raw_user_agent(api):
+    async with http() as hc:
+        for ua in ("uptime-monitor/2", "Claude-User/1.0", "acme-agent/9 (contact zebra@example.com)"):
+            await post(hc, call("search_contracts", {}), **{"User-Agent": ua})
+    text = usage.metrics.render()
+    for family in ("prober", "claude-user", "other"):
+        assert f'mcp_tool_calls_total{{family="{family}",outcome="ok",tool="search_contracts"}} 1' in text
+    assert "acme" not in text and "zebra" not in text and "uptime" not in text
+    assert 'mcp_tool_duration_seconds_count{tool="search_contracts"} 3' in text  # duration keeps its labels
+
+
 def seed(path):
     ledger = usage.Ledger.open(str(path))
     conn = sqlite3.connect(path)
@@ -518,7 +531,7 @@ def test_retention_days_defaults_to_180_and_rejects_bad_values():
 
 # An empty /metrics as 1.0.2 rendered it: with account linking off it must stay exactly this.
 METRICS_1_0_2 = """\
-# HELP mcp_tool_calls_total Tool calls by tool and outcome.
+# HELP mcp_tool_calls_total Tool calls by tool, outcome and User-Agent family.
 # TYPE mcp_tool_calls_total counter
 # HELP mcp_requests_total Requests served on /mcp by JSON-RPC method.
 # TYPE mcp_requests_total counter
@@ -602,7 +615,7 @@ async def test_linked_calls_are_counted_and_flagged_without_the_account(linked, 
     text = usage.metrics.render()
     assert 'mcp_linked_calls_total{tool="my_matches"} 2' in text
     assert 'mcp_distinct_callers{kind="account",window="24h"} 1' in text
-    assert 'mcp_tool_calls_total{outcome="link_required",tool="my_matches"} 1' in text
+    assert 'mcp_tool_calls_total{family="openai-mcp",outcome="link_required",tool="my_matches"} 1' in text
     got = sorted((r["tool"], r["outcome"], r["linked"]) for r in rows(usage_db))
     assert got == [("my_matches", "link_required", 0), ("my_matches", "ok", 1), ("my_matches", "ok", 1),
                    ("search_contracts", "ok", 0)]

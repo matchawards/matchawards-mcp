@@ -211,7 +211,7 @@ class Metrics:
     Every label value comes from a fixed set."""
 
     HELP = {
-        "mcp_tool_calls_total": "Tool calls by tool and outcome.",
+        "mcp_tool_calls_total": "Tool calls by tool, outcome and User-Agent family.",
         "mcp_requests_total": "Requests served on /mcp by JSON-RPC method.",
         "mcp_rejected_total": "Requests rejected before the MCP layer, by reason.",
         "mcp_agent_requests_total": "Requests served on /mcp by User-Agent family.",
