@@ -26,6 +26,13 @@ Award records may be incomplete (federal awards especially), so every award resu
 
 Every tool is read-only and needs no account (except `my_matches`, a hosted tool that exists only with account linking on; see Linked accounts): each declares `readOnlyHint`, `idempotentHint`, a title and `securitySchemes: [{"type": "noauth"}]` (in `_meta`). Results are structured: each tool publishes an `outputSchema` and returns `structuredContent`, with the same JSON as text for clients that read only text. Every result carries a `url` on matchawards.com (and a `sam_url` for federal notices), and the server asks the model to show them as markdown links. Links to matchawards.com carry `utm_source`, `utm_medium` and `utm_campaign` parameters naming the AI host the request came from (for example `utm_source=chatgpt`); links to other sites are left unchanged.
 
+### Changes in 1.1.0
+
+- Tool choice: `assess_opportunity` is described as the tool for fit, bid/no-bid and bid-brief questions, and `get_opportunity` points those questions to it (contracts and grants only).
+- Keyword hint: a contract, grant or award search by keyword with no NAICS code and only a few rows says in its note that keyword search matches titles only and points to `lookup_naics`.
+- Hosted server metrics: tool calls by User-Agent family, rows returned per list tool, MatchAwards API timing per endpoint and outcome, API requests per tool call, distinct ChatGPT conversations and first-seen ChatGPT users. Stats show the empty-result rate per tool; the ledger gains a `rows` column, added at open.
+- Hosted server: optional account linking and the `my_matches` tool (see Linked accounts). Off unless `MATCHAWARDS_AUTH_ISSUER` is set; with it off nothing else changes.
+
 ### Changes in 1.0.4
 
 - The result card renders in Claude: its `_meta.ui.domain` is left out for Claude, which accepts only its own sandbox domain; other hosts still get `https://matchawards.com`.
