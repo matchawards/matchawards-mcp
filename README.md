@@ -26,6 +26,10 @@ Award records may be incomplete (federal awards especially), so every award resu
 
 Every tool is read-only and needs no account (except `my_matches`, a hosted tool that exists only with account linking on; see Linked accounts): each declares `readOnlyHint`, `idempotentHint`, a title and `securitySchemes: [{"type": "noauth"}]` (in `_meta`). Results are structured: each tool publishes an `outputSchema` and returns `structuredContent`, with the same JSON as text for clients that read only text. Every result carries a `url` on matchawards.com (and a `sam_url` for federal notices), and the server asks the model to show them as markdown links. Links to matchawards.com carry `utm_source`, `utm_medium` and `utm_campaign` parameters naming the AI host the request came from (for example `utm_source=chatgpt`); links to other sites are left unchanged.
 
+### Changes in 1.1.1
+
+- Hosted server: `MATCHAWARDS_API_MAX_IN_FLIGHT` (default 16) caps the requests to the public API in flight at once for the whole server. A request waits up to 5 seconds for a free slot (less when the tool's own time limit is nearer), then the tool answers "busy, retry" without calling the API. The per-minute API budget is spent only once a slot is held.
+
 ### Changes in 1.1.0
 
 - Tool choice: `assess_opportunity` is described as the tool for fit, bid/no-bid and bid-brief questions, and `get_opportunity` points those questions to it (contracts and grants only).
