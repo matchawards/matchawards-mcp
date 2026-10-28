@@ -60,6 +60,11 @@ CARD_INSTRUCTIONS = "To show the user a list, call show_results last with the id
 SHOW_HINT = ("When you are done searching, call show_results once with the best ids; it shows them as a card the "
              "user can pick from.")
 SHOW_SOURCES = ("search_contracts", "search_grants", "my_matches")
+# The list-returning tools, with the result field whose length is the rows a call answered with
+# (mcp_tool_result_rows and the ledger's rows column). Other tools record no row count.
+RESULT_ROWS = {"search_contracts": "results", "search_grants": "results", "search_jobs": "results",
+               "search_awards": "results", "lookup_naics": "results", "find_teaming_partners": "partners",
+               "show_results": "results", "my_matches": "results"}
 
 # HTTP mode only: the usage ledger (None when disabled, and always in stdio mode) and the request being served.
 ledger: usage.Ledger | None = None
@@ -151,8 +156,8 @@ def _tool(srv: MCPServer, fn, title: str):
     outputSchema.
 
     In --http mode each call that reaches the tool is counted, timed and written to the usage ledger: tool name,
-    outcome, latency, who called (see HttpGuard) and whether it ran with a linked account. Never the arguments, nor
-    which account. Outside an HTTP request (stdio) it records nothing."""
+    outcome, latency, who called (see HttpGuard), whether it ran with a linked account and, for a list-returning
+    tool that answered, how many rows (RESULT_ROWS). Never the arguments, nor which account. Outside an HTTP request (stdio) it records nothing."""
 
     if WIDGETS and fn.__name__ in SHOW_SOURCES:
         fn = _with_show_hint(fn)
@@ -164,13 +169,15 @@ def _tool(srv: MCPServer, fn, title: str):
             return await fn(*args, **kwargs)
         auth = linking.auth.get()
         linked = isinstance(auth, linking.Profile)
-        start, outcome = time.monotonic(), "internal_error"
+        start, outcome, rows = time.monotonic(), "internal_error", None
         try:
             result = await fn(*args, **kwargs)
             # partial: a composite tool's budget or deadline cut it short (it still answers with what it has).
             # link_required: a linked tool answered with the challenge (ChatGPT, or no check in this request).
             outcome = ("link_required" if isinstance(result, CallToolResult) and result.is_error
                        else "partial" if getattr(result, "_partial", False) else "ok")
+            listed = getattr(result, RESULT_ROWS.get(fn.__name__, ""), None) if outcome != "link_required" else None
+            rows = len(listed) if isinstance(listed, list) else None
             return result
         except ToolError as e:
             outcome = getattr(e, "outcome", "upstream_error")
@@ -178,6 +185,8 @@ def _tool(srv: MCPServer, fn, title: str):
         finally:
             usage.metrics.inc("mcp_tool_calls_total", tool=fn.__name__, outcome=outcome, family=req["family"])
             usage.metrics.observe("mcp_tool_duration_seconds", time.monotonic() - start, tool=fn.__name__)
+            if rows is not None:
+                usage.metrics.observe("mcp_tool_result_rows", rows, tool=fn.__name__)
             if linked:
                 usage.metrics.inc("mcp_linked_calls_total", tool=fn.__name__)
             if outcome == "link_required":  # its error, as the tool chose it: insufficient_scope or invalid_token
@@ -185,7 +194,7 @@ def _tool(srv: MCPServer, fn, title: str):
                                   error=linking.INSUFFICIENT if auth == linking.INSUFFICIENT else linking.INVALID)
             if ledger is not None:
                 ledger.submit(usage.Ledger.write_call, fn.__name__, outcome, req["client"], req["ua"],
-                              req["family"], req["fp"], round((time.monotonic() - start) * 1000), linked)
+                              req["family"], req["fp"], round((time.monotonic() - start) * 1000), linked, rows)
 
     # One line per paragraph: the docstring's wrapping never reaches the published description.
     description = "\n\n".join(" ".join(p.split()) for p in inspect.cleandoc(fn.__doc__).split("\n\n"))

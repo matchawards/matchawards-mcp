@@ -128,6 +128,7 @@ def fingerprint(subject: bytes, salt: bytes | None) -> str | None:
 
 
 BUCKETS = (0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30)  # seconds; +Inf is implied
+ROW_BUCKETS = (0, 1, 5, 10, 25, 50)  # rows a list-returning tool call answered with
 WINDOWS = (("1h", 3600), ("24h", 86400))
 # Lowercase substring of clientInfo.name -> label. First match wins.
 CLIENT_BUCKETS = (("chatgpt", "chatgpt"), ("openai", "chatgpt"), ("claude", "claude"), ("cursor", "cursor"),
@@ -221,7 +222,11 @@ class Metrics:
                                      "(chatgpt, claude, other) and error.",
         "mcp_linked_calls_total": "Tool calls that ran with a linked account, by tool.",
     }
-    HISTOGRAM_HELP = {"mcp_tool_duration_seconds": "Tool call latency in seconds, by tool."}
+    HISTOGRAMS = {  # name -> (help, buckets)
+        "mcp_tool_duration_seconds": ("Tool call latency in seconds, by tool.", BUCKETS),
+        "mcp_tool_result_rows": ("Rows a successful call of a list-returning tool answered with, by tool.",
+                                 ROW_BUCKETS),
+    }
     # Rendered only with account linking on, like the distinct "account" kind: off, /metrics is what it was without.
     LINK_ONLY = ("mcp_link_challenges_total", "mcp_linked_calls_total")
 
@@ -235,9 +240,10 @@ class Metrics:
             self.counts[(name, tuple(sorted(labels.items())))] += 1
 
     def observe(self, name: str, value: float, **labels: str) -> None:
-        i = next((i for i, b in enumerate(BUCKETS) if value <= b), len(BUCKETS))
+        buckets = self.HISTOGRAMS[name][1]
+        i = next((i for i, b in enumerate(buckets) if value <= b), len(buckets))
         with self.lock:
-            h = self.histograms.setdefault((name, tuple(sorted(labels.items()))), [0] * (len(BUCKETS) + 1) + [0.0])
+            h = self.histograms.setdefault((name, tuple(sorted(labels.items()))), [0] * (len(buckets) + 1) + [0.0])
             h[i] += 1
             h[-1] += value
 
@@ -256,11 +262,11 @@ class Metrics:
             for labels, n in series:
                 body = _labels(labels)
                 lines.append(f"{name}{{{body}}} {n}" if body else f"{name} {n}")
-        for name, text in self.HISTOGRAM_HELP.items():
+        for name, (text, buckets) in self.HISTOGRAMS.items():
             lines += [f"# HELP {name} {text}", f"# TYPE {name} histogram"]
             for labels, h in sorted((labels, h) for (metric, labels), h in histograms.items() if metric == name):
                 total = 0
-                for le, n in zip((*map(str, BUCKETS), "+Inf"), h[:-1]):
+                for le, n in zip((*map(str, buckets), "+Inf"), h[:-1]):
                     total += n
                     lines.append(f"{name}_bucket{{{_labels((*labels, ('le', le)))}}} {total}")
                 lines += [f"{name}_sum{{{_labels(labels)}}} {round(h[-1], 6)}",
@@ -284,7 +290,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS tool_calls (
   ts TEXT NOT NULL, tool TEXT NOT NULL, outcome TEXT NOT NULL, client_key TEXT NOT NULL,
   ua TEXT NOT NULL, family TEXT NOT NULL, caller_fp TEXT, latency_ms INTEGER NOT NULL,
-  linked INTEGER NOT NULL DEFAULT 0);
+  linked INTEGER NOT NULL DEFAULT 0, rows INTEGER);
 CREATE INDEX IF NOT EXISTS tool_calls_ts ON tool_calls (ts);
 CREATE TABLE IF NOT EXISTS transport_daily (
   day TEXT NOT NULL, client_key TEXT NOT NULL, method TEXT NOT NULL, client_name TEXT NOT NULL,
@@ -299,9 +305,11 @@ def _has_column(conn, table: str, column: str) -> bool:
 
 def migrate(conn) -> None:
     """Bring a ledger made by an older version up to SCHEMA: tool_calls.linked (1.1) is added when missing, 0 for
-    the rows already there."""
+    the rows already there, and tool_calls.rows (1.1), NULL for them."""
     if not _has_column(conn, "tool_calls", "linked"):
         conn.execute("ALTER TABLE tool_calls ADD COLUMN linked INTEGER NOT NULL DEFAULT 0")
+    if not _has_column(conn, "tool_calls", "rows"):
+        conn.execute("ALTER TABLE tool_calls ADD COLUMN rows INTEGER")
 
 
 def _now() -> datetime:
@@ -377,12 +385,14 @@ class Ledger:
         self.pruned_day = now.date().isoformat()  # set only after the deletes, so a failed prune is retried
 
     @staticmethod
-    def write_call(conn, tool, outcome, client_key, ua, family, caller_fp, latency_ms, linked=False) -> None:
-        """One tool call. linked: it ran with a linked account (which one is never stored)."""
+    def write_call(conn, tool, outcome, client_key, ua, family, caller_fp, latency_ms, linked=False,
+                   rows=None) -> None:
+        """One tool call. linked: it ran with a linked account (which one is never stored). rows: the rows a
+        list-returning tool answered with (None for other tools and for calls that failed)."""
         conn.execute("INSERT INTO tool_calls (ts, tool, outcome, client_key, ua, family, caller_fp, latency_ms, "
-                     "linked) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     "linked, rows) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                      (_now().isoformat(timespec="seconds"), tool, outcome, client_key, ua, family, caller_fp,
-                      latency_ms, int(linked)))
+                      latency_ms, int(linked), rows))
 
     @staticmethod
     def write_transport(conn, client_key, method, name, version, ua) -> None:
@@ -444,6 +454,11 @@ def stats(conn, days: int) -> str:
     if _has_column(conn, "tool_calls", "linked"):  # a ledger no 1.1 server has opened yet has none
         [(linked,)] = q("SELECT COUNT(*) FROM tool_calls WHERE ts >= ? AND linked = 1", ts)
         out.append(f"Tool calls with a linked account: {linked}")
+    if _has_column(conn, "tool_calls", "rows"):
+        _table(out, "Empty results by tool (list tools, successful calls)", ("tool", "calls", "empty", "empty rate"), [
+            (tool, n, empty, f"{100 * empty / n:.1f}%") for tool, n, empty in q(
+                "SELECT tool, COUNT(*), SUM(rows = 0) FROM tool_calls WHERE ts >= ? AND rows IS NOT NULL "
+                "GROUP BY 1 ORDER BY 1", ts)])
     by_method, by_client = Counter(), Counter()
     for method, name, version, count, _ in transport:
         by_method[method] += count

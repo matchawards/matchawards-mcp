@@ -18,7 +18,8 @@ from matchawards_mcp import api as ma_api
 from test_http import LEGACY, egress, http  # noqa: F401  (egress is a fixture)
 from test_linking import CLAUDE_UA, ME, OPENAI_UA, TOKEN, issuer, linked, me_api  # noqa: F401  (fixtures)
 from test_linking import call as link_call
-from test_server import api, anyio_backend, page  # noqa: F401  (fixtures)
+from test_server import api, anyio_backend, page, row  # noqa: F401  (fixtures)
+from test_data_tools import awards_page
 
 SECRET = "zebracornsecret"  # an argument value that must never be stored
 
@@ -344,6 +345,19 @@ def test_histogram_buckets_are_cumulative():
     assert "# TYPE mcp_tool_duration_seconds histogram" in text
 
 
+def test_result_rows_histogram_buckets():
+    m = usage.Metrics()
+    for n in (0, 0, 1, 3, 10, 49, 60):
+        m.observe("mcp_tool_result_rows", n, tool="search_contracts")
+    text = m.render()
+    got = {le: int(line.rsplit(" ", 1)[1]) for line in text.splitlines()
+           if line.startswith("mcp_tool_result_rows_bucket") for le in [line.split('le="')[1].split('"')[0]]}
+    assert got == {"0": 2, "1": 3, "5": 4, "10": 5, "25": 5, "50": 6, "+Inf": 7}
+    assert 'mcp_tool_result_rows_count{tool="search_contracts"} 7' in text
+    assert 'mcp_tool_result_rows_sum{tool="search_contracts"} 123' in text
+    assert "# TYPE mcp_tool_result_rows histogram" in text
+
+
 def test_distinct_windows_and_hashing(monkeypatch):
     d = usage.Distinct()
     now = [1_000_000.0]
@@ -478,6 +492,46 @@ async def test_tool_calls_by_family_never_carry_the_raw_user_agent(api):
     assert 'mcp_tool_duration_seconds_count{tool="search_contracts"} 3' in text  # duration keeps its labels
 
 
+@pytest.mark.anyio
+async def test_list_tools_record_the_rows_they_answered_with(api, usage_db, monkeypatch):
+    monkeypatch.setattr(server, "WIDGETS", True)  # show_results is listed
+    monkeypatch.setattr(server, "mcp", server.build_mcp())
+    detail = {**row(1), "type": "federal", "naics": {"code": "541512"}, "agency_id": "dept_of_the_army",
+              "state": "VA"}
+
+    def reply(req):
+        path = req.url.path
+        if path.endswith("/opportunities/1"):
+            return httpx.Response(200, json={"as_of": "x", "result": detail})
+        if path.endswith("/opportunities/9"):
+            return httpx.Response(404, json={"error": "not_found"})
+        if path.endswith("/awards"):
+            return httpx.Response(200, json=awards_page([1, 2, 3]))
+        if path.endswith("/naics"):
+            return httpx.Response(200, json={"as_of": "x", "results": [{"code": "541512", "title": "T"}]})
+        if req.url.params.get("type") == "job":
+            return httpx.Response(500, json={"error": "internal_error"})
+        return httpx.Response(200, json=page([] if req.url.params.get("q") == "nothing" else [1, 2]))
+
+    api.replies = [reply]
+    async with http() as hc:
+        for name, args in [("search_contracts", {"state": "VA"}), ("search_grants", {"keyword": "nothing"}),
+                           ("search_jobs", {}), ("lookup_naics", {"query": "it"}), ("get_opportunity", {"id": "1"}),
+                           ("find_teaming_partners", {"id": "1"}), ("show_results", {"ids": ["1", "9"]}),
+                           ("search_awards", {})]:
+            await post(hc, call(name, args))
+    got = {r["tool"]: (r["outcome"], r["rows"]) for r in rows(usage_db)}
+    assert got == {"search_contracts": ("ok", 2), "search_grants": ("ok", 0), "search_jobs": ("upstream_error", None),
+                   "lookup_naics": ("ok", 1), "get_opportunity": ("ok", None), "find_teaming_partners": ("ok", 3),
+                   "show_results": ("ok", 1), "search_awards": ("ok", 3)}
+    text = usage.metrics.render()
+    assert 'mcp_tool_result_rows_bucket{tool="search_grants",le="0"} 1' in text
+    assert 'mcp_tool_result_rows_sum{tool="find_teaming_partners"} 3' in text
+    assert 'mcp_tool_result_rows_count{tool="show_results"} 1' in text
+    assert 'mcp_tool_result_rows_count{tool="search_jobs"}' not in text  # a failed call has no rows
+    assert 'mcp_tool_result_rows_count{tool="get_opportunity"}' not in text  # not a list tool
+
+
 def seed(path):
     ledger = usage.Ledger.open(str(path))
     conn = sqlite3.connect(path)
@@ -510,6 +564,22 @@ def test_stats_command_on_a_seeded_db(usage_db, capsys):
     assert "openai-mcp  1.0.0    2" in out
 
 
+def test_stats_command_prints_the_empty_result_rate_per_list_tool(usage_db, capsys):
+    usage.Ledger.open(str(usage_db))
+    conn = sqlite3.connect(usage_db)
+    with conn:
+        for tool, outcome, n in [("search_contracts", "ok", 0), ("search_contracts", "ok", 3),
+                                 ("search_contracts", "partial", 0), ("search_grants", "ok", 5),
+                                 ("search_grants", "upstream_error", None), ("get_opportunity", "ok", None)]:
+            usage.Ledger.write_call(conn, tool, outcome, "192.0.2.0/24", "x", "other", None, 5, False, n)
+    conn.close()
+    server.main(["stats", "--db", str(usage_db)])
+    out = capsys.readouterr().out
+    table = out.split("Empty results by tool")[1].split("\n\n")[0]
+    lines = [" ".join(line.split()) for line in table.splitlines()[1:]]
+    assert lines == ["tool calls empty empty rate", "search_contracts 3 2 66.7%", "search_grants 1 0 0.0%"]
+
+
 def test_stats_command_on_an_empty_or_missing_db(usage_db, capsys):
     usage.Ledger.open(str(usage_db))
     server.main(["stats", "--db", str(usage_db)])
@@ -529,8 +599,9 @@ def test_retention_days_defaults_to_180_and_rejects_bad_values():
 
 # --- Account linking: challenges, linked calls, distinct accounts, the ledger's linked flag ------------------------
 
-# An empty /metrics as 1.0.2 rendered it: with account linking off it must stay exactly this.
-METRICS_1_0_2 = """\
+# An empty /metrics with account linking off: as 1.0.2 rendered it, plus the 1.1 metrics that do not depend on
+# linking. Linking off adds nothing to it.
+METRICS_OFF = """\
 # HELP mcp_tool_calls_total Tool calls by tool, outcome and User-Agent family.
 # TYPE mcp_tool_calls_total counter
 # HELP mcp_requests_total Requests served on /mcp by JSON-RPC method.
@@ -546,6 +617,8 @@ METRICS_1_0_2 = """\
 mcp_ledger_errors_total 0
 # HELP mcp_tool_duration_seconds Tool call latency in seconds, by tool.
 # TYPE mcp_tool_duration_seconds histogram
+# HELP mcp_tool_result_rows Rows a successful call of a list-returning tool answered with, by tool.
+# TYPE mcp_tool_result_rows histogram
 # HELP mcp_distinct_callers Distinct callers in the window: client = /24 or /48 without probers or own tests, \
 chatgpt_subject = x-openai-subject from ChatGPT egress. Reset on restart.
 # TYPE mcp_distinct_callers gauge
@@ -561,7 +634,7 @@ mcp_distinct_evictions_total{kind="chatgpt_subject"} 0
 
 
 def test_off_metrics_are_the_same_as_without_linking():
-    assert usage.metrics.render() == METRICS_1_0_2
+    assert usage.metrics.render() == METRICS_OFF
     usage.distinct.see("account", "123")  # nothing feeds it while off; even then it stays out
     assert "account" not in usage.metrics.render() and "link" not in usage.metrics.render()
 
@@ -619,6 +692,8 @@ async def test_linked_calls_are_counted_and_flagged_without_the_account(linked, 
     got = sorted((r["tool"], r["outcome"], r["linked"]) for r in rows(usage_db))
     assert got == [("my_matches", "link_required", 0), ("my_matches", "ok", 1), ("my_matches", "ok", 1),
                    ("search_contracts", "ok", 0)]
+    mine = sorted((r["outcome"], r["rows"]) for r in rows(usage_db) if r["tool"] == "my_matches")
+    assert mine == [("link_required", None), ("ok", 1), ("ok", 1)]  # the challenge answers no rows
     raw = b"".join(p.read_bytes() for p in usage_db.parent.glob("usage.db*"))
     assert sub.encode() not in raw and b"tok-a" not in raw
     assert all(sub not in k for k in usage.distinct.seen["account"])  # a salted hash only
@@ -636,7 +711,7 @@ CREATE TABLE transport_daily (
 """
 
 
-def test_a_ledger_from_before_linking_gets_the_linked_column(usage_db, capsys):
+def test_a_ledger_from_before_1_1_gets_the_linked_and_rows_columns(usage_db, capsys):
     conn = sqlite3.connect(usage_db)
     with conn:
         conn.executescript(OLD_SCHEMA)
@@ -644,11 +719,13 @@ def test_a_ledger_from_before_linking_gets_the_linked_column(usage_db, capsys):
                      (usage._now().isoformat(timespec="seconds"),))
     conn.close()
     server.main(["stats", "--db", str(usage_db)])  # read-only, not migrated yet: still prints
-    assert "Tool calls with a linked account" not in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Tool calls with a linked account" not in out and "Empty results" not in out
     ledger = usage.Ledger.open(str(usage_db))
     ledger.submit(usage.Ledger.write_call, "my_matches", "ok", "192.0.2.0/24", "x", "other", None, 7, True)
     server.ledger = ledger
-    assert sorted((r["tool"], r["linked"]) for r in rows(usage_db)) == [("my_matches", 1), ("search_jobs", 0)]
+    assert sorted((r["tool"], r["linked"], r["rows"]) for r in rows(usage_db)) == [
+        ("my_matches", 1, None), ("search_jobs", 0, None)]  # rows: added too, NULL for the older rows
     assert usage.Ledger.open(str(usage_db)) is not None  # a second open: already there, nothing to add
     server.main(["stats", "--db", str(usage_db)])
     assert "Tool calls with a linked account: 1" in capsys.readouterr().out
