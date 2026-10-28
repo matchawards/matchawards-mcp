@@ -1,0 +1,35 @@
+{
+  "id": "matchawards",
+  "name": "MatchAwards",
+  "description": "Find US government contracts, grants and jobs, see who won similar work, and size up an opportunity before you bid. Read-only, no account. Backed by the hosted MatchAwards MCP server.",
+  "activation": {
+    "onStartup": false
+  },
+  "categories": [
+    "sales-marketing"
+  ],
+  "contracts": {
+    "tools": [
+      "assess_opportunity",
+      "find_teaming_partners",
+      "get_company",
+      "get_opportunity",
+      "lookup_naics",
+      "search_awards",
+      "search_contracts",
+      "search_grants",
+      "search_jobs"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "endpoint": {
+        "type": "string",
+        "default": "https://matchawards.com/mcp",
+        "description": "URL of the MatchAwards MCP server the tools call. Defaults to the hosted server, https://matchawards.com/mcp. Only an https URL on matchawards.com or one of its subdomains is accepted, or an http(s) URL on localhost, 127.0.0.1 or [::1] for local development; any other value makes every tool call fail with an error naming this setting."
+      }
+    }
+  }
+}

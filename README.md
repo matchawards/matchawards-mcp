@@ -127,6 +127,10 @@ Add this to `.vscode/mcp.json` in your workspace:
 
 Any MCP client that can start a stdio server works. The command is `uvx matchawards-mcp`.
 
+### OpenClaw
+
+[`integrations/openclaw-plugin`](integrations/openclaw-plugin) holds a native OpenClaw plugin (`@matchawards/openclaw-plugin` on ClawHub) whose nine tools call the hosted endpoint, and a ClawHub skill, `matchawards`, that teaches an agent the public REST API with curl. Both are read-only and need no account. The plugin's `tools.json` is generated from this server's tool list (`integrations/openclaw-plugin/scripts/gen_tools.py`), and the test suite fails when it is out of date.
+
 ### Run the HTTP server yourself
 
 `matchawards-mcp --http` serves the same tools over stateless Streamable HTTP (JSON replies, no sessions, no SSE) at `http://127.0.0.1:8765/mcp`:
