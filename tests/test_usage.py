@@ -716,8 +716,8 @@ mcp_chatgpt_subjects_new_total 0
 # TYPE mcp_tool_result_rows histogram
 # HELP mcp_tool_api_pages MatchAwards API requests one tool call made, by tool.
 # TYPE mcp_tool_api_pages histogram
-# HELP mcp_api_duration_seconds MatchAwards API request latency in seconds, by endpoint and outcome (ok, error, \
-timeout).
+# HELP mcp_api_duration_seconds MatchAwards API request latency in seconds, by endpoint and outcome (ok, \
+client_error, error, timeout).
 # TYPE mcp_api_duration_seconds histogram
 # HELP mcp_distinct_callers Distinct callers in the window: client = /24 or /48 without probers or own tests, \
 chatgpt_subject = x-openai-subject from ChatGPT egress, chatgpt_session = x-openai-session (conversations) from \
@@ -865,6 +865,10 @@ async def test_api_requests_are_timed_by_endpoint_and_outcome(api):
         lambda req: httpx.Response(503, json={"error": "timeout"}, headers={"Retry-After": "5"}),
         lambda req: (_ for _ in ()).throw(httpx.ReadTimeout("slow", request=req)),
         lambda req: httpx.Response(200, json={"as_of": "x", "results": []}),
+        lambda req: httpx.Response(500, json={"error": "internal_error"}),
+        lambda req: httpx.Response(429, headers={"Retry-After": "3"}),
+        lambda req: (_ for _ in ()).throw(httpx.ConnectError("refused", request=req)),
+        lambda req: httpx.Response(503, json={"error": "grants_unavailable"}),
     ]
     async with http() as hc:
         await post(hc, call("search_contracts", {}))
@@ -872,10 +876,15 @@ async def test_api_requests_are_timed_by_endpoint_and_outcome(api):
         await post(hc, call("get_company", {"uei": "C3KXNLTAAY98"}))
         await post(hc, call("search_grants", {}))
         await post(hc, call("lookup_naics", {"query": "roofing"}))
+        await post(hc, call("get_opportunity", {"id": "8"}))
+        await post(hc, call("get_opportunity", {"id": "9"}))
+        await post(hc, call("get_company", {"uei": "C3KXNLTAAY99"}))
+        await post(hc, call("search_grants", {}))
     counts = series(usage.metrics.render(), "mcp_api_duration_seconds_count")
-    assert counts == {'{endpoint="search",outcome="ok"}': 1, '{endpoint="opportunity",outcome="error"}': 1,
+    assert counts == {'{endpoint="search",outcome="ok"}': 1, '{endpoint="opportunity",outcome="client_error"}': 2,
                       '{endpoint="company",outcome="timeout"}': 1, '{endpoint="search",outcome="timeout"}': 1,
-                      '{endpoint="naics",outcome="ok"}': 1}
+                      '{endpoint="naics",outcome="ok"}': 1, '{endpoint="opportunity",outcome="error"}': 1,
+                      '{endpoint="company",outcome="error"}': 1, '{endpoint="search",outcome="error"}': 1}
     text = usage.metrics.render()
     assert 'mcp_api_duration_seconds_bucket{endpoint="search",outcome="ok",le="30"} 1' in text
     assert "117402307943537453" not in text and "C3KXNLTAAY98" not in text
@@ -889,10 +898,19 @@ async def test_a_request_cut_off_by_a_deadline_is_a_timeout(monkeypatch):
     seen = []
     monkeypatch.setattr(ma_api, "on_request", lambda *a: seen.append(a))
     client = httpx.AsyncClient(transport=httpx.MockTransport(slow), base_url="https://api.test")
+    deadline = asyncio.get_running_loop().time() + 0.05
     with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(ma_api.send(client, "awards", ma_api.AWARDS_PATH), 0.05)
+        await asyncio.wait_for(ma_api.send(client, "awards", ma_api.AWARDS_PATH, deadline), 0.05)
     [(label, outcome, seconds)] = seen
     assert (label, outcome) == ("awards", "timeout") and 0 < seconds < 5
+    # The client went away (or shutdown) before any deadline: no API outcome, nothing recorded.
+    for deadline in (None, asyncio.get_running_loop().time() + 60):
+        task = asyncio.ensure_future(ma_api.send(client, "awards", ma_api.AWARDS_PATH, deadline))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert len(seen) == 1
 
 
 @pytest.mark.anyio
@@ -962,6 +980,29 @@ async def test_the_profile_check_is_timed_as_me(linked, me_api, api, monkeypatch
         me_api.reply = lambda req: httpx.Response(401)
         await link_call(hc, token="another-token")
     counts = series(usage.metrics.render(), "mcp_api_duration_seconds_count")
-    assert counts['{endpoint="me",outcome="ok"}'] == 1 and counts['{endpoint="me",outcome="error"}'] == 1
+    assert counts['{endpoint="me",outcome="ok"}'] == 1 and counts['{endpoint="me",outcome="client_error"}'] == 1
     # The check runs before the tool: my_matches counts only its own searches.
     assert "mcp_tool_api_pages_count{tool=\"my_matches\"} 1" in usage.metrics.render()
+
+
+@pytest.mark.parametrize("slow, outcome", [("/awards", "partial"), ("/opportunities/1", "upstream_timeout")])
+@pytest.mark.anyio
+async def test_a_composite_deadline_cut_is_a_timed_out_api_request(usage_db, monkeypatch, slow, outcome):
+    detail = {**row(1), "type": "federal", "naics": {"code": "541512"}, "agency_id": "dept_of_the_army"}
+
+    async def handler(req):
+        if req.url.path.endswith(slow):
+            await asyncio.sleep(5)
+        if req.url.path.endswith("/opportunities/1"):
+            return httpx.Response(200, json={"as_of": "x", "result": detail})
+        return httpx.Response(200, json=awards_page([1]))
+
+    monkeypatch.setattr(ma_api, "client", httpx.AsyncClient(transport=httpx.MockTransport(handler),
+                                                            base_url="https://api.test"))
+    monkeypatch.setattr(server.tools, "COMPOSITE_DEADLINE_S", 0.2)
+    async with http() as hc:
+        await post(hc, call("assess_opportunity", {"id": "1"}))
+    assert [r["outcome"] for r in rows(usage_db)] == [outcome]
+    counts = series(usage.metrics.render(), "mcp_api_duration_seconds_count")
+    label = "awards" if slow == "/awards" else "opportunity"
+    assert counts[f'{{endpoint="{label}",outcome="timeout"}}'] == 1

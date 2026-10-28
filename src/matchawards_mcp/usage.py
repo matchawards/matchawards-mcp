@@ -233,7 +233,7 @@ class Metrics:
                                  ROW_BUCKETS),
         "mcp_tool_api_pages": ("MatchAwards API requests one tool call made, by tool.", PAGE_BUCKETS),
         "mcp_api_duration_seconds": ("MatchAwards API request latency in seconds, by endpoint and outcome (ok, "
-                                     "error, timeout).", BUCKETS),
+                                     "client_error, error, timeout).", BUCKETS),
     }
     # Rendered only with account linking on, like the distinct "account" kind: off, /metrics is what it was without.
     LINK_ONLY = ("mcp_link_challenges_total", "mcp_linked_calls_total")

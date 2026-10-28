@@ -114,34 +114,61 @@ def endpoint(path: str) -> str:
     return "company" if path.startswith(COMPANIES_PATH + "/") else "other"
 
 
-async def send(http: httpx.AsyncClient, label: str, url: str, **kwargs) -> httpx.Response:
-    """http.get(url, **kwargs), counted in the tool call's requests (tool_requests) and timed (on_request) under
-    `label`, with outcome ok (an answer below 400), timeout (no answer within the client timeout, the API's own
-    timeout answer, or cut off by a tool's deadline) or error. Changes nothing about the request."""
+# A request cancelled this close to (or past) its deadline was cut off by it: wait_for may fire within the clock's
+# resolution of the deadline.
+DEADLINE_SLACK_S = 0.01
+
+
+def _outcome(r: httpx.Response) -> str:
+    """The mcp_api_duration_seconds outcome of an API answer: ok (below 400), timeout (the API's own timeout
+    answer: 503 with error 'timeout'), client_error (any other 4xx: a bad parameter or id, 401/403 from /me, 429)
+    or error (5xx)."""
+    if r.status_code < 400:
+        return "ok"
+    if r.status_code == 503 and _error_code(r) == "timeout":
+        return "timeout"
+    return "client_error" if r.status_code < 500 else "error"
+
+
+async def send(http: httpx.AsyncClient, label: str, url: str, deadline: float | None = None,
+               **kwargs) -> tuple[httpx.Response, str]:
+    """(http.get(url, **kwargs), its _outcome), counted in the tool call's requests (tool_requests) and timed
+    (on_request) under `label`. Changes nothing about the request.
+
+    No answer within the client timeout is outcome timeout, as is a cancellation at `deadline` (event-loop time:
+    asyncio.wait_for cut the request off at a tool's time limit); any other transport failure is error. Any other
+    cancellation (the client went away, shutdown) is not an API outcome and records nothing."""
     if (count := tool_requests.get()) is not None:
         count[0] += 1
-    start, outcome = time.monotonic(), "error"
+    start, outcome = time.monotonic(), None
     try:
         r = await http.get(url, **kwargs)
-        outcome = ("ok" if r.status_code < 400
-                   else "timeout" if r.status_code == 503 and _error_code(r) == "timeout" else "error")
-        return r
-    except (httpx.TimeoutException, asyncio.CancelledError):  # cancelled: asyncio.wait_for in search()
+        outcome = _outcome(r)
+        return r, outcome
+    except httpx.TimeoutException:
         outcome = "timeout"
         raise
+    except asyncio.CancelledError:
+        if deadline is not None and asyncio.get_running_loop().time() >= deadline - DEADLINE_SLACK_S:
+            outcome = "timeout"
+        raise
+    except Exception:
+        outcome = "error"
+        raise
     finally:
-        if on_request is not None:
+        if on_request is not None and outcome is not None:
             on_request(label, outcome, time.monotonic() - start)
 
 
-async def get(path: str, params: dict[str, Any] | None = None, not_found: str | None = None) -> dict[str, Any]:
+async def get(path: str, params: dict[str, Any] | None = None, not_found: str | None = None,
+              deadline: float | None = None) -> dict[str, Any]:
     """GET one API path; turn every failure into a ToolError the model can act on. `not_found` replaces the
-    wording of a 404."""
+    wording of a 404. `deadline`: the event-loop time a caller's asyncio.wait_for cuts it off at (timing only)."""
     query = {k: v for k, v in (params or {}).items() if v is not None and v != ""}  # "" = unset, e.g. cursor=""
     if api_budget is not None and (wait := api_budget.check("api")):
         raise fail("busy", f"MatchAwards is busy right now. Retry in {wait} seconds.")
     try:
-        r = await send(client, endpoint(path), path, params=query)
+        r, outcome = await send(client, endpoint(path), path, deadline, params=query)
     except httpx.TimeoutException:
         raise ToolError(
             f"MatchAwards did not answer within {TIMEOUT_S:.0f} seconds. Retry once; if it fails again, "
@@ -153,7 +180,7 @@ async def get(path: str, params: dict[str, Any] | None = None, not_found: str | 
         ) from None
     if r.status_code == 429:
         raise fail("rate_limited_upstream", error_message(r))
-    if r.status_code == 503 and _error_code(r) == "timeout":
+    if outcome == "timeout":  # the API's own timeout answer
         raise fail("upstream_timeout", error_message(r))
     if r.status_code == 404 and not_found:
         raise fail("invalid_input", not_found)
@@ -171,9 +198,10 @@ async def get(path: str, params: dict[str, Any] | None = None, not_found: str | 
     return data
 
 
-async def get_one(id: str) -> dict[str, Any]:
-    """One opportunity: the API answers {as_of, result: {row..., description, contacts}}; return the row with as_of."""
-    data = await get(f"{SEARCH_PATH}/{id}")
+async def get_one(id: str, deadline: float | None = None) -> dict[str, Any]:
+    """One opportunity: the API answers {as_of, result: {row..., description, contacts}}; return the row with as_of.
+    `deadline` as in get()."""
+    data = await get(f"{SEARCH_PATH}/{id}", deadline=deadline)
     result = data.get("result")
     if not isinstance(result, dict):
         raise fail("bad_response", "MatchAwards returned an unexpected API response (no result object).")
@@ -210,8 +238,8 @@ async def search(type_: str, limit: int = 20, keyword: str | None = None, *, pat
                 if left is not None and left <= 0:
                     raise asyncio.TimeoutError  # out of time: no request
                 sent += 1
-                next_page = await asyncio.wait_for(get(path, {**params, "limit": min(limit - len(rows), PAGE_LIMIT)}),
-                                                   left)
+                next_page = await asyncio.wait_for(
+                    get(path, {**params, "limit": min(limit - len(rows), PAGE_LIMIT)}, deadline=deadline), left)
             except asyncio.TimeoutError:  # not the builtin TimeoutError before Python 3.11
                 raise fail("upstream_timeout", "MatchAwards did not answer within this tool's time limit.") from None
             results = next_page.get("results")

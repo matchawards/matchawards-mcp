@@ -399,7 +399,8 @@ async def me(token: str) -> Profile | Refusal:
         return UNAVAILABLE
     started = next(_checks)
     try:
-        r = await api.send(client, "me", f"{AGENT_API_BASE}{ME_PATH}", headers={"Authorization": f"Bearer {token}"})
+        r, _ = await api.send(client, "me", f"{AGENT_API_BASE}{ME_PATH}",
+                              headers={"Authorization": f"Bearer {token}"})
     except httpx.HTTPError as e:
         log.warning("profile check failed: %s", type(e).__name__)
         return UNAVAILABLE

@@ -377,7 +377,7 @@ def _date(value: str | None) -> date | None:
 async def _opportunity(id: str, deadline: float) -> tuple[dict, OpportunityRow, str | None]:
     """The detail (raw, for ai), its row and its NAICS code if it is a valid one; contracts and grants only."""
     try:
-        data = await asyncio.wait_for(api.get_one(id), deadline - asyncio.get_running_loop().time())
+        data = await asyncio.wait_for(api.get_one(id, deadline), deadline - asyncio.get_running_loop().time())
     except asyncio.TimeoutError:
         raise api.fail("upstream_timeout", f"MatchAwards did not return the opportunity within "
                        f"{COMPOSITE_DEADLINE_S:g} seconds. Retry in a minute.") from None
