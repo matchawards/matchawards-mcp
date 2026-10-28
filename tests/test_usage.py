@@ -623,6 +623,36 @@ async def test_list_tools_record_the_rows_they_answered_with(api, usage_db, monk
     assert 'mcp_tool_result_rows_count{tool="get_opportunity"}' not in text  # not a list tool
 
 
+@pytest.mark.anyio
+async def test_rows_only_for_the_list_tools_and_their_own_list_field(usage_db, monkeypatch):
+    from pydantic import BaseModel
+
+    class Listed(BaseModel):
+        results: list[int]
+
+    class Other(BaseModel):
+        count: int
+
+    async def search_jobs() -> Other:  # a list tool whose result lacks its list field: no rows, no failure
+        """Use this when testing."""
+        return Other(count=3)
+
+    async def get_company() -> Listed:  # not a list tool, though its result has a results list
+        """Use this when testing."""
+        return Listed(results=[1, 2])
+
+    srv = server.Server(name="t")
+    for fn in (search_jobs, get_company):
+        server._tool(srv, fn, fn.__name__)
+    monkeypatch.setattr(server, "mcp", srv)
+    async with http() as hc:
+        for name in ("search_jobs", "get_company"):
+            assert (await post(hc, call(name, {}))).json()["result"]["isError"] is False
+    assert sorted((r["tool"], r["outcome"], r["rows"]) for r in rows(usage_db)) == [
+        ("get_company", "ok", None), ("search_jobs", "ok", None)]
+    assert "mcp_tool_result_rows_count" not in usage.metrics.render()
+
+
 def seed(path):
     ledger = usage.Ledger.open(str(path))
     conn = sqlite3.connect(path)

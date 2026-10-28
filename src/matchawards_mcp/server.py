@@ -179,8 +179,9 @@ def _tool(srv: MCPServer, fn, title: str):
             # link_required: a linked tool answered with the challenge (ChatGPT, or no check in this request).
             outcome = ("link_required" if isinstance(result, CallToolResult) and result.is_error
                        else "partial" if getattr(result, "_partial", False) else "ok")
-            listed = getattr(result, RESULT_ROWS.get(fn.__name__, ""), None) if outcome != "link_required" else None
-            rows = len(listed) if isinstance(listed, list) else None
+            if fn.__name__ in RESULT_ROWS and outcome != "link_required":
+                listed = getattr(result, RESULT_ROWS[fn.__name__], None)
+                rows = len(listed) if isinstance(listed, list) else None  # None: not the tool's own output model
             return result
         except ToolError as e:
             outcome = getattr(e, "outcome", "upstream_error")
