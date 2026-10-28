@@ -187,6 +187,7 @@ Do not trust a broad private range such as `172.16.0.0/12`: it may overlap your 
 | `MATCHAWARDS_RATE_SUBJECT_BURST` | `10` | `--http` only: requests per 5 seconds per ChatGPT user. |
 | `MATCHAWARDS_EGRESS_PER_MIN` | `600` | `--http` only: requests per minute for all ChatGPT traffic together. |
 | `MATCHAWARDS_GLOBAL_API_PER_MIN` | `900` | `--http` only: API calls per minute for the whole server (one search can make up to 3). Over it, a tool answers "MatchAwards is busy, retry in N seconds" without calling the API. |
+| `MATCHAWARDS_API_MAX_IN_FLIGHT` | `16` | `--http` only: API requests in flight at once for the whole server. Slow searches each hold a database connection on the API side, so this, more than the per-minute budget, bounds the load. A request waits up to 5 seconds for a free slot; past that the tool answers "MatchAwards is busy, retry in 5 seconds" without calling the API. |
 | `MATCHAWARDS_TRUSTED_PROXIES` | `127.0.0.1/32,::1/128` | `--http` only: proxies (CIDRs, comma-separated) whose `X-Real-IP` header is trusted. Loopback only by default. |
 | `MATCHAWARDS_ALLOWED_HOSTS` | `matchawards.com,staging.matchawards.com` | `--http` only: accepted `Host` headers, comma-separated (`127.0.0.1` and `localhost` are always accepted). |
 | `MATCHAWARDS_USAGE_DB` | `/data/usage.db` | `--http` only: SQLite file for the usage stats. If its directory is missing or not writable, the server logs one warning and records nothing. |

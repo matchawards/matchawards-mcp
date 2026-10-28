@@ -1,5 +1,6 @@
 """--http mode: the SDK's ASGI app driven in-process over httpx2.ASGITransport. No network."""
 
+import asyncio
 import contextlib
 from types import SimpleNamespace
 import ipaddress
@@ -11,11 +12,12 @@ import httpx2
 import pytest
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
+from mcp.server.mcpserver.exceptions import ToolError
 
 from matchawards_mcp import __version__, server, tools, usage
 from matchawards_mcp import api as ma_api
 
-from test_server import TOOLS, api, anyio_backend, page  # noqa: F401  (fixtures)
+from test_server import TOOLS, api, anyio_backend, page, row  # noqa: F401  (fixtures)
 
 TRUSTED = [ipaddress.ip_network(n) for n in ("127.0.0.1/32", "::1/128", "172.16.0.0/12")]
 PING = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
@@ -28,6 +30,7 @@ def no_api_budget_leak(monkeypatch, tmp_path):
     """http_app() installs a server-wide API budget and a usage ledger; put the stdio defaults (None) back after
     each test, and keep the ledger in a temporary directory."""
     monkeypatch.setattr(ma_api, "api_budget", None)
+    monkeypatch.setattr(ma_api, "api_slots", None)
     monkeypatch.setattr(server, "ledger", None)
     monkeypatch.setenv("MATCHAWARDS_USAGE_DB", str(tmp_path / "usage.db"))
 
@@ -354,7 +357,7 @@ async def test_one_client_hammering_leaves_the_global_budget_open(monkeypatch):
     ("MATCHAWARDS_RATE_PER_MIN", "0"), ("MATCHAWARDS_RATE_BURST", "ten"), ("MATCHAWARDS_GLOBAL_PER_MIN", "-5"),
     ("MATCHAWARDS_RATE_PER_MIN", ""), ("MATCHAWARDS_TRUSTED_PROXIES", "10.0.0.0/33"), ("MATCHAWARDS_RATE_PER_PREFIX_MIN", "0"),
     ("MATCHAWARDS_GLOBAL_API_PER_MIN", "x"), ("MATCHAWARDS_RATE_PER_SUBJECT_MIN", "0"),
-    ("MATCHAWARDS_RATE_SUBJECT_BURST", "x"), ("MATCHAWARDS_EGRESS_PER_MIN", "-1"),
+    ("MATCHAWARDS_RATE_SUBJECT_BURST", "x"), ("MATCHAWARDS_EGRESS_PER_MIN", "-1"), ("MATCHAWARDS_API_MAX_IN_FLIGHT", "0"),
 ])
 def test_bad_env_stops_startup_with_a_clear_message(monkeypatch, name, value):
     monkeypatch.setenv(name, value)
@@ -419,8 +422,53 @@ async def test_api_budget_in_http_mode(api, monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_api_in_flight_cap_in_http_mode(monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_API_MAX_IN_FLIGHT", "2")
+    server.http_app()
+    release, started = asyncio.Event(), []
+
+    async def handler(req):
+        started.append(req)
+        await release.wait()
+        return httpx.Response(200, json={"result": row(1)})
+
+    monkeypatch.setattr(ma_api, "client", httpx.AsyncClient(transport=httpx.MockTransport(handler),
+                                                            base_url="https://api.test"))
+    monkeypatch.setattr(ma_api, "SLOT_WAIT_S", 0.2)
+    held = [asyncio.create_task(tools.get_opportunity(str(i))) for i in (1, 2)]
+    while len(started) < 2:
+        await asyncio.sleep(0)
+    with pytest.raises(ToolError, match="MatchAwards is busy right now. Retry in") as busy:
+        await tools.get_opportunity("3")  # both slots held: waits SLOT_WAIT_S, then busy, and sends nothing
+    assert busy.value.outcome == "busy" and len(started) == 2
+    waiting = asyncio.create_task(tools.get_opportunity("4"))
+    await asyncio.sleep(0.05)
+    assert len(started) == 2  # queued for a slot
+    release.set()
+    await asyncio.gather(*held, waiting)
+    assert len(started) == 3  # got the slot a finished request gave back
+
+
+@pytest.mark.anyio
+async def test_api_in_flight_slot_is_returned_on_failure(monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_API_MAX_IN_FLIGHT", "1")
+    server.http_app()
+
+    def handler(req):
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(ma_api, "client", httpx.AsyncClient(transport=httpx.MockTransport(handler),
+                                                            base_url="https://api.test"))
+    monkeypatch.setattr(ma_api, "SLOT_WAIT_S", 0.1)
+    for _ in range(3):  # each failure gives its one slot back, so none of these is busy
+        with pytest.raises(ToolError, match="Could not reach MatchAwards"):
+            await tools.get_opportunity("7")
+
+
+@pytest.mark.anyio
 async def test_stdio_mode_has_no_api_budget(api):
     assert ma_api.api_budget is None
+    assert ma_api.api_slots is None
     for _ in range(5):
         await tools.get_opportunity("7")
     assert len(api.requests) == 5

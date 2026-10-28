@@ -661,6 +661,7 @@ def http_app() -> Starlette:
     global ledger
     linking.check_settings()
     api.api_budget = RateLimiter(_env_int("MATCHAWARDS_GLOBAL_API_PER_MIN", 900), 0)
+    api.api_slots = asyncio.Semaphore(_env_int("MATCHAWARDS_API_MAX_IN_FLIGHT", 16))
     api.on_request = usage.observe_api
     ledger = usage.Ledger.open(os.environ.get("MATCHAWARDS_USAGE_DB", usage.DEFAULT_DB))
     # Peers whose X-Real-IP is believed. Loopback only by default; in Docker the deployment names the exact

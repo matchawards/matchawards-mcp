@@ -37,6 +37,12 @@ PAGE_LIMIT = 50  # the API's largest `limit`
 # for this server's address (PUBLIC_API_ALLOW_IPS), which is what lets this server past the API's per-IP limit.
 # server.http_app() sets it.
 api_budget = None
+# HTTP mode only: API requests in flight for the whole server (MATCHAWARDS_API_MAX_IN_FLIGHT). The rate alone does
+# not protect the API's database: slow searches hold a database connection each, so what matters is how many run at
+# once. A request waits up to SLOT_WAIT_S for a free slot, then the tool answers busy. None in stdio mode.
+# server.http_app() sets it.
+api_slots: asyncio.Semaphore | None = None
+SLOT_WAIT_S = 5.0
 
 # HTTP mode only: called after every upstream request with (endpoint, outcome, seconds) for mcp_api_duration_seconds;
 # server.http_app() sets it. None in stdio mode, which records nothing.
@@ -160,6 +166,21 @@ async def send(http: httpx.AsyncClient, label: str, url: str, deadline: float | 
             on_request(label, outcome, time.monotonic() - start)
 
 
+async def _send_in_slot(path: str, deadline: float | None, query: dict[str, Any]) -> tuple[httpx.Response, str]:
+    """send() the GET for get(), holding one of api_slots for its duration when there are slots (HTTP mode).
+    No free slot within SLOT_WAIT_S is busy, before anything is sent."""
+    if api_slots is None:
+        return await send(client, endpoint(path), path, deadline, params=query)
+    try:
+        await asyncio.wait_for(api_slots.acquire(), SLOT_WAIT_S)
+    except asyncio.TimeoutError:
+        raise fail("busy", f"MatchAwards is busy right now. Retry in {SLOT_WAIT_S:.0f} seconds.") from None
+    try:
+        return await send(client, endpoint(path), path, deadline, params=query)
+    finally:
+        api_slots.release()
+
+
 async def get(path: str, params: dict[str, Any] | None = None, not_found: str | None = None,
               deadline: float | None = None) -> dict[str, Any]:
     """GET one API path; turn every failure into a ToolError the model can act on. `not_found` replaces the
@@ -168,7 +189,7 @@ async def get(path: str, params: dict[str, Any] | None = None, not_found: str | 
     if api_budget is not None and (wait := api_budget.check("api")):
         raise fail("busy", f"MatchAwards is busy right now. Retry in {wait} seconds.")
     try:
-        r, outcome = await send(client, endpoint(path), path, deadline, params=query)
+        r, outcome = await _send_in_slot(path, deadline, query)
     except httpx.TimeoutException:
         raise ToolError(
             f"MatchAwards did not answer within {TIMEOUT_S:.0f} seconds. Retry once; if it fails again, "
