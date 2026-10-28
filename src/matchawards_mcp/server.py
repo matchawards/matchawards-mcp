@@ -157,7 +157,8 @@ def _tool(srv: MCPServer, fn, title: str):
 
     In --http mode each call that reaches the tool is counted, timed and written to the usage ledger: tool name,
     outcome, latency, who called (see HttpGuard), whether it ran with a linked account and, for a list-returning
-    tool that answered, how many rows (RESULT_ROWS). Never the arguments, nor which account. Outside an HTTP request (stdio) it records nothing."""
+    tool that answered, how many rows (RESULT_ROWS). Its MatchAwards API requests are counted too (api.send). Never
+    the arguments, nor which account. Outside an HTTP request (stdio) it records nothing."""
 
     if WIDGETS and fn.__name__ in SHOW_SOURCES:
         fn = _with_show_hint(fn)
@@ -170,6 +171,8 @@ def _tool(srv: MCPServer, fn, title: str):
         auth = linking.auth.get()
         linked = isinstance(auth, linking.Profile)
         start, outcome, rows = time.monotonic(), "internal_error", None
+        requests = [0]
+        requests_token = api.tool_requests.set(requests)
         try:
             result = await fn(*args, **kwargs)
             # partial: a composite tool's budget or deadline cut it short (it still answers with what it has).
@@ -183,6 +186,8 @@ def _tool(srv: MCPServer, fn, title: str):
             outcome = getattr(e, "outcome", "upstream_error")
             raise
         finally:
+            api.tool_requests.reset(requests_token)
+            usage.metrics.observe("mcp_tool_api_pages", requests[0], tool=fn.__name__)
             usage.metrics.inc("mcp_tool_calls_total", tool=fn.__name__, outcome=outcome, family=req["family"])
             usage.metrics.observe("mcp_tool_duration_seconds", time.monotonic() - start, tool=fn.__name__)
             if rows is not None:
@@ -655,6 +660,7 @@ def http_app() -> Starlette:
     global ledger
     linking.check_settings()
     api.api_budget = RateLimiter(_env_int("MATCHAWARDS_GLOBAL_API_PER_MIN", 900), 0)
+    api.on_request = usage.observe_api
     ledger = usage.Ledger.open(os.environ.get("MATCHAWARDS_USAGE_DB", usage.DEFAULT_DB))
     # Peers whose X-Real-IP is believed. Loopback only by default; in Docker the deployment names the exact
     # address nginx connects from (the compose network's gateway), never a broad private range.

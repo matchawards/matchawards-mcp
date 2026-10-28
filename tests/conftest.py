@@ -1,6 +1,6 @@
 import pytest
 
-from matchawards_mcp import server
+from matchawards_mcp import api, server
 
 
 @pytest.fixture(autouse=True)
@@ -12,3 +12,9 @@ def no_egress_fetch(monkeypatch):
         return None
 
     monkeypatch.setattr(server, "fetch_egress", failed_fetch)
+
+
+@pytest.fixture(autouse=True)
+def no_api_timing_leak(monkeypatch):
+    """http_app() points api.on_request at the metrics; put the stdio default (None) back after each test."""
+    monkeypatch.setattr(api, "on_request", None)

@@ -1,6 +1,7 @@
 """Usage stats in --http mode: the ledger, the transport aggregate, /metrics (counters, latency histogram,
 distinct-caller gauges) and the stats command. No network."""
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -690,6 +691,11 @@ mcp_chatgpt_subjects_new_total 0
 # TYPE mcp_tool_duration_seconds histogram
 # HELP mcp_tool_result_rows Rows a successful call of a list-returning tool answered with, by tool.
 # TYPE mcp_tool_result_rows histogram
+# HELP mcp_tool_api_pages MatchAwards API requests one tool call made, by tool.
+# TYPE mcp_tool_api_pages histogram
+# HELP mcp_api_duration_seconds MatchAwards API request latency in seconds, by endpoint and outcome (ok, error, \
+timeout).
+# TYPE mcp_api_duration_seconds histogram
 # HELP mcp_distinct_callers Distinct callers in the window: client = /24 or /48 without probers or own tests, \
 chatgpt_subject = x-openai-subject from ChatGPT egress, chatgpt_session = x-openai-session (conversations) from \
 ChatGPT egress. Reset on restart.
@@ -807,3 +813,132 @@ def test_a_ledger_from_before_1_1_gets_the_linked_and_rows_columns(usage_db, cap
     conn.close()
     server.main(["stats", "--db", str(usage_db)])
     assert "Tool calls with a linked account: 1" in capsys.readouterr().out
+
+
+# --- MatchAwards API timing and API requests per tool call ----------------------------------------------------------
+
+
+def series(text, name):
+    """{labels: value} of one metric's lines in a /metrics text."""
+    return {line[len(name):].rsplit(" ", 1)[0]: float(line.rsplit(" ", 1)[1])
+            for line in text.splitlines() if line.startswith(name + "{")}
+
+
+@pytest.mark.parametrize("path, label", [
+    (ma_api.SEARCH_PATH, "search"), (ma_api.AWARDS_PATH, "awards"), (ma_api.AGENCIES_PATH, "agencies"),
+    (ma_api.NAICS_PATH, "naics"), (f"{ma_api.SEARCH_PATH}/117402307943537453", "opportunity"),
+    (f"{ma_api.COMPANIES_PATH}/C3KXNLTAAY98", "company"), (ma_api.COMPANIES_PATH, "other"),
+    ("/api/public/v1/opportunitiesX", "other"), ("/anything/else", "other"),
+])
+def test_api_endpoint_labels_are_a_fixed_set(path, label):
+    assert ma_api.endpoint(path) == label
+
+
+@pytest.mark.anyio
+async def test_api_requests_are_timed_by_endpoint_and_outcome(api):
+    api.replies = [
+        lambda req: httpx.Response(200, json=page([1])),
+        lambda req: httpx.Response(404, json={"error": "not_found"}),
+        lambda req: httpx.Response(503, json={"error": "timeout"}, headers={"Retry-After": "5"}),
+        lambda req: (_ for _ in ()).throw(httpx.ReadTimeout("slow", request=req)),
+        lambda req: httpx.Response(200, json={"as_of": "x", "results": []}),
+    ]
+    async with http() as hc:
+        await post(hc, call("search_contracts", {}))
+        await post(hc, call("get_opportunity", {"id": "7"}))
+        await post(hc, call("get_company", {"uei": "C3KXNLTAAY98"}))
+        await post(hc, call("search_grants", {}))
+        await post(hc, call("lookup_naics", {"query": "roofing"}))
+    counts = series(usage.metrics.render(), "mcp_api_duration_seconds_count")
+    assert counts == {'{endpoint="search",outcome="ok"}': 1, '{endpoint="opportunity",outcome="error"}': 1,
+                      '{endpoint="company",outcome="timeout"}': 1, '{endpoint="search",outcome="timeout"}': 1,
+                      '{endpoint="naics",outcome="ok"}': 1}
+    text = usage.metrics.render()
+    assert 'mcp_api_duration_seconds_bucket{endpoint="search",outcome="ok",le="30"} 1' in text
+    assert "117402307943537453" not in text and "C3KXNLTAAY98" not in text
+
+
+@pytest.mark.anyio
+async def test_a_request_cut_off_by_a_deadline_is_a_timeout(monkeypatch):
+    async def slow(req):
+        await asyncio.sleep(5)
+
+    seen = []
+    monkeypatch.setattr(ma_api, "on_request", lambda *a: seen.append(a))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(slow), base_url="https://api.test")
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(ma_api.send(client, "awards", ma_api.AWARDS_PATH), 0.05)
+    [(label, outcome, seconds)] = seen
+    assert (label, outcome) == ("awards", "timeout") and 0 < seconds < 5
+
+
+@pytest.mark.anyio
+async def test_stdio_mode_times_no_api_request(api):
+    await server.mcp.call_tool("search_contracts", {})  # outside an HTTP request, with no http_app()
+    assert ma_api.on_request is None and usage.metrics.histograms == {}
+
+
+@pytest.mark.anyio
+async def test_api_requests_per_tool_call(api, monkeypatch):
+    monkeypatch.setattr(server, "WIDGETS", True)  # show_results: its fetches run as separate tasks
+    monkeypatch.setattr(server, "mcp", server.build_mcp())
+    monkeypatch.setattr(ma_api, "_agencies", {})
+    detail = {**row(1), "type": "federal", "naics": {"code": "541512"}, "agency_id": "dept_of_the_army",
+              "state": "VA"}
+
+    def reply(req):
+        path, params = req.url.path, req.url.params
+        if path.startswith(ma_api.SEARCH_PATH + "/"):
+            return httpx.Response(200, json={"as_of": "x", "result": {**detail, "id": path.rsplit("/", 1)[1]}})
+        if path == ma_api.AWARDS_PATH:
+            return httpx.Response(200, json=awards_page([1, 2]))
+        if path == ma_api.AGENCIES_PATH:
+            return httpx.Response(200, json={"as_of": "x", "results": [
+                {"agency_id": "dept_of_the_army", "name": "Department of the Army"}]})
+        # A sparse search: three short pages with has_more, then the page cap stops it.
+        return httpx.Response(200, json=page([], has_more=True, cursor=f"c{params.get('cursor', '')}x"))
+
+    api.replies = [reply]
+    async with http() as hc:
+        await post(hc, call("search_contracts", {"keyword": "roof"}))  # 3 pages (MAX_PAGES)
+        await post(hc, call("search_awards", {"agency": "Department of the Army"}))  # agency lookup + 1 page
+        await post(hc, call("search_awards", {"agency": "Department of the Army"}))  # agency cached: 1 page
+        await post(hc, call("get_opportunity", {"id": "1"}))
+        await post(hc, call("assess_opportunity", {"id": "1"}))  # the detail + one award lookup
+        await post(hc, call("show_results", {"ids": ["1", "2", "3"]}))
+        await post(hc, call("search_contracts", {"state": "VAX"}))  # rejected by the SDK: no tool call
+    text = usage.metrics.render()
+    sums = series(text, "mcp_tool_api_pages_sum")
+    counts = series(text, "mcp_tool_api_pages_count")
+    assert sums == {'{tool="search_contracts"}': 3, '{tool="search_awards"}': 3, '{tool="get_opportunity"}': 1,
+                    '{tool="assess_opportunity"}': 2, '{tool="show_results"}': 3}
+    assert counts == {'{tool="search_contracts"}': 1, '{tool="search_awards"}': 2, '{tool="get_opportunity"}': 1,
+                      '{tool="assess_opportunity"}': 1, '{tool="show_results"}': 1}
+    assert 'mcp_tool_api_pages_bucket{tool="search_contracts",le="2"} 0' in text
+    assert 'mcp_tool_api_pages_bucket{tool="search_contracts",le="3"} 1' in text
+    assert series(text, "mcp_api_duration_seconds_count")['{endpoint="agencies",outcome="ok"}'] == 1
+
+
+@pytest.mark.anyio
+async def test_a_busy_api_budget_makes_no_request(api, monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_GLOBAL_API_PER_MIN", "1")
+    async with http() as hc:
+        await post(hc, call("get_opportunity", {"id": "1"}))
+        await post(hc, call("get_opportunity", {"id": "2"}))  # budget spent: busy, nothing sent
+    text = usage.metrics.render()
+    assert 'mcp_tool_api_pages_bucket{tool="get_opportunity",le="0"} 1' in text
+    assert 'mcp_tool_api_pages_count{tool="get_opportunity"} 2' in text
+    assert series(text, "mcp_api_duration_seconds_count") == {'{endpoint="opportunity",outcome="ok"}': 1}
+
+
+@pytest.mark.anyio
+async def test_the_profile_check_is_timed_as_me(linked, me_api, api, monkeypatch):
+    monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "100")
+    async with http() as hc:
+        await link_call(hc, token=TOKEN)
+        me_api.reply = lambda req: httpx.Response(401)
+        await link_call(hc, token="another-token")
+    counts = series(usage.metrics.render(), "mcp_api_duration_seconds_count")
+    assert counts['{endpoint="me",outcome="ok"}'] == 1 and counts['{endpoint="me",outcome="error"}'] == 1
+    # The check runs before the tool: my_matches counts only its own searches.
+    assert "mcp_tool_api_pages_count{tool=\"my_matches\"} 1" in usage.metrics.render()

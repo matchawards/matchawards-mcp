@@ -6,6 +6,7 @@ the cursor for up to MAX_PAGES requests), `opportunities/{id}`, `companies/{uei}
 """
 
 import asyncio
+import contextvars
 import os
 import re
 import time
@@ -36,6 +37,16 @@ PAGE_LIMIT = 50  # the API's largest `limit`
 # for this server's address (PUBLIC_API_ALLOW_IPS), which is what lets this server past the API's per-IP limit.
 # server.http_app() sets it.
 api_budget = None
+
+# HTTP mode only: called after every upstream request with (endpoint, outcome, seconds) for mcp_api_duration_seconds;
+# server.http_app() sets it. None in stdio mode, which records nothing.
+on_request = None
+# HTTP mode only: the upstream requests of the tool call being served, as a one-item list the tool wrapper sets and
+# reads (mcp_tool_api_pages). A list, so the tasks a tool starts (show_results' fetches) add to the same count.
+tool_requests: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar("matchawards_tool_requests",
+                                                                                 default=None)
+# The endpoint label of an exact API path (endpoint()).
+ENDPOINTS = {SEARCH_PATH: "search", AWARDS_PATH: "awards", AGENCIES_PATH: "agencies", NAICS_PATH: "naics"}
 
 # Tests swap this for an httpx.AsyncClient on a MockTransport.
 client = httpx.AsyncClient(
@@ -93,6 +104,36 @@ def error_message(r: httpx.Response) -> str:
     return f"MatchAwards rejected the request (HTTP {r.status_code}): {error}"
 
 
+def endpoint(path: str) -> str:
+    """The endpoint label of an API path, from a fixed set: search, awards, agencies, naics, opportunity (one
+    record), company, or other. Never the path itself (it holds ids)."""
+    if path in ENDPOINTS:
+        return ENDPOINTS[path]
+    if path.startswith(SEARCH_PATH + "/"):
+        return "opportunity"
+    return "company" if path.startswith(COMPANIES_PATH + "/") else "other"
+
+
+async def send(http: httpx.AsyncClient, label: str, url: str, **kwargs) -> httpx.Response:
+    """http.get(url, **kwargs), counted in the tool call's requests (tool_requests) and timed (on_request) under
+    `label`, with outcome ok (an answer below 400), timeout (no answer within the client timeout, the API's own
+    timeout answer, or cut off by a tool's deadline) or error. Changes nothing about the request."""
+    if (count := tool_requests.get()) is not None:
+        count[0] += 1
+    start, outcome = time.monotonic(), "error"
+    try:
+        r = await http.get(url, **kwargs)
+        outcome = ("ok" if r.status_code < 400
+                   else "timeout" if r.status_code == 503 and _error_code(r) == "timeout" else "error")
+        return r
+    except (httpx.TimeoutException, asyncio.CancelledError):  # cancelled: asyncio.wait_for in search()
+        outcome = "timeout"
+        raise
+    finally:
+        if on_request is not None:
+            on_request(label, outcome, time.monotonic() - start)
+
+
 async def get(path: str, params: dict[str, Any] | None = None, not_found: str | None = None) -> dict[str, Any]:
     """GET one API path; turn every failure into a ToolError the model can act on. `not_found` replaces the
     wording of a 404."""
@@ -100,7 +141,7 @@ async def get(path: str, params: dict[str, Any] | None = None, not_found: str | 
     if api_budget is not None and (wait := api_budget.check("api")):
         raise fail("busy", f"MatchAwards is busy right now. Retry in {wait} seconds.")
     try:
-        r = await client.get(path, params=query)
+        r = await send(client, endpoint(path), path, params=query)
     except httpx.TimeoutException:
         raise ToolError(
             f"MatchAwards did not answer within {TIMEOUT_S:.0f} seconds. Retry once; if it fails again, "

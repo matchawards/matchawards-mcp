@@ -130,6 +130,7 @@ def fingerprint(subject: bytes, salt: bytes | None) -> str | None:
 
 BUCKETS = (0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30)  # seconds; +Inf is implied
 ROW_BUCKETS = (0, 1, 5, 10, 25, 50)  # rows a list-returning tool call answered with
+PAGE_BUCKETS = (0, 1, 2, 3, 5)  # upstream API requests one tool call made
 WINDOWS = (("1h", 3600), ("24h", 86400))
 # Lowercase substring of clientInfo.name -> label. First match wins.
 CLIENT_BUCKETS = (("chatgpt", "chatgpt"), ("openai", "chatgpt"), ("claude", "claude"), ("cursor", "cursor"),
@@ -230,6 +231,9 @@ class Metrics:
         "mcp_tool_duration_seconds": ("Tool call latency in seconds, by tool.", BUCKETS),
         "mcp_tool_result_rows": ("Rows a successful call of a list-returning tool answered with, by tool.",
                                  ROW_BUCKETS),
+        "mcp_tool_api_pages": ("MatchAwards API requests one tool call made, by tool.", PAGE_BUCKETS),
+        "mcp_api_duration_seconds": ("MatchAwards API request latency in seconds, by endpoint and outcome (ok, "
+                                     "error, timeout).", BUCKETS),
     }
     # Rendered only with account linking on, like the distinct "account" kind: off, /metrics is what it was without.
     LINK_ONLY = ("mcp_link_challenges_total", "mcp_linked_calls_total")
@@ -291,6 +295,11 @@ class Metrics:
 
 
 metrics = Metrics()
+
+
+def observe_api(endpoint: str, outcome: str, seconds: float) -> None:
+    """api.on_request in --http mode: one upstream request (endpoint and outcome are api.send's fixed labels)."""
+    metrics.observe("mcp_api_duration_seconds", seconds, endpoint=endpoint, outcome=outcome)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tool_calls (
