@@ -503,6 +503,40 @@ def test_chatgpt_sessions_are_capped_and_evictions_counted(monkeypatch):
     assert 'mcp_distinct_evictions_total{kind="chatgpt_session"} 3' in text
 
 
+def test_a_subject_with_no_earlier_row_counts_as_new_once(usage_db):
+    usage.Ledger.open(str(usage_db))
+    conn = sqlite3.connect(usage_db)
+    new = lambda: usage.metrics.counts[("mcp_chatgpt_subjects_new_total", ())]  # noqa: E731
+    for fp, expect in [("a" * 16, 1), ("a" * 16, 1), (None, 1), ("b" * 16, 2), ("a" * 16, 2)]:
+        with conn:
+            usage.Ledger.write_call(conn, "search_contracts", "ok", "192.0.2.0/24", "openai-mcp/1", "openai-mcp", fp, 5)
+        assert new() == expect, fp
+    conn.close()
+    assert "mcp_chatgpt_subjects_new_total 2" in usage.metrics.render()
+    ledger = usage.Ledger.open(str(usage_db))
+    for _ in range(20):  # first calls of one user on both writer threads at once: one new subject
+        ledger.submit(usage.Ledger.write_call, "search_jobs", "ok", "192.0.2.0/24", "x", "openai-mcp", "c" * 16, 5)
+    ledger.flush()
+    assert new() == 3 and usage.metrics.counts[("mcp_ledger_errors_total", ())] == 0
+
+
+@pytest.mark.anyio
+async def test_new_chatgpt_subjects_end_to_end_and_a_failing_write(api, usage_db, egress, monkeypatch, tmp_path):
+    monkeypatch.setenv("MATCHAWARDS_USAGE_SALT", "s3cret")
+    async with http() as hc:
+        for subject in ("sub-1", "sub-1", "sub-2"):
+            await post(hc, call("get_opportunity", {"id": "7"}), ip="192.0.2.10", **{"x-openai-subject": subject})
+        await post(hc, call("get_opportunity", {"id": "7"}), **{"x-openai-subject": "sub-3"})  # not egress: no fp
+        server.ledger.flush()
+        assert "mcp_chatgpt_subjects_new_total 2" in usage.metrics.render()
+        server.ledger.path = str(tmp_path)  # a directory: every write now fails
+        assert (await post(hc, call("get_opportunity", {"id": "7"}), ip="192.0.2.10",
+                           **{"x-openai-subject": "sub-4"})).json()["result"]["isError"] is False
+        server.ledger.flush()
+    text = usage.metrics.render()
+    assert "mcp_chatgpt_subjects_new_total 2" in text and "mcp_ledger_errors_total 2" in text
+
+
 @pytest.mark.anyio
 async def test_probers_are_not_distinct_clients(api):
     async with http() as hc:
@@ -648,6 +682,10 @@ METRICS_OFF = """\
 # HELP mcp_ledger_errors_total Usage ledger writes that failed (the request itself was served).
 # TYPE mcp_ledger_errors_total counter
 mcp_ledger_errors_total 0
+# HELP mcp_chatgpt_subjects_new_total Tool calls from a ChatGPT user (x-openai-subject fingerprint) with no earlier \
+row in the usage ledger.
+# TYPE mcp_chatgpt_subjects_new_total counter
+mcp_chatgpt_subjects_new_total 0
 # HELP mcp_tool_duration_seconds Tool call latency in seconds, by tool.
 # TYPE mcp_tool_duration_seconds histogram
 # HELP mcp_tool_result_rows Rows a successful call of a list-returning tool answered with, by tool.
@@ -764,5 +802,8 @@ def test_a_ledger_from_before_1_1_gets_the_linked_and_rows_columns(usage_db, cap
     assert sorted((r["tool"], r["linked"], r["rows"]) for r in rows(usage_db)) == [
         ("my_matches", 1, None), ("search_jobs", 0, None)]  # rows: added too, NULL for the older rows
     assert usage.Ledger.open(str(usage_db)) is not None  # a second open: already there, nothing to add
+    conn = sqlite3.connect(usage_db)
+    assert "tool_calls_caller_fp" in [r[1] for r in conn.execute("PRAGMA index_list(tool_calls)")]
+    conn.close()
     server.main(["stats", "--db", str(usage_db)])
     assert "Tool calls with a linked account: 1" in capsys.readouterr().out

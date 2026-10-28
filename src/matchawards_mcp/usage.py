@@ -220,6 +220,8 @@ class Metrics:
         "mcp_agent_requests_total": "Requests served on /mcp by User-Agent family.",
         "mcp_clients_total": "initialize requests by client (clientInfo.name folded into a fixed set).",
         "mcp_ledger_errors_total": "Usage ledger writes that failed (the request itself was served).",
+        "mcp_chatgpt_subjects_new_total": "Tool calls from a ChatGPT user (x-openai-subject fingerprint) with no "
+                                          "earlier row in the usage ledger.",
         "mcp_link_challenges_total": "Account-linking challenges (HTTP 401/403, or ChatGPT's tool result), by host "
                                      "(chatgpt, claude, other) and error.",
         "mcp_linked_calls_total": "Tool calls that ran with a linked account, by tool.",
@@ -231,6 +233,7 @@ class Metrics:
     }
     # Rendered only with account linking on, like the distinct "account" kind: off, /metrics is what it was without.
     LINK_ONLY = ("mcp_link_challenges_total", "mcp_linked_calls_total")
+    UNLABELLED = ("mcp_ledger_errors_total", "mcp_chatgpt_subjects_new_total")  # rendered as 0 before the first
 
     def __init__(self):
         self.counts: Counter = Counter()
@@ -259,7 +262,7 @@ class Metrics:
                 continue
             lines += [f"# HELP {name} {text}", f"# TYPE {name} counter"]
             series = sorted((labels, n) for (metric, labels), n in counts.items() if metric == name)
-            if not series and name == "mcp_ledger_errors_total":
+            if not series and name in self.UNLABELLED:
                 series = [((), 0)]
             for labels, n in series:
                 body = _labels(labels)
@@ -295,6 +298,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
   ua TEXT NOT NULL, family TEXT NOT NULL, caller_fp TEXT, latency_ms INTEGER NOT NULL,
   linked INTEGER NOT NULL DEFAULT 0, rows INTEGER);
 CREATE INDEX IF NOT EXISTS tool_calls_ts ON tool_calls (ts);
+CREATE INDEX IF NOT EXISTS tool_calls_caller_fp ON tool_calls (caller_fp) WHERE caller_fp IS NOT NULL;
 CREATE TABLE IF NOT EXISTS transport_daily (
   day TEXT NOT NULL, client_key TEXT NOT NULL, method TEXT NOT NULL, client_name TEXT NOT NULL,
   client_version TEXT NOT NULL, count INTEGER NOT NULL, last_ua TEXT NOT NULL,
@@ -391,11 +395,19 @@ class Ledger:
     def write_call(conn, tool, outcome, client_key, ua, family, caller_fp, latency_ms, linked=False,
                    rows=None) -> None:
         """One tool call. linked: it ran with a linked account (which one is never stored). rows: the rows a
-        list-returning tool answered with (None for other tools and for calls that failed)."""
+        list-returning tool answered with (None for other tools and for calls that failed).
+
+        A ChatGPT fingerprint with no earlier row (within the retention window) counts in
+        mcp_chatgpt_subjects_new_total. Checked after the insert, in its transaction: writers are serialised, so two
+        first calls of one user on the two writer threads count once."""
         conn.execute("INSERT INTO tool_calls (ts, tool, outcome, client_key, ua, family, caller_fp, latency_ms, "
                      "linked, rows) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                      (_now().isoformat(timespec="seconds"), tool, outcome, client_key, ua, family, caller_fp,
                       latency_ms, int(linked), rows))
+        if caller_fp is not None and conn.execute(
+                "SELECT 1 FROM tool_calls WHERE caller_fp = ? AND rowid != last_insert_rowid() LIMIT 1",
+                (caller_fp,)).fetchone() is None:
+            metrics.inc("mcp_chatgpt_subjects_new_total")
 
     @staticmethod
     def write_transport(conn, client_key, method, name, version, ua) -> None:
