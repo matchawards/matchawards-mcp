@@ -223,13 +223,15 @@ async def test_off_my_matches_is_not_registered():
 
 
 def test_instructions_point_at_my_matches_only_with_linking_on(issuer, monkeypatch):
-    assert server.build_mcp().instructions == server.INSTRUCTIONS + " " + server.LINKED_INSTRUCTIONS
+    assert server.build_mcp().instructions == " ".join(
+        [server.INSTRUCTIONS, server.LINKED_INSTRUCTIONS, server.BUSINESS_INSTRUCTIONS])
     monkeypatch.setattr(server, "WIDGETS", True)
     assert server.build_mcp().instructions == " ".join(
-        [server.INSTRUCTIONS, server.LINKED_INSTRUCTIONS, server.CARD_INSTRUCTIONS])
+        [server.INSTRUCTIONS, server.LINKED_INSTRUCTIONS, server.BUSINESS_INSTRUCTIONS, server.CARD_INSTRUCTIONS])
     assert "my_matches" in server.LINKED_INSTRUCTIONS and "my matches" in server.LINKED_INSTRUCTIONS
     assert len(server.build_mcp().instructions) <= 1024
-    assert server.BUSINESS_INSTRUCTIONS not in server.build_mcp().instructions  # my_matches' note asks instead
+    # A user who doesn't link still gets the ask-the-business guidance.
+    assert server.BUSINESS_INSTRUCTIONS in server.build_mcp().instructions
     monkeypatch.setattr(linking, "ISSUER", "")
     assert "my_matches" not in server.build_mcp().instructions
 
