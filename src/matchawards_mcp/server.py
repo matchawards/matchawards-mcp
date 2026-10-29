@@ -46,7 +46,7 @@ INSTRUCTIONS = (
     "get_company; bid brief: assess_opportunity; teaming: find_teaming_partners. Print url, sam_url and source_url "
     "as markdown links. Data (SAM.gov, state portals, Grants.gov, USAJOBS) may be incomplete. Never call a firm the "
     "incumbent. AI-generated text is labelled; keep the label when you quote it. "
-    "When has_more is true, call again with cursor=next_cursor and the same filters. Nothing here needs an account. "
+    "When has_more is true, call again with cursor=next_cursor and the same filters. Searches need no account. "
     "Put several NAICS codes in one search (naics='541511,541512'), not one call per code. A warning with a cursor "
     "means the scan stopped early: call again with that cursor before saying nothing exists."
 )
