@@ -36,8 +36,8 @@ AWARD_LINK_RULE = (
 )
 AWARD_COVERAGE = "Award records may be incomplete."
 # Added to a keyword search's note when it found few rows and had no naics filter (_keyword_hint).
-KEYWORD_HINT = ("Keyword search matches titles only. For a line of work, lookup_naics gives the codes; a naics search "
-                "covers more records and is faster.")
+KEYWORD_HINT = ("Keyword search matches whole words in titles only: try another form of the word (roof, not roofing). "
+                "For a line of work, lookup_naics gives the codes; a naics search covers more records and is faster.")
 KEYWORD_HINT_BELOW = 5  # rows
 AI_NOTE = "The ai fields are AI-generated: label them as AI-generated whenever you show or quote them."
 # get_opportunity's note, for a contract or grant (assess_opportunity refuses jobs).
