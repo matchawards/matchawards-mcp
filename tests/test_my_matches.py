@@ -194,6 +194,9 @@ async def test_matchawards_not_answering_the_check_is_a_busy_error_not_a_challen
 def test_the_link_prompt_says_what_linking_gives():
     assert "link their MatchAwards account" in tools.LINK_PROMPT and "Google or email" in tools.LINK_PROMPT
     assert "NAICS" in tools.LINK_PROMPT
+    # a host with no sign-in for this app (a connection without OAuth) must not end in "internal error"
+    assert "isn't available here yet" in tools.LINK_PROMPT and "lookup_naics" in tools.LINK_PROMPT
+    assert "search_contracts" in tools.LINK_PROMPT
 
 
 # --- Registration -------------------------------------------------------------------------------------------------

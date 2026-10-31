@@ -670,7 +670,10 @@ async def find_teaming_partners(
 MATCH_SETTINGS_URL = "https://matchawards.com/settings/match_settings"
 MAX_NAICS = 10  # codes per search, as search_contracts takes them
 LINK_PROMPT = ("This needs the user to link their MatchAwards account (sign in with Google or email). Once linked, it "
-               "shows open contracts matching the NAICS codes on their MatchAwards profile.")
+               "shows open contracts matching the NAICS codes on their MatchAwards profile. If the app offers the user "
+               "no way to sign in, say plainly that signing in to MatchAwards isn't available here yet (never call it an "
+               "error), then ask what their business does, find the codes with lookup_naics and call search_contracts "
+               "with naics set to them.")
 NO_NAICS_NOTE = ("The user's MatchAwards profile has no six-digit NAICS codes yet, so there is nothing to match. Ask "
                  "what their business does (or its NAICS codes if they know them), find the codes with lookup_naics "
                  "and call search_contracts with naics set to them, the profile_used state and set-aside, and the "
