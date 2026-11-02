@@ -699,3 +699,37 @@ async def test_no_keyword_hint_on_a_later_page_more_to_read_or_a_warning(api, to
     out = await tool(**kwargs)
     assert len(out.results) == 1 and (out.warning is not None) is (case == "warning")
     assert tools.KEYWORD_HINT not in out.note
+
+
+# --- Sign-up offer: a contract search by NAICS that found something offers a free account, once --------------------
+
+@pytest.mark.anyio
+async def test_signup_offer_on_a_first_page_naics_contract_search(api):
+    from matchawards_mcp import links
+    api.replies = [ok(page([1, 2]))]
+    token = links.source.set("chatgpt")
+    try:
+        out = await tools.search_contracts(naics="541511")
+    finally:
+        links.source.reset(token)
+    url = "https://matchawards.com/auth/sign_up?utm_source=chatgpt&utm_medium=ai_agent&utm_campaign=matchawards_mcp"
+    assert out.note.endswith(tools.SIGNUP_OFFER.format(url=url)) and out.note.count("/auth/sign_up") == 1
+    assert len(api.requests) == 1  # the offer makes no request of its own
+
+
+@pytest.mark.parametrize("kwargs, n", [
+    ({"keyword": "roof"}, 2),  # no naics
+    ({"naics": "541511"}, 0),  # nothing found
+    ({"naics": "541511", "cursor": "c1"}, 2),  # a later page
+])
+@pytest.mark.anyio
+async def test_no_signup_offer_without_naics_rows_or_on_a_later_page(api, kwargs, n):
+    api.replies = [ok(page(list(range(1, n + 1))))]
+    assert "/auth/sign_up" not in (await tools.search_contracts(**kwargs)).note
+
+
+@pytest.mark.parametrize("tool, make", [(tools.search_grants, page), (tools.search_awards, awards_page)])
+@pytest.mark.anyio
+async def test_no_signup_offer_on_grant_or_award_searches(api, tool, make):
+    api.replies = [ok(make([1, 2]))]
+    assert "/auth/sign_up" not in (await tool(naics="541511")).note

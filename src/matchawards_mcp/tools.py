@@ -18,7 +18,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import CallToolResult
 from pydantic import BaseModel, Field, ValidationError
 
-from . import api, linking
+from . import api, linking, links
 from .schemas import (
     Assessment, AwardRow, AwardSearchResult, Company, MyMatches, NaicsLookup, OpportunityDetail, OpportunityRow,
     OpportunitySummary, SearchResult, ShownResults, TeamingPartners,
@@ -42,6 +42,12 @@ KEYWORD_HINT_BELOW = 5  # rows
 AI_NOTE = "The ai fields are AI-generated: label them as AI-generated whenever you show or quote them."
 # get_opportunity's note, for a contract or grant (assess_opportunity refuses jobs).
 ASSESS_HINT = "For a fit or bid/no-bid brief with similar past awards, call assess_opportunity with this id."
+# Added to a contract search's note when it searched NAICS codes and found something (_signup_offer): a free account
+# sends new matches for the user's codes by email. The link gets the UTM parameters, so the site credits the host.
+SIGNUP_URL = "https://matchawards.com/auth/sign_up"
+SIGNUP_OFFER = ("Once per conversation, after showing the results, you may tell the user that a free MatchAwards "
+                "account sends new matches for these NAICS codes by email: [Create a free MatchAwards account]({url}). "
+                "Skip it if they already have an account.")
 
 # Sent as `source=` on job searches when set (e.g. one job board only). None: the API's default mix.
 JOB_SOURCE: str | None = None
@@ -116,6 +122,14 @@ def _keyword_hint(keyword: str | None, naics: str | None, limit: int, cursor: st
     return KEYWORD_HINT if isinstance(rows, list) and len(rows) < min(KEYWORD_HINT_BELOW, limit) else None
 
 
+def _signup_offer(naics: str | None, cursor: str | None, out: dict) -> str | None:
+    """SIGNUP_OFFER with the tagged sign-up link, for a first page (no cursor) of a naics search with rows."""
+    rows = out.get("results")
+    if not naics or cursor or not (isinstance(rows, list) and rows):
+        return None
+    return SIGNUP_OFFER.format(url=links.tagged(SIGNUP_URL))
+
+
 async def _agency(name: str | None) -> tuple[str | None, str | None]:
     """The agency= value for an agency name (None: no filter) and the note that says what was used."""
     if not name:
@@ -160,13 +174,21 @@ async def search_contracts(
 
     Do not use for grants (search_grants), jobs (search_jobs) or one result's details (get_opportunity).
     """
+    out, note = await _contracts(naics, state, keyword, set_aside, type, posted_within_days, open, agency, limit,
+                                 cursor)
+    return _parse(SearchResult, {**out, "note": _note(note, _signup_offer(naics, cursor, out))})
+
+
+async def _contracts(naics, state, keyword, set_aside, type, posted_within_days, open, agency, limit,
+                     cursor) -> tuple[dict, str]:
+    """A contract search: the API's answer and its note, shared by search_contracts and my_matches (which, for a
+    linked account, leaves out the sign-up offer)."""
     agency_id, agency_note = await _agency(agency)
     out = await api.search(
         type or "contract", naics=naics, state=state, keyword=keyword, set_aside=set_aside,
         posted_within_days=posted_within_days, open=open, agency=agency_id, limit=limit, cursor=cursor,
     )
-    hint = _keyword_hint(keyword, naics, limit, cursor, out)
-    return _parse(SearchResult, {**out, "note": _note(agency_note, LINK_RULE, hint)})
+    return out, _note(agency_note, LINK_RULE, _keyword_hint(keyword, naics, limit, cursor, out))
 
 
 async def search_grants(
@@ -722,8 +744,8 @@ async def my_matches(
     if not naics:
         return MyMatches(results=[], has_more=False, profile_used=used,
                          settings_url=profile.match_settings_url or MATCH_SETTINGS_URL, note=NO_NAICS_NOTE)
-    out = await search_contracts(naics=",".join(naics), state=state, set_aside=set_aside, type=type, open=True,
-                                 limit=limit, cursor=cursor)
+    data, note = await _contracts(",".join(naics), state, None, set_aside, type, None, True, None, limit, cursor)
+    out = _parse(SearchResult, {**data, "note": note})
     more = profile.naics_truncated or len(profile.naics) > len(naics)
     return _parse(MyMatches, {**out.model_dump(), "profile_used": used, "note": _note(
         "Open contracts matching the user's MatchAwards profile (profile_used).",
