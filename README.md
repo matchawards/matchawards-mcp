@@ -26,6 +26,11 @@ Award records may be incomplete (federal awards especially), so every award resu
 
 Every tool is read-only and needs no account (except `my_matches`, a hosted tool that exists only with account linking on; see Linked accounts): each declares `readOnlyHint`, `idempotentHint`, a title and `securitySchemes: [{"type": "noauth"}]` (in `_meta`). Results are structured: each tool publishes an `outputSchema` and returns `structuredContent`, with the same JSON as text for clients that read only text. Every result carries a `url` on matchawards.com (and a `sam_url` for federal notices), and the server asks the model to show them as markdown links. Links to matchawards.com carry `utm_source`, `utm_medium` and `utm_campaign` parameters naming the AI host the request came from (for example `utm_source=chatgpt`); links to other sites are left unchanged.
 
+### Changes in 1.1.4
+
+- `search_contracts`: the first page of a NAICS search that found something tells the model it may offer, once per conversation, a free MatchAwards account that sends new matches for those codes by email, with a sign-up link carrying the host's UTM parameters. `my_matches` never offers it.
+- `MATCHAWARDS_CHATGPT_SIGNIN=0` (hosted, linking on): while ChatGPT's connection offers no sign-in, `my_matches` answers ChatGPT without the challenge (ChatGPT shows one only as an internal error): sign-in isn't available there yet, search by NAICS codes instead. Counted as outcome `signin_unavailable`.
+
 ### Changes in 1.1.3
 
 - `my_matches` without a linked account: when the app gives the user no way to sign in, the model says plainly that signing in to MatchAwards isn't available there yet (not an error), asks what the business does, finds the codes with `lookup_naics` and searches with `search_contracts`.
