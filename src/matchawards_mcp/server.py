@@ -181,7 +181,9 @@ def _tool(srv: MCPServer, fn, title: str):
             result = await fn(*args, **kwargs)
             # partial: a composite tool's budget or deadline cut it short (it still answers with what it has).
             # link_required: a linked tool answered with the challenge (ChatGPT, or no check in this request).
+            # signin_unavailable: my_matches told ChatGPT that sign-in isn't available there (CHATGPT_SIGNIN off).
             outcome = ("link_required" if isinstance(result, CallToolResult) and result.is_error
+                       else "signin_unavailable" if getattr(result, "_signin_unavailable", False)
                        else "partial" if getattr(result, "_partial", False) else "ok")
             if fn.__name__ in RESULT_ROWS and outcome != "link_required":
                 listed = getattr(result, RESULT_ROWS[fn.__name__], None)

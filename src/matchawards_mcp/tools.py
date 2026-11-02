@@ -696,6 +696,11 @@ LINK_PROMPT = ("This needs the user to link their MatchAwards account (sign in w
                "no way to sign in, say plainly that signing in to MatchAwards isn't available here yet (never call it an "
                "error), then ask what their business does, find the codes with lookup_naics and call search_contracts "
                "with naics set to them.")
+# my_matches' answer to ChatGPT while its connection offers no sign-in (linking.CHATGPT_SIGNIN off): no challenge,
+# which ChatGPT would show only as "internal error".
+NO_SIGNIN_NOTE = ("Signing in to MatchAwards isn't available in ChatGPT yet, so there are no saved matches to show. "
+                  "This is not an error: tell the user plainly, then ask what their business does, find the codes "
+                  "with lookup_naics and call search_contracts with naics set to them.")
 NO_NAICS_NOTE = ("The user's MatchAwards profile has no six-digit NAICS codes yet, so there is nothing to match. Ask "
                  "what their business does (or its NAICS codes if they know them), find the codes with lookup_naics "
                  "and call search_contracts with naics set to them, the profile_used state and set-aside, and the "
@@ -734,6 +739,11 @@ async def my_matches(
             raise api.fail("upstream_error", "MatchAwards is busy right now. Retry in a minute.")
         if profile == linking.FORBIDDEN:  # the account itself is refused: neither would linking again
             raise api.fail("forbidden", FORBIDDEN_TEXT)
+        if links.source.get() == "chatgpt" and not linking.CHATGPT_SIGNIN:
+            out = MyMatches(results=[], has_more=False, note=NO_SIGNIN_NOTE,
+                            profile_used={"naics": [], "set_aside_applied": False})
+            out._signin_unavailable = True
+            return out
         error = profile if profile in (linking.INVALID, linking.INSUFFICIENT) else linking.INVALID
         return linking.challenge_result(error, LINK_PROMPT)
     naics, state = list(profile.naics[:MAX_NAICS]), None if ignore_state else profile.state

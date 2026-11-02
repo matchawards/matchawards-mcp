@@ -42,6 +42,10 @@ ISSUER = os.environ.get("MATCHAWARDS_AUTH_ISSUER", "").strip().rstrip("/")  # ""
 RESOURCE = os.environ.get("MATCHAWARDS_RESOURCE", "").strip()  # "" = {ISSUER}/mcp
 # /api/agent/v1 lives in the same app as the public API, so by default it is the same base.
 AGENT_API_BASE = os.environ.get("MATCHAWARDS_AGENT_API_BASE", "").strip().rstrip("/") or api.API_BASE
+# "0": ChatGPT's connection to this server offers no sign-in (an app published with No authentication keeps that
+# until OpenAI changes it), so ChatGPT shows a challenge result only as "internal error". my_matches then answers
+# ChatGPT without the challenge: sign-in isn't available there yet, search by NAICS instead. Other hosts still link.
+CHATGPT_SIGNIN = os.environ.get("MATCHAWARDS_CHATGPT_SIGNIN", "1").strip() != "0"
 SCOPE = "profile:read"
 ME_PATH = "/api/agent/v1/me"
 METADATA_PATH = "/.well-known/oauth-protected-resource"

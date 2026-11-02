@@ -352,3 +352,48 @@ async def test_calls_are_counted_by_outcome(linked, me_api, api):
     assert counts[("mcp_tool_calls_total", (("family", "openai-mcp"), ("outcome", "link_required"),
                                             ("tool", "my_matches")))] == 1
     assert counts[("mcp_tool_calls_total", (("family", "claude-user"), ("outcome", "ok"), ("tool", "my_matches")))] == 1
+
+
+# --- ChatGPT's connection without sign-in (MATCHAWARDS_CHATGPT_SIGNIN=0): no challenge, a plain answer -------------
+
+@pytest.mark.anyio
+async def test_chatgpt_without_signin_gets_a_plain_answer_not_the_challenge(linked, me_api, api, monkeypatch):
+    monkeypatch.setattr(linking, "CHATGPT_SIGNIN", False)
+    usage.metrics.counts.clear()
+    async with http() as hc:
+        r = await call(hc, ua=OPENAI_UA)
+    assert r.status_code == 200 and "www-authenticate" not in r.headers
+    result = r.json()["result"]
+    assert result["isError"] is False and "mcp/www_authenticate" not in (result.get("_meta") or {})
+    out = result["structuredContent"]
+    assert out["results"] == [] and out["has_more"] is False and out["note"] == tools.NO_SIGNIN_NOTE
+    assert out["profile_used"] == {"naics": [], "set_aside": None, "set_aside_name": None, "set_aside_applied": False,
+                                   "state": None}
+    jsonschema.validate(out, server.mcp._tool_manager.get_tool("my_matches").output_schema)
+    assert api.requests == [] and me_api.requests == []
+    assert usage.metrics.counts[("mcp_tool_calls_total", (("family", "openai-mcp"), ("outcome", "signin_unavailable"),
+                                                           ("tool", "my_matches")))] == 1
+    assert not any(name == "mcp_link_challenges_total" for name, _ in usage.metrics.counts)
+
+
+@pytest.mark.anyio
+async def test_without_chatgpt_signin_other_hosts_still_link(linked, me_api, api, monkeypatch):
+    monkeypatch.setattr(linking, "CHATGPT_SIGNIN", False)
+    async with http() as hc:
+        r = await call(hc, ua=CLAUDE_UA)
+    assert r.status_code == 401 and r.headers["www-authenticate"] == header("invalid_token")
+
+
+@pytest.mark.anyio
+async def test_without_chatgpt_signin_a_linked_chatgpt_user_still_gets_matches(linked, me_api, api, monkeypatch):
+    monkeypatch.setattr(linking, "CHATGPT_SIGNIN", False)
+    api.replies = [ok(page([1]))]
+    async with http() as hc:
+        r = await call(hc, ua=OPENAI_UA, token=TOKEN)
+    out = r.json()["result"]["structuredContent"]
+    assert len(out["results"]) == 1 and out["note"].startswith(NOTE)
+
+
+def test_the_no_signin_note_says_it_is_not_an_error_and_falls_back_to_naics():
+    assert "isn't available in ChatGPT yet" in tools.NO_SIGNIN_NOTE and "not an error" in tools.NO_SIGNIN_NOTE
+    assert "lookup_naics" in tools.NO_SIGNIN_NOTE and "search_contracts" in tools.NO_SIGNIN_NOTE

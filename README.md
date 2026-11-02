@@ -212,6 +212,7 @@ Do not trust a broad private range such as `172.16.0.0/12`: it may overlap your 
 | `MATCHAWARDS_USAGE_RETENTION_DAYS` | `180` | `--http` only: days usage-stat rows are kept. |
 | `MATCHAWARDS_AUTH_ISSUER` | unset | `--http` only: the OAuth authorization server, an https URL (http only on `localhost`, `127.0.0.1` or `[::1]`, for a local run; e.g. `https://matchawards.com`). Set: account linking is on. Unset: no linking, and nothing else changes. |
 | `MATCHAWARDS_RESOURCE` | `<issuer>/mcp` | `--http` only, linking on: this server's public https URL (http only on a loopback host), the resource tokens are issued for. |
+| `MATCHAWARDS_CHATGPT_SIGNIN` | `1` | `--http` only, linking on: `0` when ChatGPT's connection to this server offers no sign-in (an app published with No authentication). ChatGPT shows a challenge result only as an internal error, so `my_matches` then answers ChatGPT without one: sign-in isn't available there yet, search by NAICS codes instead (outcome `signin_unavailable`). A linked ChatGPT user and other hosts are unaffected. |
 | `MATCHAWARDS_AGENT_API_BASE` | `MATCHAWARDS_API_BASE` | `--http` only, linking on: base URL of the account API that checks a linked user's token. |
 | `MATCHAWARDS_WIDGETS` | unset | `1`: serve the result card (see Cards). Unset: no card resource and no `show_results`. |
 

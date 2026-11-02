@@ -137,6 +137,7 @@ class MyMatches(SearchResult):
     profile_used: ProfileUsed
     settings_url: SiteUrl = Field(None, description="Set when the profile has no NAICS codes: the match settings "
                                   "page on matchawards.com where the user adds them. Show it as a markdown link.")
+    _signin_unavailable: bool = PrivateAttr(False)  # the host offers no sign-in (linking.CHATGPT_SIGNIN off)
 
 
 class ShownResults(BaseModel):
