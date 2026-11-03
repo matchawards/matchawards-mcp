@@ -8,13 +8,14 @@ published schema only changes on purpose.
 import re
 from typing import Annotated
 
-from pydantic import AfterValidator, BaseModel, BeforeValidator, Field, PrivateAttr
+from pydantic import AfterValidator, BaseModel, BeforeValidator, Field, PrivateAttr, model_validator
 
 from . import links
 
 Text = str | None
 # A link to a matchawards.com page: it carries UTM parameters naming the AI host (links.tagged). Third-party links
-# (sam_url, source_url) are plain Text.
+# (sam_url, source_url) are plain Text; with go-links on, a model's after-validator turns them into the record's
+# matchawards.com/go link (links.go).
 SiteUrl = Annotated[Text, AfterValidator(links.tagged)]
 # AI text from the API, cut to 1000 characters (the API cuts it too; a longer value is shortened, not rejected).
 AiText = Annotated[
@@ -111,6 +112,11 @@ class OpportunityRow(BaseModel):
     url: SiteUrl = Field(None, description="The posting on matchawards.com. Show it as a markdown link.")
     sam_url: Text = Field(None, description="The SAM.gov notice (federal only). Show it as a markdown link.")
     solicitation_number: Text = None
+
+    @model_validator(mode="after")
+    def _go_link(self):
+        self.sam_url = links.go(self.id, self.url, self.sam_url)
+        return self
 
 
 class SearchResult(BaseModel):
@@ -239,6 +245,11 @@ class AwardRow(BaseModel):
     source_url: Text = Field(None, description="The award notice at SAM.gov or USAspending. Show it as a markdown "
                              "link.")
 
+    @model_validator(mode="after")
+    def _go_link(self):
+        self.source_url = links.go(self.id, self.url, self.source_url)
+        return self
+
 
 class AwardSearchResult(SearchResult):
     results: list[AwardRow]
@@ -301,6 +312,11 @@ class OpportunitySummary(BaseModel):
     open: bool = Field(description="true: the deadline is today or later, US Eastern (no deadline: false).")
     url: SiteUrl = Field(None, description="The posting on matchawards.com. Show it as a markdown link.")
     sam_url: Text = Field(None, description="The SAM.gov notice (federal only). Show it as a markdown link.")
+
+    @model_validator(mode="after")
+    def _go_link(self):
+        self.sam_url = links.go(self.id, self.url, self.sam_url)
+        return self
 
 
 class Winner(BaseModel):

@@ -184,3 +184,87 @@ async def test_over_http_the_source_comes_from_the_user_agent(api, ua, label):
     [row] = out.structured_content["results"]
     assert utm(row["url"]) == params(label)
     assert links.source.get() == "mcp"  # reset after the request
+
+
+# --- go-links (MATCHAWARDS_GO_LINKS=1) --------------------------------------------------------------------------
+
+PAGE = "https://matchawards.com/a/posts/7?utm_source=mcp&utm_medium=ai_agent&utm_campaign=matchawards_mcp"
+
+
+@pytest.fixture
+def go_on(monkeypatch):
+    monkeypatch.setattr(links, "GO_LINKS", True)
+
+
+def go_url(via, record_id, host="matchawards.com"):
+    return (f"https://{host}/go/{via}/{record_id}"
+            f"?utm_source={via}&utm_medium=ai_agent&utm_campaign=matchawards_mcp")
+
+
+def test_go_links_are_off_by_default():
+    assert links.GO_LINKS is False
+    assert links.go("7", PAGE, "https://sam.gov/opp/7/view") == "https://sam.gov/opp/7/view"
+
+
+def test_a_source_link_becomes_the_records_go_link_with_the_caller_as_via(go_on):
+    with as_source("chatgpt"):
+        assert links.go("7", PAGE, "https://sam.gov/opp/7/view") == go_url("chatgpt", "7")
+    assert links.go("7", PAGE, "https://www.usaspending.gov/award/X") == go_url("mcp", "7")
+
+
+def test_a_staging_record_gets_a_staging_go_link(go_on):
+    page = "https://staging.matchawards.com/a/posts/7"
+    assert links.go("7", page, "https://sam.gov/opp/7/view") == go_url("mcp", "7", "staging.matchawards.com")
+
+
+@pytest.mark.parametrize("record_id, page, url", [
+    (None, PAGE, "https://sam.gov/x"),                     # an award with no MatchAwards page
+    ("", PAGE, "https://sam.gov/x"),
+    ("7/../admin", PAGE, "https://sam.gov/x"),             # not a number: never pasted into the path
+    ("1e5", PAGE, "https://sam.gov/x"),
+    ("7", None, "https://sam.gov/x"),                      # no page on the site to take the host from
+    ("7", "https://evil.example/a/posts/7", "https://sam.gov/x"),
+    ("7", "https://matchawards.com.evil.example/a/7", "https://sam.gov/x"),
+    ("7", "http://matchawards.com/a/7", "https://sam.gov/x"),
+    ("7", "https://user@matchawards.com/a/7", "https://sam.gov/x"),
+    ("7", "https://evil.example\\@matchawards.com/a/7", "https://sam.gov/x"),
+    ("7", "https://[::1/a", "https://sam.gov/x"),          # unparsable page URL
+    ("7", PAGE, "https://matchawards.com/go/mcp/7"),       # already a site link: left alone, not wrapped twice
+])
+def test_the_plain_link_is_kept_when_no_safe_go_link_can_be_built(go_on, record_id, page, url):
+    assert links.go(record_id, page, url) == url
+
+
+@pytest.mark.parametrize("url", [None, ""])
+def test_no_source_link_stays_none(go_on, url):
+    assert links.go("7", PAGE, url) is None
+
+
+@pytest.mark.anyio
+async def test_with_go_links_on_search_rows_summaries_and_awards_carry_go_links(api, go_on):
+    rows = [{**r, "sam_url": f"https://sam.gov/opp/{r['id']}/view"} for r in page([1, 2])["results"]]
+    api.replies = [ok({**page([1, 2]), "results": rows})]
+    with as_source("claude"):
+        out = await tools.search_contracts(state="VA")
+    assert [r.sam_url for r in out.results] == [go_url("claude", "1"), go_url("claude", "2")]
+
+    detail = {"id": "9", "type": "federal", "naics": {"code": "541512"}, "agency_id": "dept_of_the_army",
+              "url": "https://matchawards.com/a/9", "sam_url": "https://sam.gov/opp/9/view"}
+    api.replies = [lambda req: httpx.Response(200, json=awards_page([1]) if req.url.path == AWARDS
+                                              else {"as_of": "x", "result": detail})]
+    out = await tools.assess_opportunity("9")
+    assert out.opportunity.sam_url == go_url("mcp", "9")  # the summary keeps the row's go-link, not wrapped twice
+    assert [a.source_url for a in out.similar_awards] == [go_url("mcp", "1")]
+
+    api.replies = [ok({"as_of": "x", "result": COMPANY})]
+    first, no_page = (await tools.get_company("C3KXNLTAAY98")).recent_awards
+    assert first.source_url == go_url("mcp", "1")
+    assert no_page.source_url == "https://sam.gov/opp/2"  # no MatchAwards id: the plain link
+
+
+@pytest.mark.anyio
+async def test_with_go_links_on_the_output_still_matches_the_published_schema(api, go_on):
+    api.replies = [ok({"as_of": "x", "result": {"id": "7", "type": "federal", "url": "https://matchawards.com/a/7",
+                                                "sam_url": "https://sam.gov/opp/7/view"}})]
+    out = await schema_checked("get_opportunity", {"id": "7"})
+    assert out["sam_url"] == go_url("mcp", "7")
