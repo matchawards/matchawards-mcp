@@ -201,8 +201,8 @@ def go_url(via, record_id, host="matchawards.com"):
             f"?utm_source={via}&utm_medium=ai_agent&utm_campaign=matchawards_mcp")
 
 
-def test_go_links_are_off_by_default():
-    assert links.GO_LINKS is False
+def test_with_go_links_off_the_source_link_is_plain(monkeypatch):
+    monkeypatch.setattr(links, "GO_LINKS", False)
     assert links.go("7", PAGE, "https://sam.gov/opp/7/view") == "https://sam.gov/opp/7/view"
 
 
@@ -210,6 +210,10 @@ def test_a_source_link_becomes_the_records_go_link_with_the_caller_as_via(go_on)
     with as_source("chatgpt"):
         assert links.go("7", PAGE, "https://sam.gov/opp/7/view") == go_url("chatgpt", "7")
     assert links.go("7", PAGE, "https://www.usaspending.gov/award/X") == go_url("mcp", "7")
+
+
+def test_the_largest_site_status_id_is_go_linked(go_on):
+    assert links.go(str(2**63 - 1), PAGE, "https://sam.gov/x") == go_url("mcp", str(2**63 - 1))
 
 
 def test_a_staging_record_gets_a_staging_go_link(go_on):
@@ -222,6 +226,8 @@ def test_a_staging_record_gets_a_staging_go_link(go_on):
     ("", PAGE, "https://sam.gov/x"),
     ("7/../admin", PAGE, "https://sam.gov/x"),             # not a number: never pasted into the path
     ("1e5", PAGE, "https://sam.gov/x"),
+    (str(2**63), PAGE, "https://sam.gov/x"),               # past the site's status ids
+    ("1" * 20, PAGE, "https://sam.gov/x"),
     ("7", None, "https://sam.gov/x"),                      # no page on the site to take the host from
     ("7", "https://evil.example/a/posts/7", "https://sam.gov/x"),
     ("7", "https://matchawards.com.evil.example/a/7", "https://sam.gov/x"),

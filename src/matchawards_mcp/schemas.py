@@ -87,7 +87,19 @@ class Contact(BaseModel):
     title: Text = None
 
 
-class OpportunityRow(BaseModel):
+class GoLinked(BaseModel):
+    """A record with an id, its matchawards.com page (url) and a third-party source link (sam_url or source_url):
+    with go-links on, the source link is the record's matchawards.com/go link (links.go)."""
+
+    @model_validator(mode="after")
+    def _go_link(self):
+        for field in ("sam_url", "source_url"):
+            if field in type(self).model_fields:
+                setattr(self, field, links.go(self.id, self.url, getattr(self, field)))
+        return self
+
+
+class OpportunityRow(GoLinked):
     """One search result. Jobs fill title, agency (the employer), state, city, posted_at and url only."""
 
     id: str = Field(strict=True, description="Pass to get_opportunity for the description and contacts.")
@@ -112,11 +124,6 @@ class OpportunityRow(BaseModel):
     url: SiteUrl = Field(None, description="The posting on matchawards.com. Show it as a markdown link.")
     sam_url: Text = Field(None, description="The SAM.gov notice (federal only). Show it as a markdown link.")
     solicitation_number: Text = None
-
-    @model_validator(mode="after")
-    def _go_link(self):
-        self.sam_url = links.go(self.id, self.url, self.sam_url)
-        return self
 
 
 class SearchResult(BaseModel):
@@ -218,7 +225,7 @@ class Period(BaseModel):
     end: Text = None
 
 
-class AwardRow(BaseModel):
+class AwardRow(GoLinked):
     """One award. Federal contract awards fill solicitation_number and contract_number; grant awards fill
     cfda_number and period, and their title is the recipient's name."""
 
@@ -244,11 +251,6 @@ class AwardRow(BaseModel):
     url: SiteUrl = Field(None, description="The award on matchawards.com. Show it as a markdown link.")
     source_url: Text = Field(None, description="The award notice at SAM.gov or USAspending. Show it as a markdown "
                              "link.")
-
-    @model_validator(mode="after")
-    def _go_link(self):
-        self.source_url = links.go(self.id, self.url, self.source_url)
-        return self
 
 
 class AwardSearchResult(SearchResult):
@@ -298,7 +300,7 @@ class Company(BaseModel):
     note: Text = None
 
 
-class OpportunitySummary(BaseModel):
+class OpportunitySummary(GoLinked):
     id: str = Field(strict=True)
     type: Text = None
     title: Text = None
@@ -312,11 +314,6 @@ class OpportunitySummary(BaseModel):
     open: bool = Field(description="true: the deadline is today or later, US Eastern (no deadline: false).")
     url: SiteUrl = Field(None, description="The posting on matchawards.com. Show it as a markdown link.")
     sam_url: Text = Field(None, description="The SAM.gov notice (federal only). Show it as a markdown link.")
-
-    @model_validator(mode="after")
-    def _go_link(self):
-        self.sam_url = links.go(self.id, self.url, self.sam_url)
-        return self
 
 
 class Winner(BaseModel):

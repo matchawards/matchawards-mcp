@@ -25,7 +25,7 @@ DEFAULT_SOURCE = "mcp"  # stdio, an unknown or test client, or no request at all
 # through an internal address while the links in its answers name the public site.
 SITE_DOMAIN = "matchawards.com"
 
-# Off until the site serves /go/<via>/<id> (it answers an unknown id with the record's page, never a 404).
+# Off until the site serves /go/<via>/<id>.
 GO_LINKS = os.environ.get("MATCHAWARDS_GO_LINKS", "0").strip() == "1"
 
 # utm_source for the request being served (HTTP mode sets it per request, see server.HttpGuard).
@@ -83,7 +83,8 @@ def go(record_id: str | None, page_url: str | None, url: str | None) -> str | No
     number, the page is not on the site, or `url` already points to the site. None or "" gives None."""
     if not url:
         return None
-    if not GO_LINKS or not isinstance(record_id, str) or not re.fullmatch(r"[0-9]{1,18}", record_id):
+    if not GO_LINKS or not isinstance(record_id, str) or not re.fullmatch(r"[0-9]{1,19}", record_id) \
+            or int(record_id) >= 2**63:  # the site's status ids: below 2**63
         return url
     try:
         page, target = urlsplit(page_url or ""), urlsplit(url)
