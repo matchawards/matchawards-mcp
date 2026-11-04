@@ -26,6 +26,10 @@ Award records may be incomplete (federal awards especially), so every award resu
 
 Every tool is read-only and needs no account (except `my_matches`, a hosted tool that exists only with account linking on; see Linked accounts): each declares `readOnlyHint`, `idempotentHint`, a title and `securitySchemes: [{"type": "noauth"}]` (in `_meta`). Results are structured: each tool publishes an `outputSchema` and returns `structuredContent`, with the same JSON as text for clients that read only text. Every result carries a `url` on matchawards.com (and a `sam_url` for federal notices), and the server asks the model to show them as markdown links. Links to matchawards.com carry `utm_source`, `utm_medium` and `utm_campaign` parameters naming the AI host the request came from (for example `utm_source=chatgpt`); links to other sites are left unchanged.
 
+### Changes in 1.1.5
+
+- Go-links (hosted, `MATCHAWARDS_GO_LINKS=1`): an opportunity's `sam_url` and an award's `source_url` are given as the record's `https://matchawards.com/go/<utm_source>/<id>` link, which redirects to the same SAM.gov or USAspending page and counts the hand-off. A record without a MatchAwards id or page keeps its plain link. Off by default.
+
 ### Changes in 1.1.4
 
 - `search_contracts`: the first page of a NAICS search that found something tells the model it may offer, once per conversation, a free MatchAwards account that sends new matches for those codes by email, with a sign-up link carrying the host's UTM parameters. `my_matches` never offers it.
