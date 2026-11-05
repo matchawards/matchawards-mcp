@@ -34,12 +34,10 @@ source: contextvars.ContextVar[str] = contextvars.ContextVar("matchawards_utm_so
 
 def utm_source(family: str | None) -> str:
     """The utm_source label for a User-Agent family (usage.classify_ua). A fixed set, so a caller cannot mint its
-    own value: chatgpt, codex, claude, cursor, vscode, n8n or mcp."""
+    own value: chatgpt, claude, cursor, vscode, n8n or mcp."""
     family = family or ""
     if family == "openai-mcp":
         return "chatgpt"
-    if family == "codex":
-        return "codex"
     if family.startswith("claude"):
         return "claude"
     if family in ("cursor", "vscode"):

@@ -797,18 +797,26 @@ async def test_protocol_budget_per_client_and_per_48(monkeypatch):
         assert (await ping(hc, "198.51.100.30")).status_code == 200  # tool calls keep their own budget
         assert (await protocol(hc, "198.51.100.31")).status_code == 200  # another client is not affected
         assert rejected("rate_limit_protocol") == 1
-        # IPv6: every /64 of one /48 shares the per-minute protocol budget, as tool calls share theirs.
-        codes = [(await protocol(hc, f"2001:db8:5:{i:x}::1")).status_code for i in range(10)]
-        assert codes == [200] * 6 + [429] * 4
+        # IPv6: the /64s of one /48 share 4 per-client budgets a minute (24 here), as tool calls do (240 vs 60).
+        codes = [(await protocol(hc, f"2001:db8:5:{i:x}::1")).status_code for i in range(30)]
+        assert codes == [200] * 24 + [429] * 6
 
 
 @pytest.mark.anyio
-async def test_protocol_requests_from_chatgpt_are_not_limited(egress, monkeypatch):
+async def test_protocol_requests_from_chatgpt_count_only_in_the_protocol_total(egress, monkeypatch):
     monkeypatch.setenv("MATCHAWARDS_PROTOCOL_BURST", "2")
     monkeypatch.setenv("MATCHAWARDS_RATE_SUBJECT_BURST", "2")
+    monkeypatch.setenv("MATCHAWARDS_PROTOCOL_GLOBAL_PER_MIN", "12")
     async with http() as hc:
         assert {(await protocol(hc, "192.0.2.10", "tools/list", subject="u")).status_code for _ in range(10)} == {200}
         assert (await ping(hc, "192.0.2.10", subject="u")).status_code == 200  # nor do they use the user's budget
+        # All protocol requests together, from anywhere: 12 a minute here.
+        assert (await protocol(hc, "198.51.100.50")).status_code == 200
+        assert (await protocol(hc, "198.51.100.51")).status_code == 200
+        assert (await protocol(hc, "198.51.100.52")).status_code == 429
+        assert (await protocol(hc, "192.0.2.10", subject="v")).status_code == 429
+        assert rejected("rate_limit_protocol_global") == 2
+        assert (await ping(hc, "198.51.100.52")).status_code == 200  # tool calls are not in that total
 
 
 @pytest.mark.anyio
@@ -816,21 +824,55 @@ async def test_protocol_requests_from_chatgpt_are_not_limited(egress, monkeypatc
     {"jsonrpc": "2.0", "id": 1, "method": "completion/complete", "params": {}},  # a method with no free pass
     {"jsonrpc": "2.0", "id": 1, "method": "made/up"},  # unknown to the SDK
     [{"jsonrpc": "2.0", "id": 1, "method": "initialize"}],  # a batch, even of protocol requests
+    {"jsonrpc": "2.0", "id": 1, "method": ["tools/list"]},  # a method that is not a string
+    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"pad": "x" * 9000}},  # past OBSERVE_BYTES
     "not json",
-])
+], ids=["completion", "unknown", "batch", "method-not-str", "past-observe", "not-json"])
 async def test_anything_but_a_protocol_request_counts_as_a_tool_call(monkeypatch, body):
     monkeypatch.setenv("MATCHAWARDS_RATE_BURST", "2")
     headers = {**LEGACY, "X-Real-IP": "198.51.100.40"}
     async with http() as hc:
         for _ in range(2):
             if isinstance(body, str):
-                await hc.post("/mcp", content=body, headers={**headers, "Content-Type": "application/json"})
+                r = await hc.post("/mcp", content=body, headers={**headers, "Content-Type": "application/json"})
             else:
-                await hc.post("/mcp", json=body, headers=headers)
+                r = await hc.post("/mcp", json=body, headers=headers)
+            assert r.status_code < 500
         assert (await ping(hc, "198.51.100.40")).status_code == 429
+
+
+def test_parse_body_never_raises():
+    """It runs before the rate check now: any body gives a result (an unknown one counts as a tool call)."""
+    deep = b'{"method": "tools/list", "a": ' + b"[" * 200_000 + b"]" * 200_000 + b"}"
+    for body in (deep, b'{"method": []}', b'{"method": {"a": 1}}', b"\xff\xfe", b"", b"null", b'{"params": 5}'):
+        method, _, _ = usage.parse_body(body)
+        assert method == usage.OTHER and not server.is_protocol(method)
 
 
 def test_codex_is_its_own_family():
     assert usage.classify_ua("codex-mcp-client/0.46.0") == "codex"
     assert usage.classify_ua("openai-mcp/1.0.0") == "openai-mcp"  # ChatGPT, and Codex in the cloud
-    assert links.utm_source("codex") == "codex"
+    assert usage.classify_ua("vscode-codex-extension/1.0") == "vscode"  # an editor's own name wins
+    # matchawards.com counts go-link hand-offs only for its known vias, which do not include codex yet.
+    assert links.utm_source("codex") == "mcp"
+
+
+@pytest.mark.anyio
+async def test_a_body_that_does_not_arrive_in_time_gets_408(monkeypatch):
+    monkeypatch.setattr(server, "BODY_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(usage, "metrics", usage.Metrics())
+    app = server.http_app()
+    sent = []
+
+    async def receive():
+        await asyncio.sleep(10)  # the client never sends its body
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {"type": "http", "method": "POST", "path": "/mcp", "raw_path": b"/mcp", "query_string": b"",
+             "headers": [(b"host", b"matchawards.com"), (b"content-length", b"100")], "client": ("127.0.0.1", 1)}
+    async with app.router.lifespan_context(app):
+        await app(scope, receive, send)
+    assert sent[0]["status"] == 408
+    assert rejected("timeout") == 1

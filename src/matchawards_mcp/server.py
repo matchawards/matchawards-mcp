@@ -280,11 +280,14 @@ MAX_BODY_BYTES = 64 * 1024  # a JSON-RPC request to these tools is well under 2 
 # notifications. Coding agents (Codex) run initialize, tools/list, prompts/list and resources/list again for each
 # session, three to four of these per tool call, so they get their own wider per-client budget
 # (MATCHAWARDS_PROTOCOL_PER_MIN / _BURST) instead of using up the tool-call one. Anything else (tools/call, a
-# method the SDK does not know, a batch, a body that is not JSON) counts as a tool call.
+# method the SDK does not know, a batch, a body that is not JSON) counts as a tool call. Keep this to methods with
+# no API request behind them: resources/read serves only the static results card (build_mcp); a resource or prompt
+# that calls the API must not be added here.
 PROTOCOL_METHODS = frozenset({
-    "initialize", "ping", "server/discover", "tools/list", "prompts/list", "prompts/get", "resources/list",
+    "initialize", "ping", "server/discover", "tools/list", "prompts/list", "resources/list",
     "resources/templates/list", "resources/read",
 })
+BODY_TIMEOUT_S = 10  # the whole body must arrive within this, before the rate check (nginx buffers it anyway)
 
 
 def is_protocol(method: str) -> bool:
@@ -511,14 +514,15 @@ class HttpGuard:
 
     def __init__(self, app, limiter: RateLimiter, prefix_limiter: RateLimiter, global_limiter: RateLimiter,
                  subject_limiter: RateLimiter, egress_limiter: RateLimiter, egress: EgressRanges,
-                 trusted_proxies, allowed_hosts, usage_salt: bytes | None = None,
-                 protocol_limiter: RateLimiter | None = None):
+                 trusted_proxies, allowed_hosts, usage_salt: bytes | None = None, *,
+                 protocol_limiter: RateLimiter, protocol_global_limiter: RateLimiter):
         self.app, self.limiter, self.prefix_limiter, self.global_limiter = app, limiter, prefix_limiter, global_limiter
         self.subject_limiter, self.egress_limiter, self.egress = subject_limiter, egress_limiter, egress
         self.trusted_proxies, self.allowed_hosts, self.usage_salt = trusted_proxies, allowed_hosts, usage_salt
-        self.protocol_limiter = protocol_limiter or RateLimiter(600, 120)
-        # All /64s of one IPv6 /48 together: the per-minute protocol budget, with no 5-second rule.
-        self.protocol_prefix_limiter = RateLimiter(self.protocol_limiter.per_min, 0)
+        self.protocol_limiter, self.protocol_global_limiter = protocol_limiter, protocol_global_limiter
+        # All /64s of one IPv6 /48 together: 4 per-client budgets per minute (as for tool calls, 240 vs 60), with
+        # no 5-second rule, so one /64 cannot use up its neighbours' budget.
+        self.protocol_prefix_limiter = RateLimiter(4 * protocol_limiter.per_min, 0)
 
     def reject(self, scope, path: str) -> tuple[str, Response] | None:
         """(reason, response) that ends this request before its body is read, or None to go on."""
@@ -547,16 +551,17 @@ class HttpGuard:
         """(reason, 429 response) when a rate limit stops this /mcp request, else None (and the request is counted).
 
         `protocol`: the request is a handshake, listing or notification (is_protocol), with no API request behind
-        it. It counts only in the per-client protocol budget (per address, and per minute per IPv6 /48);
-        from ChatGPT's egress addresses it is not limited, since the egress pool is there to bound API load and
-        these requests add none. Every other request counts in the tool-call limits below."""
+        it. It counts only in the protocol budgets: per client (address, and per minute per IPv6 /48) and all
+        protocol requests together (each still writes the usage ledger). From ChatGPT's egress addresses only the
+        all-together one applies: the per-user and egress pools are there to bound API load, and these requests add
+        none. Every other request counts in the tool-call limits below."""
         self.egress.refresh_if_due()
         if protocol:
-            if ip in self.egress:
-                return None
-            prefix = prefix_key(key)
-            checks = [(self.protocol_limiter, key, "protocol")]
-            checks += [(self.protocol_prefix_limiter, prefix, "protocol")] if prefix else []
+            checks = [(self.protocol_global_limiter, "all", "protocol_global")]
+            if ip not in self.egress:
+                prefix = prefix_key(key)
+                checks[:0] = [(self.protocol_limiter, key, "protocol")]
+                checks += [(self.protocol_prefix_limiter, prefix, "protocol")] if prefix else []
             return self._count(checks)
         # A request counts in the limits only when all of them allow it: a source adds at most its own budget to
         # the global count (IPv4 address 60/min, IPv6 /48 240/min, all of ChatGPT 600/min, so 1200 needs 5+ /48s
@@ -594,12 +599,12 @@ class HttpGuard:
             limiter.record(k)
         return None
 
-    async def serve_mcp(self, scope, receive, send, ip, key: str, body: bytes) -> None:
+    async def serve_mcp(self, scope, receive, send, ip, key: str, body: bytes, parsed: tuple[str, str, str]) -> None:
         """Pass a request on to /mcp, observing it for the usage stats on the way.
 
         `body` is the request body as __call__ read it (read_body: at most MAX_BODY_BYTES; `receive` replays it to
-        the MCP layer). Only the JSON-RPC method and clientInfo are read from its first usage.OBSERVE_BYTES, after
-        the response is sent.
+        the MCP layer); `parsed` is usage.parse_body of its first usage.OBSERVE_BYTES (method, client name and
+        version), counted after the response is sent.
 
         With account linking on, a tools/call of a linked tool is checked (linking.check) and the outcome put in
         linking.auth for the tool. No or a bad token gets a 401, a token without the scope a 403, unless the caller
@@ -634,7 +639,7 @@ class HttpGuard:
             linking.auth.reset(auth_token)
             links.source.reset(source_token)
             _request.reset(token)
-            method, name, version = usage.parse_body(body[: usage.OBSERVE_BYTES])
+            method, name, version = parsed
             usage.metrics.inc("mcp_requests_total", method=method)
             usage.metrics.inc("mcp_agent_requests_total", family=req["family"])
             if method == "initialize":
@@ -662,18 +667,24 @@ class HttpGuard:
             await send(message)
 
         try:
-            rejected, body = self.reject(scope, path), b""
+            rejected, body, parsed = self.reject(scope, path), b"", (usage.OTHER, "", "")
             if not rejected and path == "/mcp":
                 # The body (at most MAX_BODY_BYTES; Content-Length was checked above) tells a tool call from a
-                # handshake or listing request, which have separate rate budgets.
-                body, receive = await read_body(receive, MAX_BODY_BYTES)
-                rejected = self.limit(scope, ip, key, is_protocol(usage.parse_body(body)[0]))
+                # handshake or listing request, which have separate rate budgets. Parsed once, from its first
+                # usage.OBSERVE_BYTES (a handshake is well under 2 KB): a longer or unreadable body is a tool call.
+                try:
+                    body, receive = await asyncio.wait_for(read_body(receive, MAX_BODY_BYTES), BODY_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    rejected = "timeout", PlainTextResponse("Request body not received in time", status_code=408)
+                else:
+                    parsed = usage.parse_body(body[: usage.OBSERVE_BYTES])
+                    rejected = self.limit(scope, ip, key, is_protocol(parsed[0]))
             if rejected:
                 usage.metrics.inc("mcp_rejected_total", reason=rejected[0])
                 await rejected[1](scope, receive, send_status)
             elif path == "/mcp":
                 await self.serve_mcp({**scope, "path": path, "raw_path": path.encode()}, receive, send_status, ip,
-                                     key, body)
+                                     key, body, parsed)
             else:
                 await self.app({**scope, "path": path, "raw_path": path.encode()}, receive, send_status)
         finally:
@@ -747,6 +758,9 @@ def http_app() -> Starlette:
         # Handshake, listing and notification requests per client (is_protocol): no API request behind them.
         protocol_limiter=RateLimiter(_env_int("MATCHAWARDS_PROTOCOL_PER_MIN", 600),
                                      _env_int("MATCHAWARDS_PROTOCOL_BURST", 120)),
+        # All handshake, listing and notification requests together, ChatGPT's included: bounds the usage-ledger
+        # writes and parsing they still cost.
+        protocol_global_limiter=RateLimiter(_env_int("MATCHAWARDS_PROTOCOL_GLOBAL_PER_MIN", 6000), 0),
         # All clients together: bounds the load on the API, which does not rate-limit this server's address.
         # All /64s of one IPv6 /48 together.
         prefix_limiter=RateLimiter(_env_int("MATCHAWARDS_RATE_PER_PREFIX_MIN", 240), 0),

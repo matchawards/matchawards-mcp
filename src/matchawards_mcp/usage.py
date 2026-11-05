@@ -47,7 +47,7 @@ OTHER = "_other"
 
 # First match wins, so the more specific names come first (claude-user and claudebot before claude).
 FAMILIES = (
-    "openai-mcp", "codex", "claude-user", "claudebot", "claude", "chatgpt-user", "perplexity", "cursor", "vscode",
+    "openai-mcp", "claude-user", "claudebot", "claude", "chatgpt-user", "perplexity", "cursor", "vscode", "codex",
     "matchawards-mcp", "matchawards-cli", "n8n-nodes-matchawards", "matchawards-test",
 )
 # Words directory, uptime and census tooling puts in its own UA. A bare curl/httpx/node UA has none of them.
@@ -94,11 +94,11 @@ def parse_body(body: bytes) -> tuple[str, str, str]:
     """(method, client name, client version) from the start of a JSON-RPC body. Total: junk gives ('_other', '', '')."""
     try:
         msg = json.loads(body)
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         return OTHER, "", ""
     if not isinstance(msg, dict):
         return OTHER, "", ""
-    method = msg.get("method")
+    method = msg.get("method") if isinstance(msg.get("method"), str) else None
     params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
     info = params.get("clientInfo") if method == "initialize" else None
     if not isinstance(info, dict) and isinstance(params.get("_meta"), dict):
