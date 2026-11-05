@@ -276,6 +276,21 @@ _LOG_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
 _LOG_PATHS = {"/mcp", "/healthz", linking.METADATA_PATH, linking.METADATA_PATH + "/mcp"}
 MAX_BODY_BYTES = 64 * 1024  # a JSON-RPC request to these tools is well under 2 KB
 
+# Requests with no MatchAwards API request behind them: the handshake, listings, the static widget resource and
+# notifications. Coding agents (Codex) run initialize, tools/list, prompts/list and resources/list again for each
+# session, three to four of these per tool call, so they get their own wider per-client budget
+# (MATCHAWARDS_PROTOCOL_PER_MIN / _BURST) instead of using up the tool-call one. Anything else (tools/call, a
+# method the SDK does not know, a batch, a body that is not JSON) counts as a tool call.
+PROTOCOL_METHODS = frozenset({
+    "initialize", "ping", "server/discover", "tools/list", "prompts/list", "prompts/get", "resources/list",
+    "resources/templates/list", "resources/read",
+})
+
+
+def is_protocol(method: str) -> bool:
+    """True for a usage.parse_body method that has no API request behind it (PROTOCOL_METHODS or a notification)."""
+    return method in PROTOCOL_METHODS or method.startswith("notifications/")
+
 
 class RateLimiter:
     """Sliding window per client key: at most `per_min` requests in 60 s and `burst` in 5 s."""
@@ -486,8 +501,9 @@ async def read_body(receive, limit: int):
 
 class HttpGuard:
     """Runs before the MCP layer, in this order: path (404), Host (421), method (405), body size (411/413),
-    rate limits (429), then, with account linking on, the challenge to a call of a linked tool without a usable
-    token (401/403, see serve_mcp). Writes one access line per request.
+    rate limits (429, after the body is read: a tool call and a handshake or listing request have separate
+    budgets), then, with account linking on, the challenge to a call of a linked tool without a usable token
+    (401/403, see serve_mcp). Writes one access line per request.
 
     A rejection is counted in mcp_rejected_total{reason}. A request passed on to /mcp is counted by JSON-RPC method
     and User-Agent family (and initialize by client), counted in the distinct-caller gauges, added to the daily
@@ -495,13 +511,17 @@ class HttpGuard:
 
     def __init__(self, app, limiter: RateLimiter, prefix_limiter: RateLimiter, global_limiter: RateLimiter,
                  subject_limiter: RateLimiter, egress_limiter: RateLimiter, egress: EgressRanges,
-                 trusted_proxies, allowed_hosts, usage_salt: bytes | None = None):
+                 trusted_proxies, allowed_hosts, usage_salt: bytes | None = None,
+                 protocol_limiter: RateLimiter | None = None):
         self.app, self.limiter, self.prefix_limiter, self.global_limiter = app, limiter, prefix_limiter, global_limiter
         self.subject_limiter, self.egress_limiter, self.egress = subject_limiter, egress_limiter, egress
         self.trusted_proxies, self.allowed_hosts, self.usage_salt = trusted_proxies, allowed_hosts, usage_salt
+        self.protocol_limiter = protocol_limiter or RateLimiter(600, 120)
+        # All /64s of one IPv6 /48 together: the per-minute protocol budget, with no 5-second rule.
+        self.protocol_prefix_limiter = RateLimiter(self.protocol_limiter.per_min, 0)
 
-    def reject(self, scope, path: str, ip, key: str) -> tuple[str, Response] | None:
-        """(reason, response) that ends this request here, or None to pass it on."""
+    def reject(self, scope, path: str) -> tuple[str, Response] | None:
+        """(reason, response) that ends this request before its body is read, or None to go on."""
         if path == "/healthz" or (linking.enabled() and path in linking.metadata_paths()):
             # Unlimited, on any Host; the route itself answers 405 to anything but GET/HEAD. The metadata is a
             # static public document: a host fetches it before it has linked, and from wherever it runs.
@@ -521,12 +541,28 @@ class HttpGuard:
             return "size", PlainTextResponse("Invalid Content-Length", status_code=400)
         if int(length) > MAX_BODY_BYTES:
             return "size", PlainTextResponse("Request body too large", status_code=413)
+        return None
+
+    def limit(self, scope, ip, key: str, protocol: bool) -> tuple[str, Response] | None:
+        """(reason, 429 response) when a rate limit stops this /mcp request, else None (and the request is counted).
+
+        `protocol`: the request is a handshake, listing or notification (is_protocol), with no API request behind
+        it. It counts only in the per-client protocol budget (per address, and per minute per IPv6 /48);
+        from ChatGPT's egress addresses it is not limited, since the egress pool is there to bound API load and
+        these requests add none. Every other request counts in the tool-call limits below."""
+        self.egress.refresh_if_due()
+        if protocol:
+            if ip in self.egress:
+                return None
+            prefix = prefix_key(key)
+            checks = [(self.protocol_limiter, key, "protocol")]
+            checks += [(self.protocol_prefix_limiter, prefix, "protocol")] if prefix else []
+            return self._count(checks)
         # A request counts in the limits only when all of them allow it: a source adds at most its own budget to
-        # the global count (IPv4 address 30/min, IPv6 /48 120/min, all of ChatGPT 600/min, so 1200 needs 10+ /48s
-        # or 40+ IPv4 addresses, or ChatGPT plus half that), and a lockout at one level does not use up the budgets
+        # the global count (IPv4 address 60/min, IPv6 /48 240/min, all of ChatGPT 600/min, so 1200 needs 5+ /48s
+        # or 20+ IPv4 addresses, or ChatGPT plus half that), and a lockout at one level does not use up the budgets
         # of the others. A distributed flood from that many sources can still trip the global cap for everyone;
         # Cloudflare in front of nginx is the outer layer.
-        self.egress.refresh_if_due()
         if ip in self.egress:
             # ChatGPT: many users share each of these addresses, so a per-IP limit would throttle them together.
             # Its x-openai-subject (one per user) gets the per-client budget instead, inside a pool for all ChatGPT
@@ -541,6 +577,11 @@ class HttpGuard:
             prefix = prefix_key(key)
             checks = [(self.limiter, key, "client"), (self.global_limiter, "all", "global")]
             checks += [(self.prefix_limiter, prefix, "prefix")] if prefix else []
+        return self._count(checks)
+
+    @staticmethod
+    def _count(checks) -> tuple[str, Response] | None:
+        """The first (limiter, key, name) in `checks` that is over its limit as a 429, else record all and None."""
         for limiter, k, name in checks:
             if wait := limiter.wait(k):
                 return f"rate_limit_{name}", JSONResponse(
@@ -553,42 +594,32 @@ class HttpGuard:
             limiter.record(k)
         return None
 
-    async def serve_mcp(self, scope, receive, send, ip, key: str) -> None:
+    async def serve_mcp(self, scope, receive, send, ip, key: str, body: bytes) -> None:
         """Pass a request on to /mcp, observing it for the usage stats on the way.
 
-        The first usage.OBSERVE_BYTES of the body are copied as they stream past, and only the JSON-RPC method and
-        clientInfo are read from them, after the response is sent.
+        `body` is the request body as __call__ read it (read_body: at most MAX_BODY_BYTES; `receive` replays it to
+        the MCP layer). Only the JSON-RPC method and clientInfo are read from its first usage.OBSERVE_BYTES, after
+        the response is sent.
 
-        With account linking on, the body is read first instead (read_body: at most MAX_BODY_BYTES, then replayed to
-        the MCP layer), and a tools/call of a linked tool is checked (linking.check) and the outcome put in
+        With account linking on, a tools/call of a linked tool is checked (linking.check) and the outcome put in
         linking.auth for the tool. No or a bad token gets a 401, a token without the scope a 403, unless the caller
         is ChatGPT (openai-mcp): it links on a tool result, so its call goes on and the tool answers the challenge.
         An account MatchAwards refuses (403 forbidden) or MatchAwards not answering the check is never a challenge:
         the call goes on and the tool reports it. The rate
         limits already counted the request, so a challenge costs what a call does."""
         headers = dict(scope["headers"])
-        subject = chatgpt_subject(scope) if ip in self.egress else b""  # as reject() decided it
+        subject = chatgpt_subject(scope) if ip in self.egress else b""  # as limit() decided it
         session = chatgpt_session(scope) if ip in self.egress else b""
         raw_ua = headers.get(b"user-agent", b"").decode("latin-1")
         ua = usage.clean(raw_ua, 200)
         req = {"client": usage.truncate_key(key), "ua": ua, "family": usage.classify_ua(ua),
                "fp": usage.fingerprint(subject, self.usage_salt)}
-        seen = bytearray()
-
-        async def observing_receive():
-            message = await receive()
-            if message["type"] == "http.request" and len(seen) < usage.OBSERVE_BYTES:
-                seen.extend(message.get("body", b"")[: usage.OBSERVE_BYTES - len(seen)])
-            return message
-
         token = _request.set(req)
         source_token = links.source.set(links.utm_source(req["family"]))  # utm_source on matchawards.com links
         auth_token = linking.auth.set(None)
         try:
-            app, app_receive = self.app, observing_receive
+            app = self.app
             if linking.enabled():
-                body, app_receive = await read_body(receive, MAX_BODY_BYTES)
-                seen.extend(body[: usage.OBSERVE_BYTES])
                 if linking.linked_tool(body):
                     outcome = await linking.check(scope)
                     linking.auth.set(outcome)
@@ -598,12 +629,12 @@ class HttpGuard:
                     elif outcome in (linking.INVALID, linking.INSUFFICIENT) and not linking.is_openai_host(raw_ua):
                         app = linking.challenge_response(outcome)
                         usage.metrics.inc("mcp_link_challenges_total", host=link_host(raw_ua), error=outcome)
-            await app(scope, app_receive, send)
+            await app(scope, receive, send)
         finally:
             linking.auth.reset(auth_token)
             links.source.reset(source_token)
             _request.reset(token)
-            method, name, version = usage.parse_body(bytes(seen))
+            method, name, version = usage.parse_body(body[: usage.OBSERVE_BYTES])
             usage.metrics.inc("mcp_requests_total", method=method)
             usage.metrics.inc("mcp_agent_requests_total", family=req["family"])
             if method == "initialize":
@@ -631,12 +662,18 @@ class HttpGuard:
             await send(message)
 
         try:
-            if rejected := self.reject(scope, path, ip, key):
+            rejected, body = self.reject(scope, path), b""
+            if not rejected and path == "/mcp":
+                # The body (at most MAX_BODY_BYTES; Content-Length was checked above) tells a tool call from a
+                # handshake or listing request, which have separate rate budgets.
+                body, receive = await read_body(receive, MAX_BODY_BYTES)
+                rejected = self.limit(scope, ip, key, is_protocol(usage.parse_body(body)[0]))
+            if rejected:
                 usage.metrics.inc("mcp_rejected_total", reason=rejected[0])
                 await rejected[1](scope, receive, send_status)
             elif path == "/mcp":
                 await self.serve_mcp({**scope, "path": path, "raw_path": path.encode()}, receive, send_status, ip,
-                                     key)
+                                     key, body)
             else:
                 await self.app({**scope, "path": path, "raw_path": path.encode()}, receive, send_status)
         finally:
@@ -704,10 +741,15 @@ def http_app() -> Starlette:
     )
     app.add_middleware(
         HttpGuard,
-        limiter=RateLimiter(_env_int("MATCHAWARDS_RATE_PER_MIN", 30), _env_int("MATCHAWARDS_RATE_BURST", 10)),
+        # Tool calls (and anything that is not a handshake or listing) per client: the MatchAwards API's own
+        # per-address limit (60 per minute, 20 per 5 s), so calling through this server is never stricter.
+        limiter=RateLimiter(_env_int("MATCHAWARDS_RATE_PER_MIN", 60), _env_int("MATCHAWARDS_RATE_BURST", 20)),
+        # Handshake, listing and notification requests per client (is_protocol): no API request behind them.
+        protocol_limiter=RateLimiter(_env_int("MATCHAWARDS_PROTOCOL_PER_MIN", 600),
+                                     _env_int("MATCHAWARDS_PROTOCOL_BURST", 120)),
         # All clients together: bounds the load on the API, which does not rate-limit this server's address.
         # All /64s of one IPv6 /48 together.
-        prefix_limiter=RateLimiter(_env_int("MATCHAWARDS_RATE_PER_PREFIX_MIN", 120), 0),
+        prefix_limiter=RateLimiter(_env_int("MATCHAWARDS_RATE_PER_PREFIX_MIN", 240), 0),
         # Above MATCHAWARDS_EGRESS_PER_MIN (checked above): ChatGPT traffic alone can use its whole pool, and
         # everyone else still needs room under the global cap.
         global_limiter=RateLimiter(global_per_min, 0),

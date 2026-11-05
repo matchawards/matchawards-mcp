@@ -47,7 +47,7 @@ OTHER = "_other"
 
 # First match wins, so the more specific names come first (claude-user and claudebot before claude).
 FAMILIES = (
-    "openai-mcp", "claude-user", "claudebot", "claude", "chatgpt-user", "perplexity", "cursor", "vscode",
+    "openai-mcp", "codex", "claude-user", "claudebot", "claude", "chatgpt-user", "perplexity", "cursor", "vscode",
     "matchawards-mcp", "matchawards-cli", "n8n-nodes-matchawards", "matchawards-test",
 )
 # Words directory, uptime and census tooling puts in its own UA. A bare curl/httpx/node UA has none of them.
