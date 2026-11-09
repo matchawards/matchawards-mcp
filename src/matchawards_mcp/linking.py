@@ -40,6 +40,9 @@ from . import api, links
 
 ISSUER = os.environ.get("MATCHAWARDS_AUTH_ISSUER", "").strip().rstrip("/")  # "" = linking off
 RESOURCE = os.environ.get("MATCHAWARDS_RESOURCE", "").strip()  # "" = {ISSUER}/mcp
+# The resource MatchAwards names in /me for a token this server takes. "" = resource(). Set it when this server runs
+# under a second public URL while the authorization server still issues every token for its first one.
+TOKEN_RESOURCE = os.environ.get("MATCHAWARDS_TOKEN_RESOURCE", "").strip()
 # /api/agent/v1 lives in the same app as the public API, so by default it is the same base.
 AGENT_API_BASE = os.environ.get("MATCHAWARDS_AGENT_API_BASE", "").strip().rstrip("/") or api.API_BASE
 # "0": ChatGPT's connection to this server offers no sign-in (an app published with No authentication keeps that
@@ -105,6 +108,11 @@ def resource() -> str:
     return RESOURCE or f"{ISSUER}/mcp"
 
 
+def token_resource() -> str:
+    """The resource a token must have been issued for, as /me names it: MATCHAWARDS_TOKEN_RESOURCE or resource()."""
+    return TOKEN_RESOURCE or resource()
+
+
 def metadata_url() -> str:
     """Where the resource's metadata is, per RFC 9728 §3.1: the well-known path inserted before the resource's path
     ('https://matchawards.com/mcp' -> 'https://matchawards.com/.well-known/oauth-protected-resource/mcp')."""
@@ -138,6 +146,7 @@ def check_settings() -> None:
     if not enabled():
         return
     for name, value, public in (("MATCHAWARDS_AUTH_ISSUER", ISSUER, True), ("MATCHAWARDS_RESOURCE", resource(), True),
+                                ("MATCHAWARDS_TOKEN_RESOURCE", token_resource(), True),
                                 ("MATCHAWARDS_AGENT_API_BASE", AGENT_API_BASE, False)):
         try:
             parts = urlsplit(value)
@@ -351,9 +360,9 @@ def _resource_key(url: str) -> tuple:
 
 
 def _same_resource(value) -> bool:
-    """Whether a /me body's resource names this server."""
+    """Whether a /me body's resource names this server (token_resource())."""
     try:
-        return isinstance(value, str) and _resource_key(value) == _resource_key(resource())
+        return isinstance(value, str) and _resource_key(value) == _resource_key(token_resource())
     except ValueError:  # e.g. a port that is not a number, or user:pass@ in it
         return False
 
@@ -388,8 +397,8 @@ async def me(token: str) -> Profile | Refusal:
     403: forbidden, an error /me does not name, or none) or UNAVAILABLE (no answer in time, a network error, any
     other status, a body that is not a profile, or the server-wide API budget spent).
 
-    /me names the resource (RFC 8707) the token was issued for. Only a token issued for this server's resource()
-    is taken: one a client got for another service is not a key to this one.
+    /me names the resource (RFC 8707) the token was issued for. Only a token issued for this server's
+    token_resource() is taken: one a client got for another service is not a key to this one.
 
     A profile is cached for CACHE_TTL_S and INVALID for INVALID_TTL_S; INSUFFICIENT, FORBIDDEN and UNAVAILABLE are
     asked again next time. A refusal drops the token's cached profile, and a profile is not cached when a check that

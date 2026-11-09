@@ -170,6 +170,8 @@ def test_resource_and_metadata_url(monkeypatch):
     ("AGENT_API_BASE", "http://user:pass@10.0.0.5:3000", "must be an http\\(s\\) URL"),
     ("ISSUER", "https://matchawards.com:99999", "must be an https URL"),
     ("RESOURCE", "https://matchawards.com:x/mcp", "must be an https URL"),
+    ("TOKEN_RESOURCE", "http://matchawards.com/mcp", "MATCHAWARDS_TOKEN_RESOURCE must be an https URL"),
+    ("TOKEN_RESOURCE", "https://matchawards.com/mcp?a=1", "MATCHAWARDS_TOKEN_RESOURCE must be an https URL"),
     ("AGENT_API_BASE", "http://10.0.0.5:-1", "must be an http\\(s\\) URL"),
 ])
 def test_bad_settings_stop_startup(monkeypatch, name, value, message):
@@ -881,3 +883,27 @@ async def test_body_limits_hold_with_linking_on(with_tool):
         assert (await hc.post("/mcp", json=big, headers=LEGACY)).status_code == 413
         padded = {**big, "params": {**big["params"], "pad": "x" * (60 * 1024)}}
         assert (await hc.post("/mcp", json=padded, headers={**LEGACY, "User-Agent": CLAUDE_UA})).status_code == 401
+
+
+@pytest.mark.anyio
+async def test_a_second_url_takes_tokens_issued_for_the_token_resource(issuer, me_api, monkeypatch):
+    """A second public URL (its own resource in the metadata and challenges) takes the tokens /me says were issued
+    for MATCHAWARDS_TOKEN_RESOURCE, and only those."""
+    monkeypatch.setattr(linking, "RESOURCE", "https://mcp.matchawards.com/mcp")
+    assert linking.metadata()["resource"] == "https://mcp.matchawards.com/mcp"
+    assert await linking.me(TOKEN) == linking.INVALID  # /me names https://matchawards.com/mcp
+    forget()
+    monkeypatch.setattr(linking, "TOKEN_RESOURCE", "https://matchawards.com/mcp")
+    assert isinstance(await linking.me(TOKEN), linking.Profile)
+    assert linking.metadata()["resource"] == "https://mcp.matchawards.com/mcp"  # unchanged
+    assert linking.metadata_url() == "https://mcp.matchawards.com/.well-known/oauth-protected-resource/mcp"
+    forget()
+    me_api.reply = lambda req: httpx.Response(200, json={**ME, "resource": "https://mcp.matchawards.com/mcp"})
+    assert await linking.me(TOKEN) == linking.INVALID  # only the token resource, not its own URL as well
+
+
+def test_the_token_resource_defaults_to_the_resource(monkeypatch):
+    monkeypatch.setattr(linking, "ISSUER", "https://staging.matchawards.com")
+    assert linking.token_resource() == "https://staging.matchawards.com/mcp"
+    monkeypatch.setattr(linking, "RESOURCE", "https://mcp-staging.matchawards.com/mcp")
+    assert linking.token_resource() == "https://mcp-staging.matchawards.com/mcp"

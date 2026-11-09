@@ -1,3 +1,3 @@
 """MatchAwards MCP server: US government contracts, grants and jobs for AI agents."""
 
-__version__ = "1.1.6"
+__version__ = "1.1.7"
