@@ -104,7 +104,8 @@ def enabled() -> bool:
 
 
 def resource() -> str:
-    """The resource this server is (the audience of a token issued for it): MATCHAWARDS_RESOURCE or {issuer}/mcp."""
+    """The resource this server is, named in its metadata and challenges: MATCHAWARDS_RESOURCE or {issuer}/mcp. A
+    token must have been issued for it, unless MATCHAWARDS_TOKEN_RESOURCE names another (token_resource())."""
     return RESOURCE or f"{ISSUER}/mcp"
 
 
