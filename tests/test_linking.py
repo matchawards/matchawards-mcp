@@ -903,7 +903,7 @@ async def test_a_second_url_takes_tokens_issued_for_the_token_resource(issuer, m
 
 
 def test_the_token_resource_defaults_to_the_resource(monkeypatch):
-    monkeypatch.setattr(linking, "ISSUER", "https://staging.matchawards.com")
-    assert linking.token_resource() == "https://staging.matchawards.com/mcp"
-    monkeypatch.setattr(linking, "RESOURCE", "https://mcp-staging.matchawards.com/mcp")
-    assert linking.token_resource() == "https://mcp-staging.matchawards.com/mcp"
+    monkeypatch.setattr(linking, "ISSUER", "https://auth.example.org")
+    assert linking.token_resource() == "https://auth.example.org/mcp"
+    monkeypatch.setattr(linking, "RESOURCE", "https://mcp.example.org/mcp")
+    assert linking.token_resource() == "https://mcp.example.org/mcp"
